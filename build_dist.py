@@ -21,8 +21,8 @@ PyInstaller.__main__.run([
     "--add-data", f"{os.path.join(ROOT, 'tacklecast')};tacklecast",
     # Include assets
     "--add-data", f"{os.path.join(ROOT, 'assets')};assets",
-    # Include mpv DLL
-    "--add-binary", f"{os.path.join(ROOT, 'mpv_bin', 'libmpv-2.dll')};.",
+    # Collect PyAV's bundled FFmpeg libraries
+    "--collect-all", "av",
     # Output to dist/TackleCast
     "--distpath", os.path.join(ROOT, "dist"),
     # Overwrite
@@ -36,9 +36,13 @@ PyInstaller.__main__.run([
     "--hidden-import", "tacklecast.overlay",
     "--hidden-import", "tacklecast.settings",
     "--hidden-import", "tacklecast.logger",
+    "--hidden-import", "av",
     "--hidden-import", "sounddevice",
     "--hidden-import", "numpy",
     "--hidden-import", "imageio_ffmpeg",
+    "--hidden-import", "OpenGL",
+    "--hidden-import", "OpenGL.GL",
+    "--collect-all", "OpenGL",
 ])
 
 # Clean up build artifacts

@@ -4,14 +4,12 @@ from PyQt6.QtGui import QPainter, QColor, QFont
 
 
 class OverlayWidget(QWidget):
-    """Frameless top-level widget that floats above the mpv window."""
+    """Transparent child widget that floats above the video surface."""
 
     def __init__(self, parent=None):
-        super().__init__(parent,
-                         Qt.WindowType.FramelessWindowHint |
-                         Qt.WindowType.Tool)
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setFixedHeight(40)
         self.setFixedWidth(420)
 

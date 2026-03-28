@@ -6,8 +6,27 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QTimer, QPoint
 from PyQt6.QtGui import QFont, QColor, QIcon
+from PyQt6.QtOpenGLWidgets import QOpenGLWidget
+from OpenGL.GL import (
+    glViewport, glClearColor, glClear, glEnable, glDisable,
+    glGenTextures, glBindTexture, glTexImage2D, glTexSubImage2D,
+    glTexParameteri, glActiveTexture, glDeleteTextures,
+    glGenBuffers, glBindBuffer, glBufferData, glEnableVertexAttribArray,
+    glVertexAttribPointer, glDrawArrays, glGenVertexArrays, glBindVertexArray,
+    glPixelStorei,
+    GL_COLOR_BUFFER_BIT, GL_TEXTURE_2D, GL_TEXTURE0, GL_TEXTURE1, GL_TEXTURE2,
+    GL_RED, GL_R8, GL_UNSIGNED_BYTE, GL_LINEAR,
+    GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER,
+    GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE,
+    GL_FLOAT, GL_TRIANGLE_STRIP, GL_ARRAY_BUFFER, GL_STATIC_DRAW,
+    GL_UNPACK_ROW_LENGTH, GL_UNPACK_ALIGNMENT,
+)
 
-from tacklecast.capture import MpvCapture
+from PyQt6.QtOpenGL import QOpenGLShaderProgram, QOpenGLShader
+import numpy as np
+import ctypes
+
+from tacklecast.capture import CaptureThread
 from tacklecast.audio import AudioPassthrough
 from tacklecast.devices import enumerate_video_devices, enumerate_audio_inputs, enumerate_audio_outputs
 from tacklecast.audio import find_audio_input_for_video
@@ -90,30 +109,202 @@ QSpinBox::up-button, QSpinBox::down-button {
 """
 
 
-class VideoContainer(QWidget):
-    """Black container that mpv renders into."""
+VERTEX_SHADER = """
+#version 330 core
+layout(location = 0) in vec2 position;
+layout(location = 1) in vec2 texcoord;
+out vec2 v_texcoord;
+
+uniform vec4 u_viewport;  // x, y, w, h in normalized [-1,1] coords
+
+void main() {
+    gl_Position = vec4(position * u_viewport.zw + u_viewport.xy, 0.0, 1.0);
+    v_texcoord = texcoord;
+}
+"""
+
+FRAGMENT_SHADER = """
+#version 330 core
+in vec2 v_texcoord;
+out vec4 fragColor;
+
+uniform sampler2D tex_y;
+uniform sampler2D tex_u;
+uniform sampler2D tex_v;
+uniform int u_full_range;
+
+void main() {
+    float y = texture(tex_y, v_texcoord).r;
+    float u = texture(tex_u, v_texcoord).r - 0.5;
+    float v = texture(tex_v, v_texcoord).r - 0.5;
+
+    // BT.601 YUV to RGB (MJPEG uses BT.601)
+    if (u_full_range != 0) {
+        // Full range (yuvj*): Y 0-255
+        fragColor = vec4(
+            clamp(y               + 1.402  * v, 0.0, 1.0),
+            clamp(y - 0.34414 * u - 0.71414 * v, 0.0, 1.0),
+            clamp(y + 1.772   * u              , 0.0, 1.0),
+            1.0);
+    } else {
+        // Limited range (yuv*): Y 16-235
+        y = 1.1643 * (y - 0.0625);
+        fragColor = vec4(
+            clamp(y               + 1.596  * v, 0.0, 1.0),
+            clamp(y - 0.39173 * u - 0.81290 * v, 0.0, 1.0),
+            clamp(y + 2.0172  * u              , 0.0, 1.0),
+            1.0);
+    }
+}
+"""
+
+
+class VideoWidget(QOpenGLWidget):
+    """Renders YUV420p video frames using OpenGL textures and a GLSL shader."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.setMouseTracking(True)
-        pal = self.palette()
-        pal.setColor(self.backgroundRole(), QColor(0, 0, 0))
-        self.setPalette(pal)
-        self.setAutoFillBackground(True)
+        self._yuv_data = None  # (y_bytes, u_bytes, v_bytes, y_stride, uv_stride, full_range)
+        self._frame_w = 0
+        self._frame_h = 0
+        self._program = None
+        self._textures = None  # (tex_y, tex_u, tex_v)
+        self._tex_w = 0
+        self._tex_h = 0
+        self._vao = None
+        self._vbo = None
 
-    def get_wid(self):
-        return int(self.winId())
+    def update_frame(self, frame_data, width, height):
+        """Update the displayed frame. frame_data is (y, u, v, uv_w, uv_h, full_range)."""
+        self._yuv_data = frame_data
+        self._frame_w = width
+        self._frame_h = height
+        self.update()
+
+    def initializeGL(self):
+        glClearColor(0.0, 0.0, 0.0, 1.0)
+
+        # Compile shader program
+        self._program = QOpenGLShaderProgram(self)
+        self._program.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, VERTEX_SHADER)
+        self._program.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, FRAGMENT_SHADER)
+        self._program.link()
+
+        # Create VAO and VBO for a fullscreen quad
+        # positions (clip space) + texcoords
+        quad = np.array([
+            -1, -1,  0, 1,   # bottom-left  (flip V: texcoord y=1 at bottom)
+             1, -1,  1, 1,   # bottom-right
+            -1,  1,  0, 0,   # top-left
+             1,  1,  1, 0,   # top-right
+        ], dtype=np.float32)
+
+        self._vao = glGenVertexArrays(1)
+        glBindVertexArray(self._vao)
+
+        self._vbo = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self._vbo)
+        glBufferData(GL_ARRAY_BUFFER, quad.nbytes, quad, GL_STATIC_DRAW)
+
+        # position: location 0, 2 floats, stride 16, offset 0
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 2, GL_FLOAT, False, 16, ctypes.c_void_p(0))
+        # texcoord: location 1, 2 floats, stride 16, offset 8
+        glEnableVertexAttribArray(1)
+        glVertexAttribPointer(1, 2, GL_FLOAT, False, 16, ctypes.c_void_p(8))
+
+        glBindVertexArray(0)
+
+        # Create 3 textures for Y, U, V planes
+        self._textures = glGenTextures(3)
+        for tex in self._textures:
+            glBindTexture(GL_TEXTURE_2D, tex)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+
+    def resizeGL(self, w, h):
+        glViewport(0, 0, w, h)
+
+    def paintGL(self):
+        glClear(GL_COLOR_BUFFER_BIT)
+
+        if self._yuv_data is None or self._program is None:
+            return
+
+        y_data, u_data, v_data, uv_w, uv_h, full_range = self._yuv_data
+        w, h = self._frame_w, self._frame_h
+        resized = (w != self._tex_w or h != self._tex_h)
+
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0)
+
+        # Upload Y plane (full resolution)
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, self._textures[0])
+        if resized:
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, w, h, 0,
+                         GL_RED, GL_UNSIGNED_BYTE, y_data)
+        else:
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h,
+                            GL_RED, GL_UNSIGNED_BYTE, y_data)
+
+        # Upload U plane (chroma resolution from capture)
+        glActiveTexture(GL_TEXTURE1)
+        glBindTexture(GL_TEXTURE_2D, self._textures[1])
+        if resized:
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_w, uv_h, 0,
+                         GL_RED, GL_UNSIGNED_BYTE, u_data)
+        else:
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_w, uv_h,
+                            GL_RED, GL_UNSIGNED_BYTE, u_data)
+
+        # Upload V plane (same chroma resolution)
+        glActiveTexture(GL_TEXTURE2)
+        glBindTexture(GL_TEXTURE_2D, self._textures[2])
+        if resized:
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_w, uv_h, 0,
+                         GL_RED, GL_UNSIGNED_BYTE, v_data)
+        else:
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_w, uv_h,
+                            GL_RED, GL_UNSIGNED_BYTE, v_data)
+
+        self._tex_w = w
+        self._tex_h = h
+
+        # Calculate aspect-ratio-correct viewport in normalized coords
+        win_w, win_h = self.width(), self.height()
+        src_aspect = w / h
+        win_aspect = win_w / win_h
+
+        if win_aspect > src_aspect:
+            scale_x = src_aspect / win_aspect
+            scale_y = 1.0
+        else:
+            scale_x = 1.0
+            scale_y = win_aspect / src_aspect
+
+        self._program.bind()
+        self._program.setUniformValue("tex_y", 0)
+        self._program.setUniformValue("tex_u", 1)
+        self._program.setUniformValue("tex_v", 2)
+        self._program.setUniformValue("u_full_range", int(full_range))
+        self._program.setUniformValue("u_viewport", 0.0, 0.0, scale_x, scale_y)
+
+        glBindVertexArray(self._vao)
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
+        glBindVertexArray(0)
+
+        self._program.release()
 
 
 class ControlBar(QWidget):
-    """Frameless top-level floating control bar."""
+    """Child widget control bar that sits at the bottom of the video."""
 
     def __init__(self, parent=None):
-        super().__init__(parent,
-                         Qt.WindowType.FramelessWindowHint |
-                         Qt.WindowType.Tool)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        super().__init__(parent)
         self.setFixedHeight(44)
         self.setAutoFillBackground(True)
 
@@ -195,26 +386,27 @@ class MainWindow(QMainWindow):
         self.setMouseTracking(True)
 
         self.settings = Settings.load()
-        self.capture = MpvCapture()
+        self.capture = CaptureThread()
         self.audio = AudioPassthrough()
         self._populating = True
 
-        # Video container
-        self.video_container = VideoContainer(self)
+        # Video widget
+        self.video_container = VideoWidget(self)
         self.setCentralWidget(self.video_container)
 
-        # Floating overlay (top-level, stays on top of mpv)
-        self.overlay = OverlayWidget()
+        # Overlay and control bar are children of the main window,
+        # positioned manually on top of the video surface
+        self.overlay = OverlayWidget(self)
         self.overlay.show()
+        self.overlay.raise_()
 
-        # Floating control bar (top-level)
-        self.control_bar = ControlBar()
+        self.control_bar = ControlBar(self)
         self.control_bar.hide()
 
-        # Polling timer — keeps overlay positioned and polls mpv stats
-        self._mouse_timer = QTimer()
-        self._mouse_timer.timeout.connect(self._check_mouse)
-        self._mouse_timer.start(100)
+        # Frame polling timer — drives rendering and overlay updates
+        self._render_timer = QTimer()
+        self._render_timer.timeout.connect(self._poll_frame)
+        self._render_timer.start(8)  # ~120fps capable polling
 
         # Populate controls
         self._populate_devices()
@@ -305,17 +497,13 @@ class MainWindow(QMainWindow):
         res_key = self.control_bar.resolution_combo.currentData() or "1080p"
         fps = self._get_fps()
         w, h, fps, pixel_format, threads = get_capture_config(res_key, fps)
-        wid = self.video_container.get_wid()
-        log.info(f"Starting capture: device={device_name}, {res_key} @ {fps}fps ({w}x{h}, {pixel_format}, threads={threads})")
+        log.info(f"Starting capture: device={device_name}, {res_key} @ {fps}fps ({w}x{h}, {pixel_format})")
 
         self.overlay.set_status("Connecting...")
         self.capture.start(
-            wid=wid,
             device_name=device_name,
             width=w, height=h, fps=fps,
             pixel_format=pixel_format,
-            decode_threads=threads,
-            on_fps_update=None,
             on_error=self._on_capture_error,
         )
 
@@ -398,36 +586,42 @@ class MainWindow(QMainWindow):
     # --- Floating widget positioning ---
 
     def _position_floating_widgets(self):
-        """Position overlay and control bar relative to main window."""
+        """Position overlay and control bar relative to the video container."""
         if not self.isVisible():
             return
-        # Overlay: top-left of window
-        top_left = self.video_container.mapToGlobal(QPoint(4, 4))
-        self.overlay.move(top_left)
-        self.overlay.setFixedWidth(min(500, self.width()))
+        # Overlay: top-left of video area
+        vid_pos = self.video_container.pos()
+        self.overlay.move(vid_pos.x() + 4, vid_pos.y() + 4)
+        self.overlay.setFixedWidth(min(500, self.video_container.width()))
+        self.overlay.raise_()
 
-        # Control bar: bottom of window
+        # Control bar: bottom of video area
         bar_h = self.control_bar.height()
-        bottom_left = self.video_container.mapToGlobal(QPoint(0, self.video_container.height() - bar_h))
-        self.control_bar.move(bottom_left)
+        self.control_bar.move(vid_pos.x(), vid_pos.y() + self.video_container.height() - bar_h)
         self.control_bar.setFixedWidth(self.video_container.width())
+        self.control_bar.raise_()
 
-    def _check_mouse(self):
-        """Poll mouse position, keep overlay visible, and update stats."""
+    def _poll_frame(self):
+        """Poll for new frames and update the video widget and overlay."""
 
-        # Always keep overlay positioned and raised above mpv
+        # Keep overlay positioned
         if self.isVisible():
-            top_left = self.video_container.mapToGlobal(QPoint(4, 4))
-            if self.overlay.pos() != top_left:
-                self.overlay.move(top_left)
+            vid_pos = self.video_container.pos()
+            target = QPoint(vid_pos.x() + 4, vid_pos.y() + 4)
+            if self.overlay.pos() != target:
+                self.overlay.move(target)
             self.overlay.raise_()
 
-        # Poll mpv for resolution/FPS
-        stats = self.capture.poll_stats()
-        if stats:
-            fps, w, h = stats
+        # Get latest frame from capture thread
+        arr, w, h, is_new = self.capture.get_frame()
+        if is_new and arr is not None:
+            self.video_container.update_frame(arr, w, h)
             self.overlay.set_status("")  # Clear "Connecting..."
-            self.overlay.update_stats(fps, w, h)
+
+        # Update overlay stats
+        fps, sw, sh = self.capture.get_stats()
+        if sw > 0:
+            self.overlay.update_stats(fps, sw, sh)
 
     def _toggle_controls(self):
         """Toggle the control bar on/off."""
@@ -457,12 +651,10 @@ class MainWindow(QMainWindow):
         self._position_floating_widgets()
 
     def closeEvent(self, event):
-        self._mouse_timer.stop()
+        self._render_timer.stop()
         self.capture.stop()
         self.audio.stop()
         self._save_settings()
-        self.overlay.close()
-        self.control_bar.close()
         super().closeEvent(event)
 
 

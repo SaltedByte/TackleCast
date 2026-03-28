@@ -27,21 +27,38 @@ def enumerate_video_devices():
     return devices
 
 
+def _wasapi_index():
+    """Find the WASAPI host API index, preferred on modern Windows."""
+    try:
+        for i, api in enumerate(sd.query_hostapis()):
+            if "wasapi" in api["name"].lower():
+                return i
+    except Exception:
+        pass
+    return None
+
+
 def enumerate_audio_inputs():
-    """Returns list of (index, name) for audio input devices."""
+    """Returns list of (index, name) for WASAPI audio input devices."""
+    wasapi = _wasapi_index()
     devices = sd.query_devices()
     inputs = []
     for i, dev in enumerate(devices):
         if dev["max_input_channels"] > 0:
+            if wasapi is not None and dev["hostapi"] != wasapi:
+                continue
             inputs.append((i, dev["name"]))
     return inputs
 
 
 def enumerate_audio_outputs():
-    """Returns list of (index, name) for audio output devices."""
+    """Returns list of (index, name) for WASAPI audio output devices."""
+    wasapi = _wasapi_index()
     devices = sd.query_devices()
     outputs = []
     for i, dev in enumerate(devices):
         if dev["max_output_channels"] > 0:
+            if wasapi is not None and dev["hostapi"] != wasapi:
+                continue
             outputs.append((i, dev["name"]))
     return outputs

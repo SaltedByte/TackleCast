@@ -1,237 +1,239 @@
-import os
-import sys
+import threading
 import time
+
+import av
+import numpy as np
 
 from tacklecast.logger import get_logger
 
-# Ensure mpv DLL is findable — works in both dev mode and PyInstaller bundle
-def _find_mpv():
-    candidates = [
-        # PyInstaller bundle: DLL is next to the exe
-        getattr(sys, '_MEIPASS', ''),
-        os.path.dirname(sys.executable),
-        # Dev mode: mpv_bin/ next to the tacklecast package
-        os.path.join(os.path.dirname(os.path.dirname(__file__)), "mpv_bin"),
-    ]
-    for d in candidates:
-        if d and os.path.isfile(os.path.join(d, "libmpv-2.dll")):
-            os.environ["PATH"] = d + ";" + os.environ.get("PATH", "")
-            return
-_find_mpv()
-
-import mpv
-
-# mpv properties we want to capture for diagnostics
-_DIAG_PROPERTIES = [
-    "hwdec-current",
-    "video-codec",
-    "video-params",
-    "video-out-params",
-    "vo",
-    "estimated-vf-fps",
-    "frame-drop-count",
-    "decoder-frame-drop-count",
-    "demuxer-cache-duration",
-    "width",
-    "height",
-    "container-fps",
-    "avsync",
-]
-
-# Lighter set for periodic logging (every 15s)
-_PERIODIC_PROPERTIES = [
-    "estimated-vf-fps",
-    "frame-drop-count",
-    "decoder-frame-drop-count",
-    "demuxer-cache-duration",
-    "avsync",
-]
+# Chroma subsampling dimensions for common YUV formats
+# Returns (uv_w_divisor, uv_h_divisor, full_range)
+_YUV_FORMATS = {
+    "yuv420p":  (2, 2, False),
+    "yuvj420p": (2, 2, True),
+    "yuv422p":  (2, 1, False),
+    "yuvj422p": (2, 1, True),
+    "yuv444p":  (1, 1, False),
+    "yuvj444p": (1, 1, True),
+}
 
 
-class MpvCapture:
-    """Wraps mpv for DirectShow capture card playback embedded in a Qt widget."""
+class CaptureThread:
+    """Captures video from a DirectShow device using PyAV and delivers
+    decoded YUV frames via a shared reference for GL rendering."""
 
     def __init__(self):
-        self._player = None
-        self._wid = None
+        self._thread = None
+        self._stop_event = threading.Event()
+        self._frame_lock = threading.Lock()
+        self._latest_frame = None  # (y, u, v, uv_w, uv_h, full_range)
+        self._frame_w = 0
+        self._frame_h = 0
+        self._new_frame = False
+        self._fps = 0.0
+        self._width = 0
+        self._height = 0
+        self._frame_count = 0
+        self._fps_time = 0.0
+        self._lock = threading.Lock()
         self._on_error = None
-        self._last_frame_num = 0
-        self._last_poll_time = 0.0
-        self._measured_fps = 0.0
-        self._diag_logged = False
-        self._last_periodic_log = 0.0
 
-    def start(self, wid, device_name, width, height, fps, pixel_format="mjpeg",
-              decode_threads=1, on_fps_update=None, on_error=None):
-        """Start playback embedded in the given window handle."""
-        log = get_logger()
-        log.info("--- Capture start ---")
-        log.info(f"Requested: device={device_name}, {width}x{height}@{fps}fps, format={pixel_format}, threads={decode_threads}")
+    def get_frame(self):
+        """Get the latest frame if available.
+        Returns (frame_data, w, h, is_new) or (None, 0, 0, False).
+        frame_data is (y_bytes, u_bytes, v_bytes, uv_w, uv_h, full_range)."""
+        with self._frame_lock:
+            if self._latest_frame is not None:
+                new = self._new_frame
+                self._new_frame = False
+                return self._latest_frame, self._frame_w, self._frame_h, new
+            return None, 0, 0, False
 
+    def get_stats(self):
+        """Returns (fps, width, height)."""
+        with self._lock:
+            return self._fps, self._width, self._height
+
+    def start(self, device_name, width, height, fps, pixel_format="nv12",
+              decode_threads=1, on_error=None):
+        """Start capturing from the given DirectShow device."""
         self.stop()
-        self._wid = wid
+        self._stop_event.clear()
         self._on_error = on_error
-        self._last_frame_num = 0
-        self._last_poll_time = 0.0
-        self._measured_fps = 0.0
-        self._diag_logged = False
-        self._last_periodic_log = 0.0
 
-        # Scale buffers based on codec — MJPEG frames are much larger than raw NV12
-        # and need room in the demuxer, while the DirectShow buffer should be small
-        # to prevent upstream latency buildup.
-        if pixel_format == "mjpeg":
-            # ~2-3 frames of headroom in demuxer, tight DirectShow buffer
-            rtbufsize = "1M"
-            demuxer_max = "2MiB"
-        else:
-            # Raw NV12 — minimal buffers, no decoding needed
-            rtbufsize = "1M"
-            demuxer_max = "100KiB"
+        with self._frame_lock:
+            self._latest_frame = None
+            self._new_frame = False
 
-        log.info(f"Buffer config: rtbufsize={rtbufsize}, demuxer_max_bytes={demuxer_max}")
-        log.info(f"Render config: vo=gpu-next, video_sync=desync, untimed=true")
-
-        try:
-            self._player = mpv.MPV(
-                wid=str(int(wid)),
-                profile="low-latency",
-                untimed=True,
-                aid="no",
-                demuxer_lavf_format="dshow",
-                demuxer_lavf_o=(
-                    f"video_size={width}x{height},"
-                    f"framerate={fps},"
-                    f"rtbufsize={rtbufsize}"
-                    + (f",vcodec=mjpeg" if pixel_format == "mjpeg" else f",pixel_format={pixel_format}")
-                ),
-                vo="gpu-next",
-                hwdec="auto-safe",
-                video_latency_hacks="yes",
-                cache="no",
-                demuxer_max_bytes=demuxer_max,
-                demuxer_max_back_bytes="0",
-                demuxer_thread="no",
-                vd_lavc_threads=decode_threads,
-                video_sync="desync",
-                osd_level=0,
-                keep_open="yes",
-                msg_level="all=error",
-            )
-
-            @self._player.event_callback("end-file")
-            def _on_end(event):
-                try:
-                    reason = getattr(event, 'reason', None)
-                    if self._on_error and reason and str(reason) == "error":
-                        self._on_error("Device disconnected or capture error")
-                except Exception:
-                    pass
-
-            url = f'av://dshow:video={device_name}'
-            self._player.play(url)
-
-        except Exception as e:
-            log.error(f"Failed to start mpv: {e}")
-            if self._on_error:
-                self._on_error(f"Failed to start mpv: {e}")
+        self._thread = threading.Thread(
+            target=self._capture_loop,
+            args=(device_name, width, height, fps, pixel_format),
+            daemon=True,
+        )
+        self._thread.start()
 
     def stop(self):
-        if self._player:
-            try:
-                self._player.terminate()
-            except Exception:
-                pass
-            self._player = None
-
-    def log_diagnostics(self):
-        """Log all mpv diagnostic properties to the log file."""
-        if not self._player:
-            return
-        log = get_logger()
-        log.info("=== mpv diagnostic snapshot ===")
-        for prop in _DIAG_PROPERTIES:
-            try:
-                val = self._player._get_property(prop)
-                log.info(f"  {prop} = {val}")
-            except Exception:
-                log.info(f"  {prop} = <unavailable>")
-
-        # Add human-readable hwdec explanation
-        try:
-            hwdec = self._player._get_property("hwdec-current")
-            codec = self._player._get_property("video-codec")
-            if hwdec == "no" or not hwdec:
-                if codec and "jpeg" in str(codec).lower():
-                    log.info("  NOTE: MJPEG is not supported by GPU hardware decoders (NVDEC/etc). "
-                             "CPU decode is expected. GPU is still used for rendering via vo=gpu.")
-                else:
-                    log.info("  NOTE: Raw video (NV12) requires no decoding. "
-                             "GPU is used for rendering via vo=gpu.")
-        except Exception:
-            pass
-        log.info("=== end diagnostics ===")
-
-    def _log_periodic_stats(self):
-        """Log lightweight stats periodically to catch latency buildup."""
-        if not self._player:
-            return
-        log = get_logger()
-        stats = {}
-        for prop in _PERIODIC_PROPERTIES:
-            try:
-                stats[prop] = self._player._get_property(prop)
-            except Exception:
-                stats[prop] = "<unavailable>"
-        parts = ", ".join(f"{k}={v}" for k, v in stats.items())
-        log.info(f"[periodic] {parts}")
-
-    def poll_stats(self):
-        """Poll mpv for current resolution and measured FPS.
-
-        Returns (fps, width, height) or None.
-        """
-        if not self._player:
-            return None
-        try:
-            w = self._player.width
-            h = self._player.height
-            if not w or not h:
-                return None
-
-            # Log diagnostics once on the first frame we get back
-            if not self._diag_logged:
-                self._diag_logged = True
-                self.log_diagnostics()
-                self._last_periodic_log = time.monotonic()
-
-            now = time.monotonic()
-
-            # Periodic stats every 15 seconds
-            if now - self._last_periodic_log >= 15.0:
-                self._last_periodic_log = now
-                self._log_periodic_stats()
-
-            try:
-                frame_num = self._player.estimated_frame_number
-            except Exception:
-                frame_num = None
-
-            if frame_num is not None and self._last_poll_time > 0:
-                dt = now - self._last_poll_time
-                if dt >= 0.3:
-                    df = frame_num - self._last_frame_num
-                    self._measured_fps = df / dt if dt > 0 else 0.0
-                    self._last_frame_num = frame_num
-                    self._last_poll_time = now
-            elif frame_num is not None:
-                self._last_frame_num = frame_num
-                self._last_poll_time = now
-
-            return (self._measured_fps, w, h)
-        except Exception:
-            return None
+        """Stop the capture thread."""
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3.0)
+        self._thread = None
 
     @property
     def is_running(self):
-        return self._player is not None
+        return self._thread is not None and self._thread.is_alive()
+
+    def _capture_loop(self, device_name, width, height, fps, pixel_format):
+        log = get_logger()
+        log.info("--- Capture start ---")
+        log.info(f"Requested: device={device_name}, {width}x{height}@{fps}fps, format={pixel_format}")
+
+        options = {
+            "video_size": f"{width}x{height}",
+            "framerate": str(fps),
+            "rtbufsize": "1M",
+        }
+        if pixel_format == "mjpeg":
+            options["vcodec"] = "mjpeg"
+        else:
+            options["pixel_format"] = pixel_format
+
+        log.info(f"PyAV options: {options}")
+
+        container = None
+        try:
+            container = av.open(
+                f"video={device_name}",
+                format="dshow",
+                options=options,
+            )
+            stream = container.streams.video[0]
+
+            # Enable multi-threaded MJPEG decode
+            if pixel_format == "mjpeg":
+                stream.codec_context.thread_count = 4
+                stream.codec_context.thread_type = "FRAME"
+                log.info(f"MJPEG multi-threaded decode: threads={stream.codec_context.thread_count}")
+
+            log.info(f"Stream opened: codec={stream.codec_context.name}, "
+                     f"{stream.width}x{stream.height}")
+
+            diag_logged = False
+            self._fps_time = time.monotonic()
+            self._frame_count = 0
+            last_periodic = time.monotonic()
+            error_count = 0
+
+            for packet in container.demux(stream):
+                if self._stop_event.is_set():
+                    break
+
+                # Decode packet — skip bad packets gracefully
+                try:
+                    frames = stream.codec_context.decode(packet)
+                except (av.error.InvalidDataError, ValueError):
+                    error_count += 1
+                    if error_count <= 5:
+                        log.warning(f"Skipping bad packet (count={error_count})")
+                    continue
+
+                for frame in frames:
+                    if self._stop_event.is_set():
+                        break
+
+                    w = frame.width
+                    h = frame.height
+                    fmt = frame.format.name
+
+                    # For NV12, reformat to planar yuv420p
+                    if fmt == "nv12":
+                        frame = frame.reformat(format="yuv420p")
+                        fmt = "yuv420p"
+
+                    # Look up chroma layout
+                    fmt_info = _YUV_FORMATS.get(fmt)
+                    if fmt_info is None:
+                        # Unknown format — fall back to yuv420p conversion
+                        frame = frame.reformat(format="yuv420p")
+                        fmt_info = (2, 2, False)
+
+                    uv_w_div, uv_h_div, full_range = fmt_info
+                    uv_w = w // uv_w_div
+                    uv_h = h // uv_h_div
+
+                    # Extract raw plane bytes — no swscale conversion
+                    y_stride = frame.planes[0].line_size
+                    uv_stride = frame.planes[1].line_size
+
+                    if y_stride == w:
+                        y_data = bytes(frame.planes[0])
+                    else:
+                        y_data = np.frombuffer(frame.planes[0], dtype=np.uint8).reshape(h, y_stride)[:, :w].tobytes()
+
+                    if uv_stride == uv_w:
+                        u_data = bytes(frame.planes[1])
+                        v_data = bytes(frame.planes[2])
+                    else:
+                        u_data = np.frombuffer(frame.planes[1], dtype=np.uint8).reshape(uv_h, uv_stride)[:, :uv_w].tobytes()
+                        v_data = np.frombuffer(frame.planes[2], dtype=np.uint8).reshape(uv_h, uv_stride)[:, :uv_w].tobytes()
+
+                    # Store latest frame for main thread
+                    with self._frame_lock:
+                        self._latest_frame = (y_data, u_data, v_data, uv_w, uv_h, full_range)
+                        self._frame_w = w
+                        self._frame_h = h
+                        self._new_frame = True
+
+                    # Update FPS measurement
+                    self._frame_count += 1
+                    now = time.monotonic()
+                    dt = now - self._fps_time
+                    if dt >= 1.0:
+                        with self._lock:
+                            self._fps = self._frame_count / dt
+                            self._width = w
+                            self._height = h
+                        self._frame_count = 0
+                        self._fps_time = now
+
+                    # Log diagnostics on first frame
+                    if not diag_logged:
+                        diag_logged = True
+                        log.info(f"=== First frame received ===")
+                        log.info(f"  codec: {stream.codec_context.name}")
+                        log.info(f"  pixel format: {fmt} ({'full' if full_range else 'limited'} range)")
+                        log.info(f"  resolution: {w}x{h}")
+                        log.info(f"  chroma: {uv_w}x{uv_h} ({'4:2:2' if uv_h_div == 1 else '4:2:0'})")
+                        log.info(f"  Y: {len(y_data)} bytes (stride={y_stride}, {'no pad' if y_stride == w else 'PADDED'})")
+                        log.info(f"  U: {len(u_data)} bytes (stride={uv_stride}, {'no pad' if uv_stride == uv_w else 'PADDED'})")
+                        log.info(f"=== end first frame ===")
+
+                    # Periodic stats
+                    if now - last_periodic >= 15.0:
+                        last_periodic = now
+                        with self._lock:
+                            fps_val = self._fps
+                        log.info(f"[periodic] fps={fps_val:.1f}, resolution={w}x{h}")
+
+        except av.error.FileNotFoundError:
+            msg = f"Device not found: {device_name}"
+            log.error(msg)
+            if self._on_error:
+                self._on_error(msg)
+        except av.error.OSError as e:
+            msg = f"Capture error: {e}"
+            log.error(msg)
+            if self._on_error:
+                self._on_error(msg)
+        except Exception as e:
+            msg = f"Unexpected capture error: {e}"
+            log.error(msg)
+            if self._on_error:
+                self._on_error(msg)
+        finally:
+            if container:
+                try:
+                    container.close()
+                except Exception:
+                    pass
+            log.info("Capture thread stopped")
