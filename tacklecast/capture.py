@@ -77,6 +77,20 @@ class MpvCapture:
         self._diag_logged = False
         self._last_periodic_log = 0.0
 
+        # Scale buffers based on codec — MJPEG frames are much larger than raw NV12
+        # and need room in the demuxer, while the DirectShow buffer should be small
+        # to prevent upstream latency buildup.
+        if pixel_format == "mjpeg":
+            # ~2-3 frames of headroom in demuxer, tight DirectShow buffer
+            rtbufsize = "1M"
+            demuxer_max = "2MiB"
+        else:
+            # Raw NV12 — minimal buffers, no decoding needed
+            rtbufsize = "1M"
+            demuxer_max = "100KiB"
+
+        log.info(f"Buffer config: rtbufsize={rtbufsize}, demuxer_max_bytes={demuxer_max}")
+
         try:
             self._player = mpv.MPV(
                 wid=str(int(wid)),
@@ -87,14 +101,14 @@ class MpvCapture:
                 demuxer_lavf_o=(
                     f"video_size={width}x{height},"
                     f"framerate={fps},"
-                    f"rtbufsize=10M"
+                    f"rtbufsize={rtbufsize}"
                     + (f",vcodec=mjpeg" if pixel_format == "mjpeg" else f",pixel_format={pixel_format}")
                 ),
                 vo="gpu",
                 hwdec="auto-safe",
                 video_latency_hacks="yes",
                 cache="no",
-                demuxer_max_bytes="100KiB",
+                demuxer_max_bytes=demuxer_max,
                 demuxer_max_back_bytes="0",
                 demuxer_thread="no",
                 vd_lavc_threads=decode_threads,

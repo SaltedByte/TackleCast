@@ -168,13 +168,7 @@ class MainWindow(QMainWindow):
         self.control_bar = ControlBar()
         self.control_bar.hide()
 
-        # Auto-hide timer
-        self._hide_timer = QTimer()
-        self._hide_timer.setSingleShot(True)
-        self._hide_timer.timeout.connect(self._hide_controls)
-        self._controls_pinned = False
-
-        # Mouse tracking timer — poll mouse position since mpv eats events
+        # Polling timer — keeps overlay positioned and polls mpv stats
         self._mouse_timer = QTimer()
         self._mouse_timer.timeout.connect(self._check_mouse)
         self._mouse_timer.start(100)
@@ -347,7 +341,6 @@ class MainWindow(QMainWindow):
 
     def _check_mouse(self):
         """Poll mouse position, keep overlay visible, and update stats."""
-        from PyQt6.QtGui import QCursor
 
         # Always keep overlay positioned and raised above mpv
         if self.isVisible():
@@ -363,34 +356,13 @@ class MainWindow(QMainWindow):
             self.overlay.set_status("")  # Clear "Connecting..."
             self.overlay.update_stats(fps, w, h)
 
-        pos = QCursor.pos()
-
-        # Use the video container's global rect for accurate hit detection
-        # (self.geometry() includes the title bar in windowed mode)
-        container_top_left = self.video_container.mapToGlobal(QPoint(0, 0))
-        container_w = self.video_container.width()
-        container_h = self.video_container.height()
-
-        local_x = pos.x() - container_top_left.x()
-        local_y = pos.y() - container_top_left.y()
-
-        if not (0 <= local_x <= container_w and 0 <= local_y <= container_h):
-            return
-
-        if local_y > container_h * 0.75:
-            self._show_controls()
-        elif self.control_bar.isVisible() and not self._controls_pinned:
-            if not self.control_bar.geometry().contains(pos):
-                self._hide_timer.start(3000)
-
-    def _show_controls(self):
-        self._position_floating_widgets()
-        self.control_bar.show()
-        self._hide_timer.start(3000)
-
-    def _hide_controls(self):
-        if not self._controls_pinned:
+    def _toggle_controls(self):
+        """Toggle the control bar on/off."""
+        if self.control_bar.isVisible():
             self.control_bar.hide()
+        else:
+            self._position_floating_widgets()
+            self.control_bar.show()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_F11:
@@ -400,19 +372,7 @@ class MainWindow(QMainWindow):
                 self.showFullScreen()
             QTimer.singleShot(100, self._position_floating_widgets)
         elif event.key() == Qt.Key.Key_Escape:
-            if self.isFullScreen():
-                self.showNormal()
-                QTimer.singleShot(100, self._position_floating_widgets)
-        elif event.key() == Qt.Key.Key_Tab:
-            if self.control_bar.isVisible():
-                self._controls_pinned = False
-                self._hide_controls()
-            else:
-                self._controls_pinned = True
-                self._show_controls()
-                self._hide_timer.stop()
-        else:
-            self._show_controls()
+            self._toggle_controls()
         super().keyPressEvent(event)
 
     def moveEvent(self, event):
