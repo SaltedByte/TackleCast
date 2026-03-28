@@ -2,18 +2,19 @@ import json
 import os
 from dataclasses import dataclass, asdict
 
-# Based on ShadowCast 3 hardware capabilities.
-# mpv handles GPU-accelerated decode, so MJPG@120 is viable now.
-# (width, height, fps, pixel_format)
+# Based on ShadowCast hardware capabilities.
+# MJPEG has no inter-frame dependencies, so multi-threaded decode is safe
+# and essential for 120fps on most CPUs.
+# (width, height, fps, pixel_format, decode_threads)
 RESOLUTION_PRESETS = {
-    "720p @60": (1280, 720, 60, "nv12"),
-    "720p @120": (1280, 720, 120, "nv12"),
-    "1080p @60": (1920, 1080, 60, "nv12"),
-    "1080p @120": (1920, 1080, 120, "mjpeg"),
-    "1440p @60": (2560, 1440, 60, "nv12"),
-    "1440p @120": (2560, 1440, 120, "mjpeg"),
-    "4K @30": (3840, 2160, 30, "nv12"),
-    "4K @60": (3840, 2160, 60, "mjpeg"),
+    "720p @60": (1280, 720, 60, "nv12", 1),
+    "720p @120": (1280, 720, 120, "nv12", 1),
+    "1080p @60": (1920, 1080, 60, "nv12", 1),
+    "1080p @120": (1920, 1080, 120, "mjpeg", 4),
+    "1440p @60": (2560, 1440, 60, "nv12", 1),
+    "1440p @120": (2560, 1440, 120, "mjpeg", 4),
+    "4K @30": (3840, 2160, 30, "nv12", 1),
+    "4K @60": (3840, 2160, 60, "mjpeg", 4),
 }
 
 def _app_dir():

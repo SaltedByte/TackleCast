@@ -10,6 +10,7 @@ from PyQt6.QtGui import QFont, QColor, QIcon
 from tacklecast.capture import MpvCapture
 from tacklecast.audio import AudioPassthrough
 from tacklecast.devices import enumerate_video_devices, enumerate_audio_inputs, enumerate_audio_outputs
+from tacklecast.audio import find_audio_input_for_video
 from tacklecast.overlay import OverlayWidget
 from tacklecast.settings import Settings, RESOLUTION_PRESETS
 from tacklecast.logger import setup_logger, get_logger
@@ -252,9 +253,9 @@ class MainWindow(QMainWindow):
             return
 
         res_key = self.control_bar.resolution_combo.currentData() or "1080p @60"
-        w, h, fps, pixel_format = RESOLUTION_PRESETS[res_key]
+        w, h, fps, pixel_format, threads = RESOLUTION_PRESETS[res_key]
         wid = self.video_container.get_wid()
-        log.info(f"Starting capture: device={device_name}, preset={res_key} ({w}x{h}@{fps}, {pixel_format})")
+        log.info(f"Starting capture: device={device_name}, preset={res_key} ({w}x{h}@{fps}, {pixel_format}, threads={threads})")
 
         self.overlay.set_status("Connecting...")
         self.capture.start(
@@ -262,6 +263,7 @@ class MainWindow(QMainWindow):
             device_name=device_name,
             width=w, height=h, fps=fps,
             pixel_format=pixel_format,
+            decode_threads=threads,
             on_fps_update=None,
             on_error=self._on_capture_error,
         )
@@ -275,6 +277,17 @@ class MainWindow(QMainWindow):
             return
         in_dev = in_dev if in_dev >= 0 else None
         out_dev = out_dev if out_dev is not None and out_dev >= 0 else None
+
+        # Auto-detect capture card audio when input is "Default"
+        if in_dev is None:
+            video_name = self.control_bar.video_combo.currentData() or ""
+            matched = find_audio_input_for_video(video_name)
+            if matched is not None:
+                log.info(f"Audio auto-detect: matched input device {matched} for video '{video_name}'")
+                in_dev = matched
+            else:
+                log.warning(f"Audio auto-detect: no match found for video '{video_name}', using system default")
+
         volume = self.control_bar.volume_slider.value() / 100.0
         log.info(f"Starting audio: input={in_dev}, output={out_dev}, volume={volume:.2f}")
         self.audio.start(in_dev, out_dev, volume)
@@ -351,15 +364,20 @@ class MainWindow(QMainWindow):
             self.overlay.update_stats(fps, w, h)
 
         pos = QCursor.pos()
-        geom = self.geometry()
 
-        if not geom.contains(pos):
+        # Use the video container's global rect for accurate hit detection
+        # (self.geometry() includes the title bar in windowed mode)
+        container_top_left = self.video_container.mapToGlobal(QPoint(0, 0))
+        container_w = self.video_container.width()
+        container_h = self.video_container.height()
+
+        local_x = pos.x() - container_top_left.x()
+        local_y = pos.y() - container_top_left.y()
+
+        if not (0 <= local_x <= container_w and 0 <= local_y <= container_h):
             return
 
-        local_y = pos.y() - geom.y()
-        window_h = geom.height()
-
-        if local_y > window_h * 0.75:
+        if local_y > container_h * 0.75:
             self._show_controls()
         elif self.control_bar.isVisible() and not self._controls_pinned:
             if not self.control_bar.geometry().contains(pos):

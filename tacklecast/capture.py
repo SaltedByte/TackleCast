@@ -38,6 +38,15 @@ _DIAG_PROPERTIES = [
     "avsync",
 ]
 
+# Lighter set for periodic logging (every 15s)
+_PERIODIC_PROPERTIES = [
+    "estimated-vf-fps",
+    "frame-drop-count",
+    "decoder-frame-drop-count",
+    "demuxer-cache-duration",
+    "avsync",
+]
+
 
 class MpvCapture:
     """Wraps mpv for DirectShow capture card playback embedded in a Qt widget."""
@@ -50,13 +59,14 @@ class MpvCapture:
         self._last_poll_time = 0.0
         self._measured_fps = 0.0
         self._diag_logged = False
+        self._last_periodic_log = 0.0
 
     def start(self, wid, device_name, width, height, fps, pixel_format="mjpeg",
-              on_fps_update=None, on_error=None):
+              decode_threads=1, on_fps_update=None, on_error=None):
         """Start playback embedded in the given window handle."""
         log = get_logger()
         log.info("--- Capture start ---")
-        log.info(f"Requested: device={device_name}, {width}x{height}@{fps}fps, format={pixel_format}")
+        log.info(f"Requested: device={device_name}, {width}x{height}@{fps}fps, format={pixel_format}, threads={decode_threads}")
 
         self.stop()
         self._wid = wid
@@ -65,6 +75,7 @@ class MpvCapture:
         self._last_poll_time = 0.0
         self._measured_fps = 0.0
         self._diag_logged = False
+        self._last_periodic_log = 0.0
 
         try:
             self._player = mpv.MPV(
@@ -86,7 +97,7 @@ class MpvCapture:
                 demuxer_max_bytes="100KiB",
                 demuxer_max_back_bytes="0",
                 demuxer_thread="no",
-                vd_lavc_threads=1,
+                vd_lavc_threads=decode_threads,
                 video_sync="desync",
                 osd_level=0,
                 keep_open="yes",
@@ -130,7 +141,35 @@ class MpvCapture:
                 log.info(f"  {prop} = {val}")
             except Exception:
                 log.info(f"  {prop} = <unavailable>")
+
+        # Add human-readable hwdec explanation
+        try:
+            hwdec = self._player._get_property("hwdec-current")
+            codec = self._player._get_property("video-codec")
+            if hwdec == "no" or not hwdec:
+                if codec and "jpeg" in str(codec).lower():
+                    log.info("  NOTE: MJPEG is not supported by GPU hardware decoders (NVDEC/etc). "
+                             "CPU decode is expected. GPU is still used for rendering via vo=gpu.")
+                else:
+                    log.info("  NOTE: Raw video (NV12) requires no decoding. "
+                             "GPU is used for rendering via vo=gpu.")
+        except Exception:
+            pass
         log.info("=== end diagnostics ===")
+
+    def _log_periodic_stats(self):
+        """Log lightweight stats periodically to catch latency buildup."""
+        if not self._player:
+            return
+        log = get_logger()
+        stats = {}
+        for prop in _PERIODIC_PROPERTIES:
+            try:
+                stats[prop] = self._player._get_property(prop)
+            except Exception:
+                stats[prop] = "<unavailable>"
+        parts = ", ".join(f"{k}={v}" for k, v in stats.items())
+        log.info(f"[periodic] {parts}")
 
     def poll_stats(self):
         """Poll mpv for current resolution and measured FPS.
@@ -149,8 +188,15 @@ class MpvCapture:
             if not self._diag_logged:
                 self._diag_logged = True
                 self.log_diagnostics()
+                self._last_periodic_log = time.monotonic()
 
             now = time.monotonic()
+
+            # Periodic stats every 15 seconds
+            if now - self._last_periodic_log >= 15.0:
+                self._last_periodic_log = now
+                self._log_periodic_stats()
+
             try:
                 frame_num = self._player.estimated_frame_number
             except Exception:
