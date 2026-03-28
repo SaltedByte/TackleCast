@@ -2,7 +2,7 @@ import sys
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout,
-    QComboBox, QSlider, QLabel,
+    QComboBox, QSlider, QLabel, QCheckBox, QSpinBox,
 )
 from PyQt6.QtCore import Qt, QTimer, QPoint
 from PyQt6.QtGui import QFont, QColor, QIcon
@@ -12,7 +12,7 @@ from tacklecast.audio import AudioPassthrough
 from tacklecast.devices import enumerate_video_devices, enumerate_audio_inputs, enumerate_audio_outputs
 from tacklecast.audio import find_audio_input_for_video
 from tacklecast.overlay import OverlayWidget
-from tacklecast.settings import Settings, RESOLUTION_PRESETS
+from tacklecast.settings import Settings, RESOLUTIONS, DEFAULT_FPS, MIN_FPS, MAX_FPS, get_capture_config
 from tacklecast.logger import setup_logger, get_logger
 
 
@@ -60,6 +60,32 @@ QSlider::handle:horizontal {
 QSlider::sub-page:horizontal {
     background: #e94560;
     border-radius: 3px;
+}
+QCheckBox {
+    color: #8899aa;
+    spacing: 4px;
+}
+QCheckBox::indicator {
+    width: 14px;
+    height: 14px;
+    border: 1px solid #0f3460;
+    border-radius: 3px;
+    background: #16213e;
+}
+QCheckBox::indicator:checked {
+    background: #e94560;
+    border-color: #e94560;
+}
+QSpinBox {
+    background-color: #16213e;
+    color: #e0e0e0;
+    border: 1px solid #0f3460;
+    border-radius: 4px;
+    padding: 2px 4px;
+    max-width: 50px;
+}
+QSpinBox::up-button, QSpinBox::down-button {
+    width: 0px;
 }
 """
 
@@ -124,8 +150,25 @@ class ControlBar(QWidget):
         lbl.setStyleSheet("color: #8899aa;")
         layout.addWidget(lbl)
         self.resolution_combo = QComboBox()
-        self.resolution_combo.setMaximumWidth(200)
+        self.resolution_combo.setMaximumWidth(120)
         layout.addWidget(self.resolution_combo)
+
+        lbl = QLabel("FPS:")
+        lbl.setStyleSheet("color: #8899aa;")
+        layout.addWidget(lbl)
+        self.fps_label = QLabel("60")
+        self.fps_label.setStyleSheet("color: #e0e0e0;")
+        self.fps_label.setFixedWidth(24)
+        layout.addWidget(self.fps_label)
+
+        self.fps_spin = QSpinBox()
+        self.fps_spin.setRange(MIN_FPS, MAX_FPS)
+        self.fps_spin.setValue(DEFAULT_FPS)
+        self.fps_spin.setVisible(False)
+        layout.addWidget(self.fps_spin)
+
+        self.experimental_cb = QCheckBox("Experimental")
+        layout.addWidget(self.experimental_cb)
 
         lbl = QLabel("Vol:")
         lbl.setStyleSheet("color: #8899aa;")
@@ -183,6 +226,8 @@ class MainWindow(QMainWindow):
         self.control_bar.audio_in_combo.currentIndexChanged.connect(self._on_audio_changed)
         self.control_bar.audio_out_combo.currentIndexChanged.connect(self._on_audio_changed)
         self.control_bar.resolution_combo.currentIndexChanged.connect(self._on_resolution_changed)
+        self.control_bar.experimental_cb.toggled.connect(self._on_experimental_toggled)
+        self.control_bar.fps_spin.valueChanged.connect(self._on_fps_changed)
         self.control_bar.volume_slider.valueChanged.connect(self._on_volume_changed)
 
         # Start after window is shown
@@ -232,11 +277,22 @@ class MainWindow(QMainWindow):
         self.control_bar.volume_slider.setValue(int(self.settings.volume * 100))
 
     def _populate_resolutions(self):
-        for name in RESOLUTION_PRESETS:
+        for name in RESOLUTIONS:
             self.control_bar.resolution_combo.addItem(name, name)
         saved_idx = self.control_bar.resolution_combo.findData(self.settings.resolution)
         if saved_idx >= 0:
             self.control_bar.resolution_combo.setCurrentIndex(saved_idx)
+
+        # Restore FPS and experimental state
+        self.control_bar.fps_spin.setValue(self.settings.fps)
+        self.control_bar.experimental_cb.setChecked(self.settings.experimental_fps)
+        self._on_experimental_toggled(self.settings.experimental_fps)
+
+    def _get_fps(self):
+        """Get the current FPS — 60 unless experimental is enabled."""
+        if self.control_bar.experimental_cb.isChecked():
+            return self.control_bar.fps_spin.value()
+        return DEFAULT_FPS
 
     def _start_capture(self):
         log = get_logger()
@@ -246,10 +302,11 @@ class MainWindow(QMainWindow):
             self.overlay.set_status("No video device found")
             return
 
-        res_key = self.control_bar.resolution_combo.currentData() or "1080p @60"
-        w, h, fps, pixel_format, threads = RESOLUTION_PRESETS[res_key]
+        res_key = self.control_bar.resolution_combo.currentData() or "1080p"
+        fps = self._get_fps()
+        w, h, fps, pixel_format, threads = get_capture_config(res_key, fps)
         wid = self.video_container.get_wid()
-        log.info(f"Starting capture: device={device_name}, preset={res_key} ({w}x{h}@{fps}, {pixel_format}, threads={threads})")
+        log.info(f"Starting capture: device={device_name}, {res_key} @ {fps}fps ({w}x{h}, {pixel_format}, threads={threads})")
 
         self.overlay.set_status("Connecting...")
         self.capture.start(
@@ -301,6 +358,20 @@ class MainWindow(QMainWindow):
             self._start_capture()
             self._save_settings()
 
+    def _on_experimental_toggled(self, checked):
+        self.control_bar.fps_spin.setVisible(checked)
+        self.control_bar.fps_label.setVisible(not checked)
+        if not self._populating:
+            if not checked:
+                self.control_bar.fps_spin.setValue(DEFAULT_FPS)
+            self._start_capture()
+            self._save_settings()
+
+    def _on_fps_changed(self):
+        if not self._populating and self.control_bar.experimental_cb.isChecked():
+            self._start_capture()
+            self._save_settings()
+
     def _on_volume_changed(self, value):
         self.control_bar.volume_label.setText(f"{value}%")
         self.audio.set_volume(value / 100.0)
@@ -318,7 +389,9 @@ class MainWindow(QMainWindow):
         self.settings.video_device = self.control_bar.video_combo.currentData() or ""
         self.settings.audio_input = self.control_bar.audio_in_combo.currentData() or -1
         self.settings.audio_output = self.control_bar.audio_out_combo.currentData() or -1
-        self.settings.resolution = self.control_bar.resolution_combo.currentData() or "1080p @60"
+        self.settings.resolution = self.control_bar.resolution_combo.currentData() or "1080p"
+        self.settings.fps = self.control_bar.fps_spin.value()
+        self.settings.experimental_fps = self.control_bar.experimental_cb.isChecked()
         self.settings.volume = self.control_bar.volume_slider.value() / 100.0
         self.settings.save()
 

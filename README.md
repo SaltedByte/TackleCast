@@ -6,23 +6,26 @@
 
 **A lightweight, low-latency capture card viewer for Windows.** No recording, no bloat — just your game on your screen.
 
-Built for capture cards like the Genki ShadowCast, Elgato, AVerMedia, and other UVC-compliant devices. TackleCast uses [mpv](https://mpv.io/) under the hood for GPU-accelerated rendering, giving you crisp video at up to 1440p@120fps with minimal latency.
+Built for capture cards like the Genki ShadowCast, Elgato, AVerMedia, and other UVC-compliant devices. TackleCast uses [mpv](https://mpv.io/) under the hood for GPU-accelerated rendering, giving you crisp video with minimal latency.
 
 ## Features
 
-- **GPU-accelerated video** via mpv — hardware MJPG decode, DirectX rendering
+- **GPU-accelerated video** via mpv — DirectX rendering via gpu-next
 - **Low-latency audio passthrough** to your speakers or headphones
-- **Resolution presets** — 720p, 1080p, 1440p, 4K at various framerates
+- **Resolution options** — 720p, 1080p, 1440p, 4K at 60fps
+- **Experimental FPS** — unlock custom frame rates (30-240fps) for advanced users
+- **Auto-detect capture card audio** — matches audio input to your video device
 - **Live FPS counter** with real measured framerate
 - **Auto-detect capture cards** via DirectShow
-- **Dark theme UI** with auto-hiding controls
+- **Dark theme UI** with Escape-toggled controls
 - **Fullscreen support** (F11)
 - **Zero recording overhead** — purely a viewer
 - **Settings persistence** — remembers your device selections
+- **Diagnostic logging** — log files in `_internal/logs/` for troubleshooting
 
 ## Quick Start (Download)
 
-1. Download the latest `TackleCast-v1.0-win64.zip` from [Releases](../../releases)
+1. Download the latest release zip from [Releases](../../releases)
 2. Extract anywhere
 3. Double-click `TackleCast.exe`
 
@@ -43,33 +46,29 @@ run.bat
 
 ## Controls
 
-| Action | Key/Mouse |
+| Action | Key |
 |---|---|
-| Show controls | Move mouse to bottom 25% of window |
-| Pin/unpin controls | Tab |
+| Toggle settings bar | Escape |
 | Fullscreen | F11 |
-| Exit fullscreen | Escape |
 
-## Resolution Presets
+## Resolutions
 
-| Preset | Format | Notes |
+| Resolution | Format at 60fps | Format above 60fps |
 |---|---|---|
-| 720p @60 | NV12 | Uncompressed |
-| 720p @120 | NV12 | Uncompressed |
-| 1080p @60 | NV12 | Uncompressed |
-| 1080p @120 | MJPG | GPU decoded |
-| 1440p @60 | NV12 | Uncompressed |
-| 1440p @120 | MJPG | GPU decoded |
-| 4K @30 | NV12 | Uncompressed |
-| 4K @60 | MJPG | GPU decoded |
+| 720p | NV12 (raw) | MJPEG (CPU decoded) |
+| 1080p | NV12 (raw) | MJPEG (CPU decoded) |
+| 1440p | NV12 (raw) | MJPEG (CPU decoded) |
+| 4K | NV12 (raw) | MJPEG (CPU decoded) |
 
-Available presets depend on your capture card's capabilities. The presets above are based on the Genki ShadowCast 3.
+At 60fps and below, video is passed through as raw NV12 with no decode overhead. Above 60fps, most capture cards require MJPEG which is CPU-decoded with multi-threading.
+
+To use frame rates above 60fps, enable the **Experimental** checkbox in the settings bar and enter your desired FPS (30-240).
 
 ## Architecture
 
 TackleCast is intentionally minimal:
 
-- **mpv** — handles DirectShow capture, MJPG decode (hardware-accelerated), and GPU rendering directly into the app window
+- **mpv** — handles DirectShow capture, MJPEG decode, and GPU rendering directly into the app window
 - **PyQt6** — dark-themed UI with floating overlay and control bar
 - **sounddevice** — low-latency audio passthrough from capture card to speakers
 - **imageio-ffmpeg** — device enumeration via bundled ffmpeg

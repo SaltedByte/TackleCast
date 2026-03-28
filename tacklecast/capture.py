@@ -90,6 +90,7 @@ class MpvCapture:
             demuxer_max = "100KiB"
 
         log.info(f"Buffer config: rtbufsize={rtbufsize}, demuxer_max_bytes={demuxer_max}")
+        log.info(f"Render config: vo=gpu-next, video_sync=desync, untimed=true")
 
         try:
             self._player = mpv.MPV(
@@ -104,7 +105,7 @@ class MpvCapture:
                     f"rtbufsize={rtbufsize}"
                     + (f",vcodec=mjpeg" if pixel_format == "mjpeg" else f",pixel_format={pixel_format}")
                 ),
-                vo="gpu",
+                vo="gpu-next",
                 hwdec="auto-safe",
                 video_latency_hacks="yes",
                 cache="no",

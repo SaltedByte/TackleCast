@@ -2,20 +2,31 @@ import json
 import os
 from dataclasses import dataclass, asdict
 
-# Based on ShadowCast hardware capabilities.
-# MJPEG has no inter-frame dependencies, so multi-threaded decode is safe
-# and essential for 120fps on most CPUs.
-# (width, height, fps, pixel_format, decode_threads)
-RESOLUTION_PRESETS = {
-    "720p @60": (1280, 720, 60, "nv12", 1),
-    "720p @120": (1280, 720, 120, "nv12", 1),
-    "1080p @60": (1920, 1080, 60, "nv12", 1),
-    "1080p @120": (1920, 1080, 120, "mjpeg", 4),
-    "1440p @60": (2560, 1440, 60, "nv12", 1),
-    "1440p @120": (2560, 1440, 120, "mjpeg", 4),
-    "4K @30": (3840, 2160, 30, "nv12", 1),
-    "4K @60": (3840, 2160, 60, "mjpeg", 4),
+# Resolution options — just width/height, FPS is separate
+RESOLUTIONS = {
+    "720p": (1280, 720),
+    "1080p": (1920, 1080),
+    "1440p": (2560, 1440),
+    "4K": (3840, 2160),
 }
+
+DEFAULT_FPS = 60
+MIN_FPS = 30
+MAX_FPS = 240
+
+
+def get_capture_config(resolution, fps):
+    """Determine pixel format and thread count from resolution + FPS.
+
+    NV12 (raw) for 60fps and below — no decode overhead.
+    MJPEG for higher FPS — required by most capture cards at high frame rates.
+    """
+    w, h = RESOLUTIONS.get(resolution, (1920, 1080))
+    if fps <= 60:
+        return w, h, fps, "nv12", 1
+    else:
+        return w, h, fps, "mjpeg", 4
+
 
 def _app_dir():
     """Get the application directory — works in dev and PyInstaller bundle."""
@@ -32,7 +43,9 @@ class Settings:
     video_device: str = ""
     audio_input: int = -1
     audio_output: int = -1
-    resolution: str = "1080p @60"
+    resolution: str = "1080p"
+    fps: int = 60
+    experimental_fps: bool = False
     volume: float = 1.0
 
     def save(self):
