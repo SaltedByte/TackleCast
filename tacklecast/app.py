@@ -12,6 +12,7 @@ from tacklecast.audio import AudioPassthrough
 from tacklecast.devices import enumerate_video_devices, enumerate_audio_inputs, enumerate_audio_outputs
 from tacklecast.overlay import OverlayWidget
 from tacklecast.settings import Settings, RESOLUTION_PRESETS
+from tacklecast.logger import setup_logger, get_logger
 
 
 DARK_STYLE = """
@@ -243,14 +244,17 @@ class MainWindow(QMainWindow):
             self.control_bar.resolution_combo.setCurrentIndex(saved_idx)
 
     def _start_capture(self):
+        log = get_logger()
         device_name = self.control_bar.video_combo.currentData()
         if not device_name:
+            log.warning("No video device found")
             self.overlay.set_status("No video device found")
             return
 
-        res_key = self.control_bar.resolution_combo.currentData() or "1440p @120"
+        res_key = self.control_bar.resolution_combo.currentData() or "1080p @60"
         w, h, fps, pixel_format = RESOLUTION_PRESETS[res_key]
         wid = self.video_container.get_wid()
+        log.info(f"Starting capture: device={device_name}, preset={res_key} ({w}x{h}@{fps}, {pixel_format})")
 
         self.overlay.set_status("Connecting...")
         self.capture.start(
@@ -263,6 +267,7 @@ class MainWindow(QMainWindow):
         )
 
     def _start_audio(self):
+        log = get_logger()
         self.audio.stop()
         in_dev = self.control_bar.audio_in_combo.currentData()
         out_dev = self.control_bar.audio_out_combo.currentData()
@@ -271,6 +276,7 @@ class MainWindow(QMainWindow):
         in_dev = in_dev if in_dev >= 0 else None
         out_dev = out_dev if out_dev is not None and out_dev >= 0 else None
         volume = self.control_bar.volume_slider.value() / 100.0
+        log.info(f"Starting audio: input={in_dev}, output={out_dev}, volume={volume:.2f}")
         self.audio.start(in_dev, out_dev, volume)
 
     def _on_video_device_changed(self):
@@ -298,13 +304,14 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, lambda: self.overlay.update_stats(fps, width, height, latency_ms))
 
     def _on_capture_error(self, msg):
+        get_logger().error(f"Capture error: {msg}")
         QTimer.singleShot(0, lambda: self.overlay.set_status(msg))
 
     def _save_settings(self):
         self.settings.video_device = self.control_bar.video_combo.currentData() or ""
         self.settings.audio_input = self.control_bar.audio_in_combo.currentData() or -1
         self.settings.audio_output = self.control_bar.audio_out_combo.currentData() or -1
-        self.settings.resolution = self.control_bar.resolution_combo.currentData() or "1440p @120"
+        self.settings.resolution = self.control_bar.resolution_combo.currentData() or "1080p @60"
         self.settings.volume = self.control_bar.volume_slider.value() / 100.0
         self.settings.save()
 
@@ -410,7 +417,15 @@ class MainWindow(QMainWindow):
 
 def main():
     import os
+    import platform
     import ctypes
+
+    # Initialize logging before anything else
+    log = setup_logger()
+    log.info("====== TackleCast starting ======")
+    log.info(f"Platform: {platform.platform()}")
+    log.info(f"Python: {sys.version}")
+    log.info(f"Frozen: {getattr(sys, 'frozen', False)}")
 
     # Set AppUserModelID so Windows shows our icon in the taskbar (not Python's)
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("tacklecast.tacklecast.v1")

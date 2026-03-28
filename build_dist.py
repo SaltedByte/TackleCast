@@ -35,6 +35,7 @@ PyInstaller.__main__.run([
     "--hidden-import", "tacklecast.devices",
     "--hidden-import", "tacklecast.overlay",
     "--hidden-import", "tacklecast.settings",
+    "--hidden-import", "tacklecast.logger",
     "--hidden-import", "sounddevice",
     "--hidden-import", "numpy",
     "--hidden-import", "imageio_ffmpeg",

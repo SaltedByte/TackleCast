@@ -31,7 +31,7 @@ class Settings:
     video_device: str = ""
     audio_input: int = -1
     audio_output: int = -1
-    resolution: str = "1440p @120"
+    resolution: str = "1080p @60"
     volume: float = 1.0
 
     def save(self):

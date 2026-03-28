@@ -35,7 +35,8 @@ class AudioPassthrough:
             )
             self._stream.start()
         except Exception as e:
-            print(f"Audio error: {e}")
+            from tacklecast.logger import get_logger
+            get_logger().error(f"Audio error: {e}")
             self._stream = None
 
     def stop(self):

@@ -2,6 +2,8 @@ import os
 import sys
 import time
 
+from tacklecast.logger import get_logger
+
 # Ensure mpv DLL is findable — works in both dev mode and PyInstaller bundle
 def _find_mpv():
     candidates = [
@@ -19,6 +21,23 @@ _find_mpv()
 
 import mpv
 
+# mpv properties we want to capture for diagnostics
+_DIAG_PROPERTIES = [
+    "hwdec-current",
+    "video-codec",
+    "video-params",
+    "video-out-params",
+    "vo",
+    "estimated-vf-fps",
+    "frame-drop-count",
+    "decoder-frame-drop-count",
+    "demuxer-cache-duration",
+    "width",
+    "height",
+    "container-fps",
+    "avsync",
+]
+
 
 class MpvCapture:
     """Wraps mpv for DirectShow capture card playback embedded in a Qt widget."""
@@ -30,16 +49,22 @@ class MpvCapture:
         self._last_frame_num = 0
         self._last_poll_time = 0.0
         self._measured_fps = 0.0
+        self._diag_logged = False
 
     def start(self, wid, device_name, width, height, fps, pixel_format="mjpeg",
               on_fps_update=None, on_error=None):
         """Start playback embedded in the given window handle."""
+        log = get_logger()
+        log.info("--- Capture start ---")
+        log.info(f"Requested: device={device_name}, {width}x{height}@{fps}fps, format={pixel_format}")
+
         self.stop()
         self._wid = wid
         self._on_error = on_error
         self._last_frame_num = 0
         self._last_poll_time = 0.0
         self._measured_fps = 0.0
+        self._diag_logged = False
 
         try:
             self._player = mpv.MPV(
@@ -81,6 +106,7 @@ class MpvCapture:
             self._player.play(url)
 
         except Exception as e:
+            log.error(f"Failed to start mpv: {e}")
             if self._on_error:
                 self._on_error(f"Failed to start mpv: {e}")
 
@@ -91,6 +117,20 @@ class MpvCapture:
             except Exception:
                 pass
             self._player = None
+
+    def log_diagnostics(self):
+        """Log all mpv diagnostic properties to the log file."""
+        if not self._player:
+            return
+        log = get_logger()
+        log.info("=== mpv diagnostic snapshot ===")
+        for prop in _DIAG_PROPERTIES:
+            try:
+                val = self._player._get_property(prop)
+                log.info(f"  {prop} = {val}")
+            except Exception:
+                log.info(f"  {prop} = <unavailable>")
+        log.info("=== end diagnostics ===")
 
     def poll_stats(self):
         """Poll mpv for current resolution and measured FPS.
@@ -104,6 +144,11 @@ class MpvCapture:
             h = self._player.height
             if not w or not h:
                 return None
+
+            # Log diagnostics once on the first frame we get back
+            if not self._diag_logged:
+                self._diag_logged = True
+                self.log_diagnostics()
 
             now = time.monotonic()
             try:

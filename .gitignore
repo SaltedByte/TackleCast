@@ -33,5 +33,8 @@ dist/
 # Launcher exe (built locally)
 TackleCast.exe
 
+# Logs (generated at runtime)
+logs/
+
 # Claude
 .claude/
