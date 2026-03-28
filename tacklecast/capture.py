@@ -51,16 +51,18 @@ class MpvCapture:
                 demuxer_lavf_o=(
                     f"video_size={width}x{height},"
                     f"framerate={fps},"
-                    f"rtbufsize=150M"
+                    f"rtbufsize=10M"
                     + (f",vcodec=mjpeg" if pixel_format == "mjpeg" else f",pixel_format={pixel_format}")
                 ),
                 vo="gpu",
                 hwdec="auto-safe",
                 video_latency_hacks="yes",
                 cache="no",
-                demuxer_max_bytes="500KiB",
+                demuxer_max_bytes="100KiB",
                 demuxer_max_back_bytes="0",
-                vd_lavc_threads=4,
+                demuxer_thread="no",
+                vd_lavc_threads=1,
+                video_sync="desync",
                 osd_level=0,
                 keep_open="yes",
                 msg_level="all=error",
