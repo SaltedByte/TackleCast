@@ -4,7 +4,7 @@
   <img src="assets/icon.png" alt="TackleCast" width="128">
 </p>
 
-**A lightweight, low-latency capture card viewer for Windows.** No recording, no bloat — just your game on your screen.
+**A lightweight, low-latency capture card viewer for Windows.** No recording, no bloat, just your game on your screen.
 
 Built for capture cards like the Genki ShadowCast, Elgato, AVerMedia, and other UVC-compliant devices. TackleCast uses [mpv](https://mpv.io/) under the hood for GPU-accelerated rendering, giving you crisp video with minimal latency.
 
