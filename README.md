@@ -10,18 +10,18 @@ Built for capture cards like the Genki ShadowCast, Elgato, AVerMedia, and other 
 
 ## Features
 
-- **GPU-accelerated video** via mpv — DirectX rendering via gpu-next
+- **GPU-accelerated video** via mpv - DirectX rendering via gpu-next
 - **Low-latency audio passthrough** to your speakers or headphones
-- **Resolution options** — 720p, 1080p, 1440p, 4K
-- **FPS modes** — 60 FPS (default), 120 FPS, or Custom (30-240fps)
-- **Auto-detect capture card audio** — matches audio input to your video device
+- **Resolution options** - 720p, 1080p, 1440p, 4K
+- **FPS modes** - 60 FPS (default), 120 FPS, or Custom (30-240fps)
+- **Auto-detect capture card audio** - matches audio input to your video device
 - **Live FPS counter** with real measured framerate (toggle on/off)
 - **Auto-detect capture cards** via DirectShow
 - **Dark theme UI** with pause-style settings menu
 - **Fullscreen support** (F11 or toggle in settings)
-- **Zero recording overhead** — purely a viewer
-- **Settings persistence** — remembers your device selections
-- **Diagnostic logging** — log files in `_internal/logs/` for troubleshooting
+- **Zero recording overhead** - purely a viewer
+- **Settings persistence** - remembers your device selections
+- **Diagnostic logging** - log files in `_internal/logs/` for troubleshooting
 
 ## Quick Start (Download)
 
@@ -65,10 +65,10 @@ At 60 FPS and below, video is passed through as raw NV12 with zero decode overhe
 
 TackleCast is intentionally minimal:
 
-- **mpv** — handles DirectShow capture, MJPEG decode, and GPU rendering directly into the app window
-- **PyQt6** — dark-themed UI with floating overlay and centered settings menu
-- **sounddevice** — low-latency audio passthrough from capture card to speakers
-- **imageio-ffmpeg** — device enumeration via bundled ffmpeg
+- **mpv** - handles DirectShow capture, MJPEG decode, and GPU rendering directly into the app window
+- **PyQt6** - dark-themed UI with floating overlay and centered settings menu
+- **sounddevice** - low-latency audio passthrough from capture card to speakers
+- **imageio-ffmpeg** - device enumeration via bundled ffmpeg
 
 ## Building a Standalone Distribution
 
@@ -78,7 +78,7 @@ To create a portable zip for distribution:
 python build_dist.py
 ```
 
-Output: `dist/TackleCast/` — zip this folder. Users just extract and run `TackleCast.exe`.
+Output: `dist/TackleCast/` - zip this folder. Users just extract and run `TackleCast.exe`.
 
 ## License
 
