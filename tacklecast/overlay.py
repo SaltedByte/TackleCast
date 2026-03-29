@@ -19,8 +19,13 @@ class OverlayWidget(QWidget):
         self._width = 0
         self._height = 0
         self._status = ""
+        self._show_stats = True
         self._font = QFont("Segoe UI", 10)
         self._font.setBold(True)
+
+    def set_show_stats(self, show):
+        self._show_stats = show
+        self.update()
 
     def update_stats(self, fps, width, height, latency_ms=0.0):
         self._fps = fps
@@ -37,8 +42,12 @@ class OverlayWidget(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setFont(self._font)
 
+        # Show status messages always, but stats only if enabled
         if self._status:
             text = f"  {self._status}  "
+        elif not self._show_stats:
+            painter.end()
+            return
         elif self._width > 0:
             text = f"  {self._width}x{self._height} | {self._fps:.1f} FPS  "
         else:

@@ -12,13 +12,13 @@ Built for capture cards like the Genki ShadowCast, Elgato, AVerMedia, and other 
 
 - **GPU-accelerated video** via mpv — DirectX rendering via gpu-next
 - **Low-latency audio passthrough** to your speakers or headphones
-- **Resolution options** — 720p, 1080p, 1440p, 4K at 60fps
-- **Experimental FPS** — unlock custom frame rates (30-240fps) for advanced users
+- **Resolution options** — 720p, 1080p, 1440p, 4K
+- **FPS modes** — 60 FPS (default), 120 FPS, or Custom (30-240fps)
 - **Auto-detect capture card audio** — matches audio input to your video device
-- **Live FPS counter** with real measured framerate
+- **Live FPS counter** with real measured framerate (toggle on/off)
 - **Auto-detect capture cards** via DirectShow
-- **Dark theme UI** with Escape-toggled controls
-- **Fullscreen support** (F11)
+- **Dark theme UI** with pause-style settings menu
+- **Fullscreen support** (F11 or toggle in settings)
 - **Zero recording overhead** — purely a viewer
 - **Settings persistence** — remembers your device selections
 - **Diagnostic logging** — log files in `_internal/logs/` for troubleshooting
@@ -48,28 +48,25 @@ run.bat
 
 | Action | Key |
 |---|---|
-| Toggle settings bar | Escape |
+| Open/close settings | Escape |
 | Fullscreen | F11 |
 
-## Resolutions
+## FPS Modes
 
-| Resolution | Format at 60fps | Format above 60fps |
-|---|---|---|
-| 720p | NV12 (raw) | MJPEG (CPU decoded) |
-| 1080p | NV12 (raw) | MJPEG (CPU decoded) |
-| 1440p | NV12 (raw) | MJPEG (CPU decoded) |
-| 4K | NV12 (raw) | MJPEG (CPU decoded) |
+| Mode | FPS | Format | Notes |
+|---|---|---|---|
+| 60 FPS | 60 | NV12 (raw) | Default — no decode overhead |
+| 120 FPS | 120 | MJPEG | Requires a fast CPU |
+| Custom | 30-240 | MJPEG (above 60) | Experimental — not guaranteed |
 
-At 60fps and below, video is passed through as raw NV12 with no decode overhead. Above 60fps, most capture cards require MJPEG which is CPU-decoded with multi-threading.
-
-To use frame rates above 60fps, enable the **Experimental** checkbox in the settings bar and enter your desired FPS (30-240).
+At 60 FPS and below, video is passed through as raw NV12 with zero decode overhead. Above 60 FPS, most capture cards require MJPEG which is CPU-decoded with multi-threading.
 
 ## Architecture
 
 TackleCast is intentionally minimal:
 
 - **mpv** — handles DirectShow capture, MJPEG decode, and GPU rendering directly into the app window
-- **PyQt6** — dark-themed UI with floating overlay and control bar
+- **PyQt6** — dark-themed UI with floating overlay and centered settings menu
 - **sounddevice** — low-latency audio passthrough from capture card to speakers
 - **imageio-ffmpeg** — device enumeration via bundled ffmpeg
 

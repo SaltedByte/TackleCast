@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from dataclasses import dataclass, asdict
 
 # Resolution options — just width/height, FPS is separate
@@ -9,6 +10,11 @@ RESOLUTIONS = {
     "1440p": (2560, 1440),
     "4K": (3840, 2160),
 }
+
+# FPS mode options
+FPS_MODE_60 = "60"
+FPS_MODE_120 = "120"
+FPS_MODE_CUSTOM = "custom"
 
 DEFAULT_FPS = 60
 MIN_FPS = 30
@@ -28,14 +34,14 @@ def get_capture_config(resolution, fps):
         return w, h, fps, "mjpeg", 4
 
 
-def _app_dir():
-    """Get the application directory — works in dev and PyInstaller bundle."""
-    import sys
+def _data_dir():
+    """Get the data directory for settings/logs — _internal/ for frozen, project root for dev."""
     if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
+        return os.path.join(os.path.dirname(sys.executable), "_internal")
     return os.path.dirname(os.path.dirname(__file__))
 
-SETTINGS_PATH = os.path.join(_app_dir(), "tacklecast_settings.json")
+
+SETTINGS_PATH = os.path.join(_data_dir(), "tacklecast_settings.json")
 
 
 @dataclass
@@ -44,11 +50,13 @@ class Settings:
     audio_input: int = -1
     audio_output: int = -1
     resolution: str = "1080p"
-    fps: int = 60
-    experimental_fps: bool = False
+    fps_mode: str = FPS_MODE_60
+    custom_fps: int = 120
     volume: float = 1.0
+    show_overlay: bool = True
 
     def save(self):
+        os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
         with open(SETTINGS_PATH, "w") as f:
             json.dump(asdict(self), f, indent=2)
 
@@ -57,6 +65,22 @@ class Settings:
         try:
             with open(SETTINGS_PATH, "r") as f:
                 data = json.load(f)
+            # Migrate old settings format
+            if "experimental_fps" in data:
+                if data.get("experimental_fps"):
+                    data["fps_mode"] = FPS_MODE_CUSTOM
+                    data["custom_fps"] = data.get("fps", 120)
+                data.pop("experimental_fps", None)
+                data.pop("fps", None)
             return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
         except (FileNotFoundError, json.JSONDecodeError, TypeError):
             return cls()
+
+    def get_fps(self):
+        """Get the effective FPS value based on the current mode."""
+        if self.fps_mode == FPS_MODE_60:
+            return 60
+        elif self.fps_mode == FPS_MODE_120:
+            return 120
+        else:
+            return self.custom_fps
