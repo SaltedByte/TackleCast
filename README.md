@@ -80,6 +80,10 @@ python build_dist.py
 
 Output: `dist/TackleCast/` - zip this folder. Users just extract and run `TackleCast.exe`.
 
+## Acknowledgments
+
+- **[@NeverForgetful](https://www.youtube.com/@NeverForgetful)** - Testing and QA
+
 ## License
 
 MIT
