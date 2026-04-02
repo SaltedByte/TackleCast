@@ -1,0 +1,45 @@
+========================================
+  TackleCast - Quick Start Guide
+========================================
+
+CONTROLS
+--------
+  Escape    Open / close the settings menu
+  F11       Toggle fullscreen
+
+That's it! TackleCast is designed to stay out of your way.
+Just plug in your capture card, launch TackleCast, and play.
+
+WINDOWS SMARTSCREEN
+-------------------
+Windows SmartScreen may block TackleCast from launching because
+the app is not code-signed. This is normal for open-source apps
+built with Python/PyInstaller.
+
+If SmartScreen blocks the app, try clicking "More info" then
+"Run anyway." If that option is not available, you may need to
+temporarily disable SmartScreen:
+
+  1. Open Windows Security (search "Windows Security" in Start)
+  2. Go to App & browser control
+  3. Click "Reputation-based protection settings"
+  4. Turn off "Check apps and files"
+  5. Launch TackleCast
+  6. Turn the setting back on when you're done
+
+This only needs to be done once. After the first launch, Windows
+should remember that the app is safe.
+
+You can adjust video resolution, frame rate, audio devices,
+and volume from the settings menu (Escape).
+
+----------------------------------------
+
+Thanks for trying TackleCast!
+
+This is an open-source project. If you run into any bugs or
+have feature requests, please report them as issues on GitHub:
+
+  https://github.com/SaltedByte/TackleCast/issues
+
+Happy gaming!

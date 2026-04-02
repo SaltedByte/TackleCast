@@ -41,6 +41,12 @@ PyInstaller.__main__.run([
     "--hidden-import", "imageio_ffmpeg",
 ])
 
+# Copy Quickstart.txt into the distribution folder
+quickstart_src = os.path.join(ROOT, "Quickstart.txt")
+if os.path.exists(quickstart_src):
+    shutil.copy2(quickstart_src, os.path.join(DIST, "Quickstart.txt"))
+    print("Copied Quickstart.txt into distribution")
+
 # Clean up build artifacts
 for f in ["build", "TackleCast.spec"]:
     p = os.path.join(ROOT, f)

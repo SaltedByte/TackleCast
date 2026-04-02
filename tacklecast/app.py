@@ -4,7 +4,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QComboBox, QSlider, QLabel, QSpinBox, QPushButton, QCheckBox, QFrame,
 )
-from PyQt6.QtCore import Qt, QTimer, QPoint
+from PyQt6.QtCore import Qt, QTimer, QPoint, QEvent
 from PyQt6.QtGui import QFont, QColor, QIcon, QPainter
 
 from tacklecast.capture import MpvCapture
@@ -696,9 +696,18 @@ class MainWindow(QMainWindow):
             self.menu.apply_scale(self.width())
             self._position_menu()
 
+    def changeEvent(self, event):
+        """Hide overlay when minimized, show when restored."""
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            if self.isMinimized():
+                self.overlay.hide()
+            else:
+                self.overlay.show()
+
     def _check_mouse(self):
         """Keep overlay positioned and poll mpv stats."""
-        if self.isVisible():
+        if self.isVisible() and not self.isMinimized():
             top_left = self.video_container.mapToGlobal(QPoint(4, 4))
             if self.overlay.pos() != top_left:
                 self.overlay.move(top_left)
