@@ -1,5 +1,5 @@
 use crate::devices::AudioDevice;
-use crate::settings::{Settings, FPS_MODE_30, FPS_MODE_120, FPS_MODE_60, FPS_MODE_CUSTOM, MAX_FPS, MIN_FPS};
+use crate::settings::{Settings, ScaleFilter, FPS_MODE_30, FPS_MODE_120, FPS_MODE_60, FPS_MODE_CUSTOM, MAX_FPS, MIN_FPS};
 use egui::{
     Align, Align2, Button, Checkbox, Color32, ComboBox, CornerRadius, FontId, Frame, Layout,
     Margin, RichText, Slider, Stroke,
@@ -33,6 +33,7 @@ pub struct OverlayInfo {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub fps: Option<f32>,
+    pub filter: ScaleFilter,
     pub show_overlay: bool,
     pub status_message: Option<String>,
     pub status_is_alert: bool,
@@ -182,6 +183,7 @@ fn configure_style(ctx: &egui::Context) {
     style.visuals.selection.bg_fill = COLOR_ACCENT;
     style.visuals.selection.stroke = Stroke::new(1.0, COLOR_ACCENT);
     style.visuals.slider_trailing_fill = true;
+    style.wrap_mode = Some(egui::TextWrapMode::Extend);
     style.spacing.item_spacing = egui::vec2(10.0, 10.0);
     style.spacing.button_padding = egui::vec2(12.0, 8.0);
     ctx.set_style(style);
@@ -290,6 +292,12 @@ fn draw_menu(
                             );
                             fps_mode_combo(&mut columns[1], &mut draft.fps_mode);
                         });
+
+                        scaling_filter_combo(
+                            ui,
+                            "Scaling Filter",
+                            &mut draft.scaling_filter
+                        );
 
                         if draft.fps_mode == FPS_MODE_CUSTOM {
                             labeled_custom_fps(ui, draft);
@@ -406,6 +414,24 @@ fn labeled_combo_static(
         .show_ui(ui, |ui| {
             for option in options {
                 ui.selectable_value(selected, (*option).to_string(), *option);
+            }
+        });
+}
+
+fn scaling_filter_combo(
+    ui: &mut egui::Ui,
+    label: &str,
+    selected: &mut ScaleFilter
+) {
+    use crate::settings::ScaleFilter::*;
+
+    ui.label(RichText::new(label).color(COLOR_TEXT_SECONDARY));
+    ComboBox::from_id_salt(label)
+        .width(ui.available_width())
+        .selected_text(selected.clone().to_string())
+        .show_ui(ui, |ui| {
+            for filter in [Bilinear, Bicubic, Lanczos] {
+                ui.selectable_value(selected, filter, filter.to_string());
             }
         });
 }
@@ -553,7 +579,7 @@ fn overlay_text(overlay: &OverlayInfo) -> Option<String> {
     }
 
     match (overlay.width, overlay.height, overlay.fps) {
-        (Some(width), Some(height), Some(fps)) => Some(format!("{width}x{height} | {fps:.1} FPS")),
+        (Some(width), Some(height), Some(fps)) => Some(format!("{width}x{height}\n{}\n{fps:.1} FPS", overlay.filter)),
         _ => Some("Waiting For Video...".to_string()),
     }
 }

@@ -1,3 +1,4 @@
+use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::PathBuf;
 
@@ -15,6 +16,8 @@ pub const MAX_FPS: u32 = 240;
 pub struct Settings {
     #[serde(default)]
     pub video_device: String,
+    #[serde(default = "default_scaling_filter")]
+    pub scaling_filter: ScaleFilter,
     #[serde(default = "default_audio_index")]
     pub audio_input: i32,
     #[serde(default = "default_audio_index")]
@@ -40,10 +43,29 @@ pub struct CaptureConfig {
     pub decode_threads: usize,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ScaleFilter { Bilinear, Bicubic, Lanczos }
+impl ScaleFilter {
+    pub(crate) fn as_u32(self) -> u32 {
+        match self { Self::Bilinear => 0, Self::Bicubic => 1, Self::Lanczos => 2 }
+    }
+}
+impl Display for ScaleFilter {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bilinear => f.write_str("Bilinear"),
+            Self::Bicubic => f.write_str("Bicubic"),
+            Self::Lanczos => f.write_str("Lanczos"),
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             video_device: String::new(),
+            scaling_filter: default_scaling_filter(),
             audio_input: default_audio_index(),
             audio_output: default_audio_index(),
             resolution: default_resolution(),
@@ -155,6 +177,10 @@ fn default_audio_index() -> i32 {
     -1
 }
 
+fn default_scaling_filter() -> ScaleFilter {
+    ScaleFilter::Bilinear
+}
+
 fn default_resolution() -> String {
     "1080p".to_string()
 }
@@ -191,6 +217,7 @@ mod tests {
     fn python_settings_shape_deserializes() {
         let json = r#"{
   "video_device": "ShadowCast 3",
+  "scaling_filter": "bicubic",
   "audio_input": 15,
   "audio_output": 12,
   "resolution": "1440p",
@@ -202,6 +229,7 @@ mod tests {
 
         let settings: Settings = serde_json::from_str(json).unwrap();
         assert_eq!(settings.video_device, "ShadowCast 3");
+        assert_eq!(settings.scaling_filter, ScaleFilter::Bicubic);
         assert_eq!(settings.audio_input, 15);
         assert_eq!(settings.audio_output, 12);
         assert_eq!(settings.resolution, "1440p");

@@ -17,6 +17,10 @@ use tracing::{info, warn};
 use windows::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
 };
+use winit::event_loop::EventLoopProxy;
+
+use crate::AppEvent;
+use crate::triple_buffer::Producer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
@@ -47,6 +51,18 @@ pub enum CaptureFrame {
 }
 
 impl CaptureFrame {
+    /// Create an empty frame for triple buffer slot initialization.
+    pub fn empty() -> Self {
+        Self::Cpu {
+            width: 0,
+            height: 0,
+            format: PixelFormat::Nv12,
+            y_data: Vec::new(),
+            u_data: Vec::new(),
+            v_data: Vec::new(),
+        }
+    }
+
     pub fn width(&self) -> u32 {
         match self {
             Self::Cpu { width, .. } => *width,
@@ -88,7 +104,6 @@ pub struct NegotiatedConfig {
     pub fps: u32,
 }
 
-#[derive(Debug, Clone)]
 pub struct CaptureConfig {
     pub width: u32,
     pub height: u32,
@@ -96,7 +111,6 @@ pub struct CaptureConfig {
     pub source: CaptureSource,
 }
 
-#[derive(Debug, Clone)]
 pub enum CaptureSource {
     TestPattern {
         alternate_formats: bool,
@@ -108,14 +122,15 @@ pub enum CaptureSource {
         decode_threads: usize,
         /// Shared DX12 buffer handles for zero-copy GPU decode.
         /// When present, the capture thread will try to use these for
-        /// nvJPEG decode directly into GPU memory.
+        /// nvJPEG decode directly into GPU memory. The handles are consumed
+        /// (imported + closed) during decoder initialization.
         #[cfg(feature = "gpu-decode")]
-        shared_gpu_handles: Option<Vec<crate::dx12_interop::SharedPlaneHandles>>,
+        shared_gpu_handles: Option<crate::dx12_interop::ImportHandles>,
     },
 }
 
 pub struct CaptureThread {
-    frame_rx: Receiver<CaptureFrame>,
+    frame_consumer: crate::triple_buffer::Consumer<CaptureFrame>,
     stats_rx: Receiver<CaptureStats>,
     error_rx: Receiver<String>,
     negotiated_rx: Receiver<NegotiatedConfig>,
@@ -124,15 +139,16 @@ pub struct CaptureThread {
 }
 
 impl CaptureThread {
-    pub fn start(config: CaptureConfig) -> Self {
-        let (frame_tx, frame_rx) = unbounded();
+    pub fn start(config: CaptureConfig, event_proxy: EventLoopProxy<AppEvent>) -> Self {
+        let (frame_producer, frame_consumer) =
+            crate::triple_buffer::triple_buffer(CaptureFrame::empty);
         let (stats_tx, stats_rx) = unbounded();
         let (error_tx, error_rx) = unbounded();
         let (negotiated_tx, negotiated_rx) = unbounded();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let thread_stop_flag = stop_flag.clone();
 
-        let join_handle = thread::spawn(move || match config.source.clone() {
+        let join_handle = thread::spawn(move || match config.source {
             CaptureSource::TestPattern {
                 alternate_formats,
                 force_format,
@@ -143,8 +159,9 @@ impl CaptureThread {
                 alternate_formats,
                 force_format,
                 thread_stop_flag,
-                frame_tx,
+                frame_producer,
                 stats_tx,
+                &event_proxy,
             ),
             CaptureSource::DirectShow {
                 device_name,
@@ -160,17 +177,18 @@ impl CaptureThread {
                 pixel_format,
                 decode_threads,
                 thread_stop_flag,
-                frame_tx,
+                frame_producer,
                 stats_tx,
                 error_tx,
                 negotiated_tx,
+                &event_proxy,
                 #[cfg(feature = "gpu-decode")]
                 shared_gpu_handles,
             ),
         });
 
         Self {
-            frame_rx,
+            frame_consumer,
             stats_rx,
             error_rx,
             negotiated_rx,
@@ -179,8 +197,10 @@ impl CaptureThread {
         }
     }
 
-    pub fn latest_frame(&self) -> Option<CaptureFrame> {
-        self.frame_rx.try_iter().last()
+    /// Returns the latest frame if the capture thread has produced one since
+    /// the last call. Returns None if already up-to-date.
+    pub fn latest_frame(&mut self) -> Option<CaptureFrame> {
+        self.frame_consumer.read()
     }
 
     pub fn latest_stats(&self) -> Option<CaptureStats> {
@@ -217,8 +237,9 @@ fn run_test_pattern(
     alternate_formats: bool,
     force_format: Option<PixelFormat>,
     stop_flag: Arc<AtomicBool>,
-    frame_tx: Sender<CaptureFrame>,
+    mut frame_producer: Producer<CaptureFrame>,
     stats_tx: Sender<CaptureStats>,
+    event_proxy: &EventLoopProxy<AppEvent>,
 ) {
     let frame_interval = Duration::from_secs_f64(1.0 / fps as f64);
     let mut frame_index = 0_u64;
@@ -236,9 +257,8 @@ fn run_test_pattern(
         });
 
         let frame = generate_test_frame(width, height, frame_index, format);
-        if frame_tx.send(frame).is_err() {
-            break;
-        }
+        frame_producer.write(frame);
+        let _ = event_proxy.send_event(AppEvent::FrameReady);
 
         frame_index += 1;
         stats_frame_counter += 1;
@@ -267,12 +287,13 @@ fn run_directshow_capture(
     requested_pixel_format: String,
     decode_threads: usize,
     stop_flag: Arc<AtomicBool>,
-    frame_tx: Sender<CaptureFrame>,
+    mut frame_producer: Producer<CaptureFrame>,
     stats_tx: Sender<CaptureStats>,
     error_tx: Sender<String>,
     negotiated_tx: Sender<NegotiatedConfig>,
+    event_proxy: &EventLoopProxy<AppEvent>,
     #[cfg(feature = "gpu-decode")]
-    shared_gpu_handles: Option<Vec<crate::dx12_interop::SharedPlaneHandles>>,
+    mut shared_gpu_handles: Option<crate::dx12_interop::ImportHandles>,
 ) {
     unsafe {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
@@ -312,10 +333,11 @@ fn run_directshow_capture(
                 format_attempt.as_deref(),
                 decode_threads,
                 stop_flag.clone(),
-                frame_tx.clone(),
+                &mut frame_producer,
                 stats_tx.clone(),
+                event_proxy,
                 #[cfg(feature = "gpu-decode")]
-                &shared_gpu_handles,
+                shared_gpu_handles.take(),
             ) {
                 Ok(()) => {
                     // Notify if we fell back to different settings
@@ -357,10 +379,11 @@ fn run_directshow_capture_inner(
     requested_pixel_format: Option<&str>,
     decode_threads: usize,
     stop_flag: Arc<AtomicBool>,
-    frame_tx: Sender<CaptureFrame>,
+    frame_producer: &mut Producer<CaptureFrame>,
     stats_tx: Sender<CaptureStats>,
+    event_proxy: &EventLoopProxy<AppEvent>,
     #[cfg(feature = "gpu-decode")]
-    shared_gpu_handles: &Option<Vec<crate::dx12_interop::SharedPlaneHandles>>,
+    shared_gpu_handles: Option<crate::dx12_interop::ImportHandles>,
 ) -> Result<(), String> {
     let dshow_format = find_dshow_format()
         .ok_or_else(|| "DirectShow input format was not found in FFmpeg".to_string())?;
@@ -444,11 +467,7 @@ fn run_directshow_capture_inner(
 
     // Try to initialize GPU-accelerated MJPEG decode (NVIDIA nvJPEG)
     #[cfg(feature = "gpu-decode")]
-    let is_mjpeg = requested_pixel_format
-        .map(|f| f.eq_ignore_ascii_case("mjpeg"))
-        .unwrap_or(false);
-    #[cfg(feature = "gpu-decode")]
-    let mut gpu_decoder = if is_mjpeg {
+    let mut gpu_decoder = if requested_pixel_format.is_some_and(|f| f.eq_ignore_ascii_case("mjpeg")) {
         // Try zero-copy shared buffer mode first, then fall back to owned mode
         if let Some(handles) = shared_gpu_handles {
             info!("attempting zero-copy GPU decode with shared DX12 buffers");
@@ -509,7 +528,8 @@ fn run_directshow_capture_inner(
         #[cfg(feature = "gpu-decode")]
         if let Some(ref mut gpu) = gpu_decoder {
             if let Some(data) = packet.data() {
-                match gpu.decode(data) {
+
+                match gpu.decode_into(data, frame_producer.back_slot().take().unwrap_or_else(CaptureFrame::empty)) {
                     Ok(frame) => {
                         let width = frame.width();
                         let height = frame.height();
@@ -524,9 +544,8 @@ fn run_directshow_capture_inner(
                             );
                         }
 
-                        if frame_tx.send(frame).is_err() {
-                            return Ok(());
-                        }
+                        frame_producer.write(frame);
+                        let _ = event_proxy.send_event(AppEvent::FrameReady);
 
                         stats_frame_counter += 1;
                         summary_frame_counter += 1;
@@ -561,12 +580,16 @@ fn run_directshow_capture_inner(
                         }
                         continue; // skip software decode
                     }
-                    Err(crate::gpu_decode::GpuDecodeError::InvalidData(_)) => {
+                    Err((recycled_frame, crate::gpu_decode::GpuDecodeError::InvalidData(_))) => {
                         // Bad packet (e.g. config header) — skip to software decode
-                        // for this packet, keep GPU decode active for the next one
+                        // for this packet, keep GPU decode active for the next one.
+                        // Put the recycled frame back into the back slot.
+                        *frame_producer.back_slot() = Some(recycled_frame);
                     }
-                    Err(e) => {
-                        // CUDA or nvJPEG error — count consecutive failures
+                    Err((recycled_frame, e)) => {
+                        // CUDA or nvJPEG error — count consecutive failures.
+                        // Put the recycled frame back.
+                        *frame_producer.back_slot() = Some(recycled_frame);
                         gpu_errors += 1;
                         if gpu_errors >= 3 {
                             warn!(
@@ -614,9 +637,8 @@ fn run_directshow_capture_inner(
                 );
             }
 
-            if frame_tx.send(frame).is_err() {
-                return Ok(());
-            }
+            frame_producer.write(frame);
+            let _ = event_proxy.send_event(AppEvent::FrameReady);
 
             stats_frame_counter += 1;
             summary_frame_counter += 1;

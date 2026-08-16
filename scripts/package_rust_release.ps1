@@ -20,7 +20,7 @@ function Ensure-Exists {
 $root = Resolve-Root
 $distRoot = Join-Path $root "dist"
 $outDir = Join-Path $distRoot $PackageName
-$releaseExe = Join-Path $root "target\release\tacklecast.exe"
+$releaseExe = Join-Path $root "target\x86_64-pc-windows-msvc\release\tacklecast.exe"
 $settingsSrc = Join-Path $root "tacklecast_settings.json"
 $iconSrc = Join-Path $root "assets\icon.ico"
 $ffmpegDir = $env:FFMPEG_DIR

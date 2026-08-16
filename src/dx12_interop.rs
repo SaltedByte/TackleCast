@@ -6,90 +6,147 @@
 //!
 //! Double-buffered: two sets of Y/U/V plane buffers so the CUDA decode
 //! thread can write to one while the renderer reads from the other.
+//!
+//! # Handle Lifecycle
+//!
+//! NT kernel handles from `CreateSharedHandle` are ephemeral — they exist
+//! only to transfer the DX12 resource reference to CUDA via
+//! `cuImportExternalMemory`. After CUDA imports successfully, the handles
+//! are closed immediately. The `ImportHandles` struct enforces this by
+//! closing handles in its `Drop` impl, making leaks impossible by
+//! construction.
 
 #![cfg(feature = "gpu-decode")]
 
 use std::ffi::c_void;
 use tracing::{debug, info, warn};
 use wgpu::hal::api::Dx12;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::PCWSTR;
 
 /// Number of double-buffer sets.
 pub const NUM_BUFFER_SETS: usize = 2;
 
-/// A set of Y, U, V plane buffers for one frame.
+// ---------------------------------------------------------------------------
+// Long-lived types (stored in Renderer for the duration of capture)
+// ---------------------------------------------------------------------------
+
+/// A set of Y, U, V plane buffers for one frame (wgpu side).
 pub struct PlaneBufferSet {
     pub y_buffer: wgpu::Buffer,
     pub u_buffer: wgpu::Buffer,
     pub v_buffer: wgpu::Buffer,
-    pub y_size: u64,
-    pub u_size: u64,
-    pub v_size: u64,
 }
 
-/// Shared handle info needed by the CUDA side to import external memory.
+/// Buffer layout metadata — describes row pitches and sizes for the shared
+/// buffers. Lives as long as the decode session. Contains no kernel resources.
 #[derive(Debug, Clone, Copy)]
-pub struct SharedPlaneHandles {
-    /// NT handle for the Y plane buffer (from CreateSharedHandle).
+pub struct SharedBufferLayout {
+    /// Row pitch for Y plane (aligned to COPY_BYTES_PER_ROW_ALIGNMENT).
+    pub y_pitch: u32,
+    /// Row pitch for U/V planes (aligned).
+    pub uv_pitch: u32,
+    /// Total Y plane buffer size in bytes.
+    pub y_size: u64,
+    /// Total U (or V) plane buffer size in bytes.
+    pub uv_size: u64,
+}
+
+/// All shared GPU buffers for the zero-copy pipeline (renderer side).
+pub struct SharedGpuBuffers(pub [PlaneBufferSet; NUM_BUFFER_SETS]);
+
+// ---------------------------------------------------------------------------
+// Ephemeral types (consumed during CUDA import, then dropped)
+// ---------------------------------------------------------------------------
+
+/// NT handles for one set of Y/U/V plane buffers. These are consumed by
+/// `cuImportExternalMemory` and then closed. The `Drop` impl guarantees
+/// handles are closed even if the CUDA import fails partway through.
+pub struct ImportHandleSet {
     pub y_handle: *mut c_void,
-    /// NT handle for the U plane buffer.
     pub u_handle: *mut c_void,
-    /// NT handle for the V plane buffer.
     pub v_handle: *mut c_void,
     pub y_size: u64,
     pub u_size: u64,
     pub v_size: u64,
-    /// Row pitch in bytes (aligned to COPY_BYTES_PER_ROW_ALIGNMENT).
-    /// nvJPEG must use these as output pitches so the data layout matches
-    /// what wgpu expects in copy_buffer_to_texture.
-    pub y_pitch: u32,
-    pub uv_pitch: u32,
 }
 
-// SAFETY: NT handles are just opaque pointers, safe to send across threads.
-unsafe impl Send for SharedPlaneHandles {}
-unsafe impl Sync for SharedPlaneHandles {}
-
-/// All shared GPU buffers for the zero-copy pipeline.
-pub struct SharedGpuBuffers {
-    pub buffer_sets: [PlaneBufferSet; NUM_BUFFER_SETS],
-    pub handles: [SharedPlaneHandles; NUM_BUFFER_SETS],
-    pub width: u32,
-    pub height: u32,
+impl Drop for ImportHandleSet {
+    fn drop(&mut self) {
+        unsafe {
+            close_handle_if_valid(&mut self.y_handle);
+            close_handle_if_valid(&mut self.u_handle);
+            close_handle_if_valid(&mut self.v_handle);
+        }
+    }
 }
+
+// SAFETY: NT handles are opaque pointers, safe to send across threads.
+unsafe impl Send for ImportHandleSet {}
+
+impl ImportHandleSet {
+    /// Take a handle out, returning its value and nulling the slot so Drop
+    /// won't close it. Use this after a successful CUDA import to transfer
+    /// ownership responsibility to CUDA.
+    pub fn take_y_handle(&mut self) -> *mut c_void {
+        std::mem::replace(&mut self.y_handle, std::ptr::null_mut())
+    }
+
+    pub fn take_u_handle(&mut self) -> *mut c_void {
+        std::mem::replace(&mut self.u_handle, std::ptr::null_mut())
+    }
+
+    pub fn take_v_handle(&mut self) -> *mut c_void {
+        std::mem::replace(&mut self.v_handle, std::ptr::null_mut())
+    }
+}
+
+/// All import handles for the zero-copy pipeline. Passed to the capture
+/// thread, consumed during `NvjpegDecoder::try_new_shared`, then dropped.
+pub struct ImportHandles {
+    pub sets: Vec<ImportHandleSet>,
+    pub layout: SharedBufferLayout,
+}
+
+// ---------------------------------------------------------------------------
+// Construction
+// ---------------------------------------------------------------------------
 
 /// Calculate buffer sizes for YUV 4:2:2 planes at the given dimensions.
 /// Each row is aligned to `COPY_BYTES_PER_ROW_ALIGNMENT` (256 bytes) because
 /// wgpu's `copy_buffer_to_texture` requires aligned `bytes_per_row`.
-/// Returns (y_row_pitch, uv_row_pitch, y_size, uv_size).
-fn plane_sizes(width: u32, height: u32) -> (u32, u32, u64, u64) {
+fn plane_sizes(width: u32, height: u32) -> SharedBufferLayout {
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let y_pitch = (width + align - 1) & !(align - 1);
     let uv_pitch = ((width / 2) + align - 1) & !(align - 1);
     let y_size = (y_pitch as u64) * (height as u64);
     let uv_size = (uv_pitch as u64) * (height as u64);
-    (y_pitch, uv_pitch, y_size, uv_size)
+    SharedBufferLayout { y_pitch, uv_pitch, y_size, uv_size }
 }
 
 impl SharedGpuBuffers {
     /// Try to create shared DX12 ↔ CUDA buffers via wgpu's HAL layer.
+    ///
+    /// Returns `(SharedGpuBuffers, ImportHandles)` on success:
+    /// - `SharedGpuBuffers` stays in the renderer (wgpu Buffers + layout)
+    /// - `ImportHandles` is passed to the capture thread for CUDA import,
+    ///   then dropped (closing the NT handles)
+    ///
     /// Returns None if the DX12 backend isn't active or creation fails.
     pub fn try_new(
         device: &wgpu::Device,
         width: u32,
         height: u32,
-    ) -> Option<Self> {
-        let (y_pitch, uv_pitch, y_size, uv_size) = plane_sizes(width, height);
+    ) -> Option<(Self, ImportHandles)> {
+        let layout = plane_sizes(width, height);
 
         info!(
             "creating shared DX12 buffers for zero-copy: {}x{} (Y={}B pitch={}, UV={}B pitch={}, {} sets)",
-            width, height, y_size, y_pitch, uv_size, uv_pitch, NUM_BUFFER_SETS
+            width, height, layout.y_size, layout.y_pitch, layout.uv_size, layout.uv_pitch, NUM_BUFFER_SETS
         );
 
         // Access the raw DX12 device via wgpu HAL.
-        // Create all DX12 resources and shared handles inside the callback,
-        // then wrap them as wgpu buffers outside.
         let raw_resources = unsafe {
             device.as_hal::<Dx12, _, _>(|hal_device| {
                 let hal_device = hal_device?;
@@ -97,10 +154,19 @@ impl SharedGpuBuffers {
 
                 let mut sets = Vec::with_capacity(NUM_BUFFER_SETS);
                 for i in 0..NUM_BUFFER_SETS {
-                    match create_shared_buffer_set(raw_device, y_size, uv_size, i) {
+                    match create_shared_buffer_set(raw_device, layout.y_size, layout.uv_size, i) {
                         Ok(set) => sets.push(set),
                         Err(e) => {
                             warn!("failed to create shared DX12 buffer set {i}: {e}");
+                            // Drop already-created sets — their handles are
+                            // closed by RawBufferSet's implicit drop via
+                            // close_handle_if_valid (not yet applied here since
+                            // RawBufferSet uses raw ptrs). Close manually:
+                            for prev_set in &sets {
+                                close_handle_ptr(prev_set.y_handle);
+                                close_handle_ptr(prev_set.u_handle);
+                                close_handle_ptr(prev_set.v_handle);
+                            }
                             return None;
                         }
                     }
@@ -118,33 +184,29 @@ impl SharedGpuBuffers {
             }
         };
 
-        // Wrap the DX12 resources as high-level wgpu Buffers.
+        // Wrap the DX12 resources as high-level wgpu Buffers and split
+        // handles into the ephemeral ImportHandles struct.
         let mut buffer_sets_vec = Vec::with_capacity(NUM_BUFFER_SETS);
-        let mut handles_vec = Vec::with_capacity(NUM_BUFFER_SETS);
+        let mut import_sets = Vec::with_capacity(NUM_BUFFER_SETS);
 
         for raw_set in raw_sets {
-            let y_buffer = wrap_as_wgpu_buffer(device, raw_set.y_resource.clone(), y_size);
-            let u_buffer = wrap_as_wgpu_buffer(device, raw_set.u_resource.clone(), uv_size);
-            let v_buffer = wrap_as_wgpu_buffer(device, raw_set.v_resource.clone(), uv_size);
+            let y_buffer = wrap_as_wgpu_buffer(device, raw_set.y_resource.clone(), layout.y_size);
+            let u_buffer = wrap_as_wgpu_buffer(device, raw_set.u_resource.clone(), layout.uv_size);
+            let v_buffer = wrap_as_wgpu_buffer(device, raw_set.v_resource.clone(), layout.uv_size);
 
             buffer_sets_vec.push(PlaneBufferSet {
                 y_buffer,
                 u_buffer,
                 v_buffer,
-                y_size,
-                u_size: uv_size,
-                v_size: uv_size,
             });
 
-            handles_vec.push(SharedPlaneHandles {
+            import_sets.push(ImportHandleSet {
                 y_handle: raw_set.y_handle,
                 u_handle: raw_set.u_handle,
                 v_handle: raw_set.v_handle,
-                y_size,
-                u_size: uv_size,
-                v_size: uv_size,
-                y_pitch,
-                uv_pitch,
+                y_size: layout.y_size,
+                u_size: layout.uv_size,
+                v_size: layout.uv_size,
             });
         }
 
@@ -152,20 +214,23 @@ impl SharedGpuBuffers {
             .try_into()
             .ok()
             .expect("buffer_sets length mismatch");
-        let handles: [SharedPlaneHandles; NUM_BUFFER_SETS] = handles_vec
-            .try_into()
-            .ok()
-            .expect("handles length mismatch");
 
         info!("shared DX12 buffers created successfully for zero-copy pipeline");
-        Some(Self {
-            buffer_sets,
-            handles,
-            width,
-            height,
-        })
+
+        let shared = Self(buffer_sets);
+
+        let import_handles = ImportHandles {
+            sets: import_sets,
+            layout,
+        };
+
+        Some((shared, import_handles))
     }
 }
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
 
 /// Raw DX12 resources for one buffer set, before wrapping as wgpu objects.
 struct RawBufferSet {
@@ -186,10 +251,23 @@ fn create_shared_buffer_set(
 ) -> Result<RawBufferSet, String> {
     let (y_resource, y_handle) =
         create_shared_committed_buffer(device, y_size, &format!("Y-{set_index}"))?;
-    let (u_resource, u_handle) =
-        create_shared_committed_buffer(device, uv_size, &format!("U-{set_index}"))?;
-    let (v_resource, v_handle) =
-        create_shared_committed_buffer(device, uv_size, &format!("V-{set_index}"))?;
+
+    let (u_resource, u_handle) = match create_shared_committed_buffer(device, uv_size, &format!("U-{set_index}")) {
+        Ok(result) => result,
+        Err(e) => {
+            unsafe { close_handle_ptr(y_handle); }
+            return Err(e);
+        }
+    };
+
+    let (v_resource, v_handle) = match create_shared_committed_buffer(device, uv_size, &format!("V-{set_index}")) {
+        Ok(result) => result,
+        Err(e) => {
+            unsafe { close_handle_ptr(y_handle); }
+            unsafe { close_handle_ptr(u_handle); }
+            return Err(e);
+        }
+    };
 
     debug!(
         "DX12 shared buffer set {set_index}: Y={y_size}B U={uv_size}B V={uv_size}B"
@@ -245,7 +323,7 @@ fn create_shared_committed_buffer(
                 D3D12_HEAP_FLAG_SHARED,
                 &resource_desc,
                 D3D12_RESOURCE_STATE_COMMON,
-                None, // no clear value for buffers
+                None,
                 &mut resource,
             )
             .map_err(|e| {
@@ -259,13 +337,13 @@ fn create_shared_committed_buffer(
     // Create an NT shared handle for CUDA import.
     let handle = unsafe {
         device
-            .CreateSharedHandle(&resource, None, windows::Win32::Foundation::GENERIC_ALL.0 as u32, PCWSTR::null())
+            .CreateSharedHandle(&resource, None, windows::Win32::Foundation::GENERIC_ALL.0, PCWSTR::null())
             .map_err(|e| format!("CreateSharedHandle failed for {label}: {e}"))?
     };
 
     debug!("created shared DX12 buffer '{label}': {size}B, handle={handle:?}");
 
-    Ok((resource, handle.0 as *mut c_void))
+    Ok((resource, handle.0))
 }
 
 /// Wrap a raw DX12 ID3D12Resource as a high-level wgpu::Buffer.
@@ -283,10 +361,31 @@ fn wrap_as_wgpu_buffer(
             &wgpu::BufferDescriptor {
                 label: Some("tacklecast-shared-plane-buffer"),
                 size,
-                // COPY_SRC so we can copy_buffer_to_texture
                 usage: wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             },
         )
+    }
+}
+
+/// Close an NT handle via a mutable pointer slot. Nulls the slot after
+/// closing so it won't be double-closed.
+unsafe fn close_handle_if_valid(slot: &mut *mut c_void) {
+    let ptr = *slot;
+    if !ptr.is_null() {
+        *slot = std::ptr::null_mut();
+        if let Err(e) = CloseHandle(HANDLE(ptr)) {
+            warn!("CloseHandle failed: {e}");
+        }
+    }
+}
+
+/// Close an NT handle given a raw pointer (non-mutable convenience for
+/// error paths where we don't have mutable access to the slot).
+unsafe fn close_handle_ptr(handle: *mut c_void) {
+    if !handle.is_null() {
+        if let Err(e) = CloseHandle(HANDLE(handle)) {
+            warn!("CloseHandle failed: {e}");
+        }
     }
 }

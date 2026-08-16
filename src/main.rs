@@ -12,9 +12,9 @@ mod gpu_monitor;
 mod logger;
 mod render;
 mod settings;
+mod triple_buffer;
 mod ui;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -26,18 +26,26 @@ use settings::{get_capture_config, Settings};
 use tracing::{error, info, warn};
 use ui::{OverlayInfo, UiFrame, UiState};
 use windows::core::HSTRING;
+use windows::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED};
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Icon, Window, WindowAttributes};
+use winit::window::{Window, WindowAttributes};
 
 const WINDOW_TITLE: &str = "TackleCast";
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 720;
 const APP_ID: &str = "tacklecast.tacklecast.v1";
+
+/// Events sent from background threads to the winit event loop.
+#[derive(Debug, Clone)]
+pub enum AppEvent {
+    /// The capture thread has published a new frame to the triple buffer.
+    FrameReady,
+}
 
 #[derive(Clone, Copy, Debug)]
 enum TestPatternMode {
@@ -104,7 +112,10 @@ fn main() {
     info!("audio inputs: {:?}", audio_inputs);
     info!("audio outputs: {:?}", audio_outputs);
 
-    let event_loop = EventLoop::new().expect("failed to create event loop");
+    let event_loop = EventLoop::<AppEvent>::with_user_event()
+        .build()
+        .expect("failed to create event loop");
+    let event_proxy = event_loop.create_proxy();
     let cli = CliArgs::parse();
     let mut app = App::new(
         settings,
@@ -113,6 +124,7 @@ fn main() {
         video_devices,
         audio_inputs,
         audio_outputs,
+        event_proxy,
     );
     event_loop.run_app(&mut app).expect("event loop error");
 }
@@ -124,6 +136,7 @@ struct App {
     video_devices: Vec<String>,
     audio_inputs: Vec<AudioDevice>,
     audio_outputs: Vec<AudioDevice>,
+    event_proxy: EventLoopProxy<AppEvent>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     ui: Option<UiState>,
@@ -133,9 +146,12 @@ struct App {
     latest_error: Option<String>,
     is_fullscreen: bool,
     is_minimized: bool,
+    is_sleep_suppressed: bool,
+    is_cursor_visible: bool,
     render_frame_counter: u64,
     render_frames_uploaded: u64,
     last_render_summary: Instant,
+    last_cursor_moved: Instant,
     #[cfg(feature = "gpu-decode")]
     gpu_monitor: Option<gpu_monitor::GpuMonitor>,
 }
@@ -148,6 +164,7 @@ impl App {
         video_devices: Vec<String>,
         audio_inputs: Vec<AudioDevice>,
         audio_outputs: Vec<AudioDevice>,
+        event_proxy: EventLoopProxy<AppEvent>,
     ) -> Self {
         Self {
             settings,
@@ -156,6 +173,7 @@ impl App {
             video_devices,
             audio_inputs,
             audio_outputs,
+            event_proxy,
             window: None,
             renderer: None,
             ui: None,
@@ -165,28 +183,96 @@ impl App {
             latest_error: None,
             is_fullscreen: false,
             is_minimized: false,
+            is_sleep_suppressed: false,
+            is_cursor_visible: true,
             render_frame_counter: 0,
             render_frames_uploaded: 0,
             last_render_summary: Instant::now(),
+            last_cursor_moved: Instant::now(),
             #[cfg(feature = "gpu-decode")]
             gpu_monitor: gpu_monitor::GpuMonitor::try_new(),
         }
     }
 
     fn create_window(event_loop: &ActiveEventLoop) -> Window {
-        event_loop
+        let window = event_loop
             .create_window(
                 WindowAttributes::default()
                     .with_title(WINDOW_TITLE)
                     .with_resizable(true)
                     .with_inner_size(PhysicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT))
-                    .with_window_icon(load_window_icon()),
             )
-            .expect("failed to create window")
+            .expect("failed to create window");
+
+        // Apply window icon from exe resources
+        unsafe {
+            use windows::core::PCWSTR;
+            use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+            use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                LoadImageW, SendMessageW, HICON, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED,
+                ICON_BIG, ICON_SMALL, WM_SETICON,
+            };
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+            // 1. Fetch the HWND from winit's HasWindowHandle structure
+            let handle_abstract = window.window_handle().expect("Failed to read window handle");
+            if let RawWindowHandle::Win32(win32_handle) = handle_abstract.as_raw() {
+                let hwnd = HWND(win32_handle.hwnd.get() as *mut std::ffi::c_void);
+
+                // 2. Fetch current module instance handle
+                let h_instance = GetModuleHandleW(None).unwrap_or_default();
+
+                // 3. Map numeric ID 1 assigned by winresource into PCWSTR
+                let icon_name = PCWSTR(std::ptr::without_provenance(1));
+
+                // 4. Load the embedded icon layout
+                if let Ok(handle) = LoadImageW(
+                    h_instance,
+                    icon_name,
+                    IMAGE_ICON,
+                    0, // Allow OS to handle ideal bounds sampling
+                    0,
+                    LR_DEFAULTSIZE | LR_SHARED,
+                ) {
+                    let h_icon = HICON(handle.0);
+
+                    if !h_icon.is_invalid() {
+                        // 5. Send messages to assign to taskbar and titlebar context
+                        SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(h_icon.0 as isize));
+                        SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(h_icon.0 as isize));
+                    }
+                }
+            }
+        }
+
+        window
+    }
+
+    /// Sets ES_DISPLAY_REQUIRED to prevent the display from going to sleep.
+    fn set_display_sleep_suppression(&mut self, should_suppress: bool) {
+        if should_suppress != self.is_sleep_suppressed {
+            info!(should_suppress, "updating display sleep suppression");
+            self.is_sleep_suppressed = should_suppress;
+            let flags = if should_suppress { ES_CONTINUOUS | ES_DISPLAY_REQUIRED } else { ES_CONTINUOUS };
+            unsafe {
+                SetThreadExecutionState(flags);
+            }
+        }
+    }
+
+    fn set_cursor_visible(&mut self, visible: bool) {
+        if visible != self.is_cursor_visible {
+            if let Some(window) = &self.window {
+                info!(self.is_cursor_visible, "updating cursor visibility");
+                self.is_cursor_visible = visible;
+                window.set_cursor_visible(visible);
+            }
+        }
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -243,6 +329,10 @@ impl ApplicationHandler for App {
                                 ui.open_menu(&self.settings);
                             }
                         }
+                        if self.ui.as_ref().is_some_and(|ui| ui.is_menu_open()) {
+                            self.set_cursor_visible(true);
+                        }
+
                         return;
                     }
                     Key::Named(NamedKey::F11) => {
@@ -255,7 +345,9 @@ impl ApplicationHandler for App {
         }
 
         if let Some(ui) = &mut self.ui {
-            ui.on_window_event(window, &event);
+            if ui.is_menu_open() {
+                ui.on_window_event(window, &event);
+            }
         }
 
         match event {
@@ -269,6 +361,11 @@ impl ApplicationHandler for App {
                 }
                 event_loop.exit();
             }
+            WindowEvent::CursorMoved { .. } => {
+                self.last_cursor_moved = Instant::now();
+                self.set_cursor_visible(true);
+            }
+            WindowEvent::Focused(is_focused) => self.set_display_sleep_suppression(is_focused),
             WindowEvent::Resized(size) => {
                 self.is_minimized = size.width == 0 || size.height == 0;
                 if let Some(renderer) = &mut self.renderer {
@@ -277,12 +374,14 @@ impl ApplicationHandler for App {
                 if !self.is_minimized {
                     window.request_redraw();
                 }
+                self.set_display_sleep_suppression(!self.is_minimized);
             }
             WindowEvent::Occluded(occluded) => {
                 self.is_minimized = occluded;
                 if !self.is_minimized {
                     window.request_redraw();
                 }
+                self.set_display_sleep_suppression(!self.is_minimized);
             }
             WindowEvent::RedrawRequested => {
                 if self.is_minimized {
@@ -330,14 +429,45 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let (Some(capture), Some(renderer)) = (&self.capture, &mut self.renderer) {
-            if let Some(frame) = capture.latest_frame() {
-                self.latest_error = None;
-                renderer.upload_frame(&frame);
-                self.render_frames_uploaded += 1;
-            }
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
+        match event {
+            AppEvent::FrameReady => {
+                // Skip frame processing entirely when the window isn't visible.
+                // Without a render pass to drain them, queued write_texture calls
+                // accumulate in GPU memory indefinitely (display off, minimized, etc).
+                if self.is_minimized {
+                    // Still drain the triple buffer so it doesn't hold stale frames
+                    if let Some(capture) = &mut self.capture {
+                        let _ = capture.latest_frame();
+                    }
+                    return;
+                }
 
+                let mut uploaded = false;
+                if let Some(capture) = &mut self.capture {
+                    if let Some(frame) = capture.latest_frame() {
+                        if let Some(renderer) = &mut self.renderer {
+                            renderer.upload_frame(&frame);
+                            uploaded = true;
+                        }
+                    }
+                }
+                if uploaded {
+                    self.latest_error = None;
+                    self.render_frames_uploaded += 1;
+                }
+
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // Poll non-frame channels (stats, errors, negotiation).
+        // These are low-frequency and don't need event-driven wakeup.
+        if let Some(capture) = &mut self.capture {
             if let Some(stats) = capture.latest_stats() {
                 self.latest_stats = Some(stats);
             }
@@ -365,12 +495,6 @@ impl ApplicationHandler for App {
             }
         }
 
-        if !self.is_minimized {
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
-        }
-
         // Periodic render summary (every 30s)
         let render_elapsed = self.last_render_summary.elapsed();
         if render_elapsed >= std::time::Duration::from_secs(30) {
@@ -393,6 +517,12 @@ impl ApplicationHandler for App {
             self.render_frames_uploaded = 0;
             self.last_render_summary = Instant::now();
         }
+
+        // Hide cursor after 3s of inactivity if the ui menu is closed
+        let cursor_idle_elapsed = self.last_cursor_moved.elapsed();
+        if self.is_cursor_visible && cursor_idle_elapsed >= std::time::Duration::from_secs(3) && self.ui.as_ref().is_none_or(|ui| !ui.is_menu_open()) {
+            self.set_cursor_visible(false);
+        }
     }
 }
 
@@ -414,6 +544,8 @@ impl App {
             || old_settings.audio_input != self.settings.audio_input
             || old_settings.audio_output != self.settings.audio_output;
 
+        let scaling_changed = old_settings.scaling_filter != self.settings.scaling_filter;
+
         if video_changed {
             if let Some(capture) = &mut self.capture {
                 capture.stop();
@@ -426,6 +558,12 @@ impl App {
             self.start_audio();
         } else if (old_settings.volume - self.settings.volume).abs() > f64::EPSILON {
             self.audio.set_volume(self.settings.volume);
+        }
+
+        if scaling_changed {
+            if let Some(renderer) = &mut self.renderer {
+                renderer.set_scale_filter(self.settings.scaling_filter);
+            }
         }
     }
 
@@ -443,6 +581,7 @@ impl App {
             height: self.latest_stats.map(|stats| stats.height),
             fps: self.latest_stats.map(|stats| stats.fps),
             show_overlay: self.settings.show_overlay && !self.is_minimized,
+            filter: self.settings.scaling_filter,
             status_message,
             status_is_alert: self.latest_error.is_some() || self.latest_stats.is_none(),
         }
@@ -456,6 +595,7 @@ impl App {
             } else {
                 window.set_fullscreen(None);
             }
+            self.set_display_sleep_suppression(self.is_fullscreen);
         }
     }
 
@@ -518,7 +658,7 @@ impl App {
                 #[cfg(feature = "gpu-decode")]
                 shared_gpu_handles,
             },
-        }));
+        }, self.event_proxy.clone()));
     }
 
     fn start_test_capture(&mut self, width: u32, height: u32, fps: u32, reason: &str) {
@@ -537,7 +677,7 @@ impl App {
                 alternate_formats,
                 force_format,
             },
-        }));
+        }, self.event_proxy.clone()));
     }
 
     fn start_audio(&mut self) {
@@ -563,16 +703,4 @@ impl App {
             self.settings.volume,
         );
     }
-}
-
-#[allow(dead_code)]
-fn project_root() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-}
-
-fn load_window_icon() -> Option<Icon> {
-    let icon_path = project_root().join("assets").join("icon.ico");
-    let image = image::open(icon_path).ok()?.into_rgba8();
-    let (width, height) = image.dimensions();
-    Icon::from_rgba(image.into_raw(), width, height).ok()
 }

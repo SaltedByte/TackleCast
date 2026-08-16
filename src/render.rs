@@ -1,6 +1,7 @@
 #![allow(clippy::items_after_test_module)]
 
 use crate::capture::{CaptureFrame, PixelFormat};
+use crate::settings::ScaleFilter;
 use crate::ui::PreparedUi;
 use bytemuck::{Pod, Zeroable};
 use egui_wgpu::Renderer as EguiRenderer;
@@ -19,6 +20,7 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
 };
 
 pub struct Renderer {
+    window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -27,7 +29,9 @@ pub struct Renderer {
     video_pipeline: wgpu::RenderPipeline,
     video_bind_group_layout: wgpu::BindGroupLayout,
     video_sampler: wgpu::Sampler,
+    nearest_sampler: wgpu::Sampler,
     uniforms: wgpu::Buffer,
+    scale_filter: ScaleFilter,
     video_frame: Option<VideoFrameResources>,
     egui_renderer: EguiRenderer,
     // Reusable scratch buffers to avoid per-frame allocations
@@ -53,7 +57,7 @@ impl Renderer {
             ..Default::default()
         });
         let surface = instance
-            .create_surface(window)
+            .create_surface(window.clone())
             .map_err(RenderError::CreateSurface)?;
 
         let adapter = instance
@@ -137,6 +141,12 @@ impl Renderer {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
                 ],
             });
 
@@ -157,6 +167,16 @@ impl Renderer {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::FilterMode::Nearest,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+
+        let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("tacklecast-nearest-sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -198,6 +218,7 @@ impl Renderer {
         let egui_renderer = EguiRenderer::new(&device, surface_format, None, 1, false);
 
         Ok(Self {
+            window,
             surface,
             device,
             queue,
@@ -206,7 +227,9 @@ impl Renderer {
             video_pipeline,
             video_bind_group_layout,
             video_sampler,
+            nearest_sampler,
             uniforms,
+            scale_filter: ScaleFilter::Bilinear,
             video_frame: None,
             egui_renderer,
             pad_scratch: Vec::new(),
@@ -231,6 +254,10 @@ impl Renderer {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
+    }
+
+    pub fn set_scale_filter(&mut self, filter: ScaleFilter) {
+        self.scale_filter = filter;
     }
 
     pub fn upload_frame(&mut self, frame: &CaptureFrame) {
@@ -276,6 +303,7 @@ impl Renderer {
                 &self.device,
                 &self.video_bind_group_layout,
                 &self.video_sampler,
+                &self.nearest_sampler,
                 &self.uniforms,
                 width,
                 height,
@@ -290,7 +318,7 @@ impl Renderer {
         self.queue.write_buffer(
             &self.uniforms,
             0,
-            bytemuck::bytes_of(&VideoUniforms::for_format(format)),
+            bytemuck::bytes_of(&VideoUniforms::format_mode_for(format)),
         );
 
         upload_plane_r8(
@@ -350,18 +378,18 @@ impl Renderer {
     }
 
     /// Try to initialize shared DX12 ↔ CUDA buffers for zero-copy.
-    /// Returns shared handles for the CUDA side if successful.
+    /// Returns import handles for the CUDA side if successful.
+    /// The handles are ephemeral — CUDA imports them and they're closed on drop.
     #[cfg(feature = "gpu-decode")]
     pub fn try_init_shared_buffers(
         &mut self,
         width: u32,
         height: u32,
-    ) -> Option<Vec<crate::dx12_interop::SharedPlaneHandles>> {
-        let shared =
+    ) -> Option<crate::dx12_interop::ImportHandles> {
+        let (shared, import_handles) =
             crate::dx12_interop::SharedGpuBuffers::try_new(&self.device, width, height)?;
-        let handles: Vec<_> = shared.handles.to_vec();
         self.shared_gpu_buffers = Some(shared);
-        Some(handles)
+        Some(import_handles)
     }
 
     #[cfg(feature = "gpu-decode")]
@@ -371,7 +399,7 @@ impl Renderer {
             return;
         };
 
-        if buffer_index >= shared.buffer_sets.len() {
+        if buffer_index >= shared.0.len() {
             tracing::warn!("GPU frame buffer_index {buffer_index} out of range");
             return;
         }
@@ -390,6 +418,7 @@ impl Renderer {
                 &self.device,
                 &self.video_bind_group_layout,
                 &self.video_sampler,
+                &self.nearest_sampler,
                 &self.uniforms,
                 width,
                 height,
@@ -404,10 +433,10 @@ impl Renderer {
         self.queue.write_buffer(
             &self.uniforms,
             0,
-            bytemuck::bytes_of(&VideoUniforms::for_format(format)),
+            bytemuck::bytes_of(&VideoUniforms::format_mode_for(format)),
         );
 
-        let buf_set = &shared.buffer_sets[buffer_index];
+        let buf_set = &shared.0[buffer_index];
         let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 
         // GPU-side copy: shared buffer → Y texture
@@ -500,9 +529,15 @@ impl Renderer {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 self.surface.configure(&self.device, &self.config);
+                // Flush any staged write_texture/write_buffer calls so they
+                // don't accumulate when we can't present.
+                self.queue.submit(std::iter::empty());
                 return Ok(());
             }
-            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
+            Err(wgpu::SurfaceError::Timeout) => {
+                self.queue.submit(std::iter::empty());
+                return Ok(());
+            }
             Err(wgpu::SurfaceError::OutOfMemory) => return Err(RenderError::OutOfMemory),
             Err(error) => return Err(RenderError::Surface(error)),
         };
@@ -561,6 +596,23 @@ impl Renderer {
                 );
                 pass.set_pipeline(&self.video_pipeline);
                 pass.set_bind_group(0, &video_frame.bind_group, &[]);
+
+                #[repr(C)]
+                #[derive(Clone, Copy, Pod, Zeroable)]
+                struct FilterAndViewport {
+                    filter_mode: u32,
+                    viewport_size: [f32; 2],
+                }
+
+                self.queue.write_buffer(
+                    &self.uniforms,
+                    4, // past format_mode
+                    bytemuck::bytes_of(&FilterAndViewport {
+                        filter_mode: self.scale_filter.as_u32(),
+                        viewport_size: [viewport.width, viewport.height],
+                    }),
+                );
+
                 pass.set_viewport(
                     viewport.x,
                     viewport.y,
@@ -599,6 +651,8 @@ impl Renderer {
         for texture_id in ui_texture_free {
             self.egui_renderer.free_texture(&texture_id);
         }
+
+        self.window.pre_present_notify();
         frame.present();
         Ok(())
     }
@@ -633,17 +687,20 @@ impl std::error::Error for RenderError {}
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct VideoUniforms {
     format_mode: u32,
-    _padding: [u32; 7],
+    filter_mode: u32,
+    viewport_size: [f32; 2],
+    // WGSL struct has _padding0: vec3<u32> (12 bytes) for 16-byte alignment.
+    // Total struct size = 28 bytes, but uniform buffers round up to 16-byte
+    // alignment so we pad to 32 bytes.
+    _padding: [u32; 4],
 }
 
 impl VideoUniforms {
-    fn for_format(format: PixelFormat) -> Self {
-        Self {
-            format_mode: match format {
-                PixelFormat::Nv12 => 0,
-                PixelFormat::Yuvj422p => 1,
-            },
-            _padding: [0; 7],
+    /// Returns just the format_mode value for a partial buffer write at offset 0.
+    fn format_mode_for(format: PixelFormat) -> u32 {
+        match format {
+            PixelFormat::Nv12 => 0,
+            PixelFormat::Yuvj422p => 1,
         }
     }
 }
@@ -662,7 +719,8 @@ impl VideoFrameResources {
     fn new(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
-        sampler: &wgpu::Sampler,
+        video_sampler: &wgpu::Sampler,
+        nearest_sampler: &wgpu::Sampler,
         uniforms: &wgpu::Buffer,
         width: u32,
         height: u32,
@@ -698,12 +756,16 @@ impl VideoFrameResources {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::Sampler(sampler),
+                    resource: wgpu::BindingResource::Sampler(video_sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: uniforms.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(nearest_sampler)
+                }
             ],
         });
 
@@ -907,6 +969,8 @@ fn calculate_video_viewport(
 const VIDEO_SHADER: &str = r#"
 struct VideoUniforms {
     format_mode: u32,
+    filter_mode: u32,
+    viewport_size: vec2<f32>,
     _padding0: vec3<u32>,
 };
 
@@ -915,6 +979,7 @@ struct VideoUniforms {
 @group(0) @binding(2) var v_tex: texture_2d<f32>;
 @group(0) @binding(3) var tex_sampler: sampler;
 @group(0) @binding(4) var<uniform> uniforms: VideoUniforms;
+@group(0) @binding(5) var nearest_sampler: sampler;
 
 struct VertexOut {
     @builtin(position) position: vec4<f32>,
@@ -947,10 +1012,140 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Filter kernel math
+// ---------------------------------------------------------------------------
+
+fn cubic_weight(x: f32) -> f32 {
+    // Catmull-Rom (a = -0.5): good balance of sharpness and ringing
+    let a = -0.5;
+    let ax = abs(x);
+    if ax <= 1.0 {
+        return (a + 2.0) * ax * ax * ax - (a + 3.0) * ax * ax + 1.0;
+    } else if ax < 2.0 {
+        return a * ax * ax * ax - 5.0 * a * ax * ax + 8.0 * a * ax - 4.0 * a;
+    }
+    return 0.0;
+}
+
+fn sinc(x: f32) -> f32 {
+    if abs(x) < 1e-5 { return 1.0; }
+    let px = 3.14159265 * x;
+    return sin(px) / px;
+}
+
+fn lanczos_weight(x: f32, a: f32) -> f32 {
+    if abs(x) >= a { return 0.0; }
+    return sinc(x) * sinc(x / a);
+}
+
+// ---------------------------------------------------------------------------
+// Bicubic (4x4 taps, Catmull-Rom)
+// ---------------------------------------------------------------------------
+
+fn sample_bicubic(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
+    let dims = vec2<f32>(textureDimensions(tex));
+    let texel = uv * dims - 0.5;
+    let base = floor(texel);
+    let frac = texel - base;
+    var sum = 0.0;
+    var wsum = 0.0;
+    for (var j = -1; j <= 2; j = j + 1) {
+        for (var i = -1; i <= 2; i = i + 1) {
+            let w = cubic_weight(f32(i) - frac.x) * cubic_weight(f32(j) - frac.y);
+            let pos = (base + vec2<f32>(f32(i), f32(j)) + 0.5) / dims;
+            sum = sum + textureSample(tex, nearest_sampler, pos).r * w;
+            wsum = wsum + w;
+        }
+    }
+    return sum / wsum;
+}
+
+// ---------------------------------------------------------------------------
+// Lanczos — 2-lobe (4x4 taps) for moderate upscale, 3-lobe (6x6 taps) for
+// large upscale ratios (>2x). The wider kernel eliminates aliasing/ringing
+// artifacts that the 2-lobe version produces at high magnification.
+// ---------------------------------------------------------------------------
+
+fn sample_lanczos2(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
+    let a = 2.0;
+    let dims = vec2<f32>(textureDimensions(tex));
+    let texel = uv * dims - 0.5;
+    let base = floor(texel);
+    let frac = texel - base;
+    var sum = 0.0;
+    var wsum = 0.0;
+    for (var j = -1; j <= 2; j = j + 1) {
+        for (var i = -1; i <= 2; i = i + 1) {
+            let w = lanczos_weight(f32(i) - frac.x, a) * lanczos_weight(f32(j) - frac.y, a);
+            let pos = (base + vec2<f32>(f32(i), f32(j)) + 0.5) / dims;
+            sum = sum + textureSample(tex, nearest_sampler, pos).r * w;
+            wsum = wsum + w;
+        }
+    }
+    return sum / max(wsum, 1e-5);
+}
+
+fn sample_lanczos3(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
+    let a = 3.0;
+    let dims = vec2<f32>(textureDimensions(tex));
+    let texel = uv * dims - 0.5;
+    let base = floor(texel);
+    let frac = texel - base;
+    var sum = 0.0;
+    var wsum = 0.0;
+    for (var j = -2; j <= 3; j = j + 1) {
+        for (var i = -2; i <= 3; i = i + 1) {
+            let w = lanczos_weight(f32(i) - frac.x, a) * lanczos_weight(f32(j) - frac.y, a);
+            let pos = (base + vec2<f32>(f32(i), f32(j)) + 0.5) / dims;
+            sum = sum + textureSample(tex, nearest_sampler, pos).r * w;
+            wsum = wsum + w;
+        }
+    }
+    return sum / max(wsum, 1e-5);
+}
+
+// ---------------------------------------------------------------------------
+// Filter dispatch — selects algorithm based on filter_mode uniform and
+// adapts kernel size based on viewport-to-source scale ratio.
+//
+// When the viewport is smaller than or equal to the source texture
+// (downscaling or 1:1), custom upscale filters are bypassed in favor of
+// hardware bilinear — upscale filters applied to minification would
+// undersample the source and produce aliasing.
+// ---------------------------------------------------------------------------
+
+fn sample_plane(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
+    // Bypass custom filters when not upscaling (ratio <= 1.0).
+    // Hardware bilinear is correct for downscale/1:1 without mip chains.
+    let src_dims = vec2<f32>(textureDimensions(tex));
+    let scale = uniforms.viewport_size / max(src_dims, vec2<f32>(1.0));
+    let max_scale = max(scale.x, scale.y);
+
+    if max_scale <= 1.0 || uniforms.filter_mode == 0u {
+        // Bilinear: hardware-accelerated, or forced when downscaling
+        return textureSample(tex, tex_sampler, uv).r;
+    }
+
+    if uniforms.filter_mode == 1u {
+        return sample_bicubic(tex, uv);
+    }
+
+    // filter_mode == 2u: Lanczos with adaptive lobe count
+    if max_scale > 2.0 {
+        return sample_lanczos3(tex, uv);
+    }
+    return sample_lanczos2(tex, uv);
+}
+
+// ---------------------------------------------------------------------------
+// YUV → RGB color conversion
+// ---------------------------------------------------------------------------
+
 fn sample_yuvj422p(uv: vec2<f32>) -> vec3<f32> {
-    let y = textureSample(y_tex, tex_sampler, uv).r;
-    let u = textureSample(u_tex, tex_sampler, uv).r - 0.5;
-    let v = textureSample(v_tex, tex_sampler, uv).r - 0.5;
+    let y = sample_plane(y_tex, uv);
+    let u = sample_plane(u_tex, uv) - 0.5;
+    let v = sample_plane(v_tex, uv) - 0.5;
     return vec3<f32>(
         y + 1.402 * v,
         y - 0.344136 * u - 0.714136 * v,
@@ -959,9 +1154,9 @@ fn sample_yuvj422p(uv: vec2<f32>) -> vec3<f32> {
 }
 
 fn sample_nv12(uv: vec2<f32>) -> vec3<f32> {
-    let y = textureSample(y_tex, tex_sampler, uv).r;
-    let u = textureSample(u_tex, tex_sampler, uv).r;
-    let v = textureSample(v_tex, tex_sampler, uv).r;
+    let y = sample_plane(y_tex, uv);
+    let u = sample_plane(u_tex, uv);
+    let v = sample_plane(v_tex, uv);
     let y_limited = clamp((y - (16.0 / 255.0)) * (255.0 / 219.0), 0.0, 1.0);
     let u_limited = (u - (128.0 / 255.0)) * (255.0 / 224.0);
     let v_limited = (v - (128.0 / 255.0)) * (255.0 / 224.0);

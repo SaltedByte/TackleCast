@@ -42,6 +42,11 @@ pub fn init_logging() -> Result<(), Box<dyn std::error::Error>> {
         .with_filter(default_log_filter());
 
     tracing_subscriber::registry().with(file_layer).try_init()?;
+    
+    std::panic::set_hook(Box::new(|info| {
+        tracing::error!("panic: {info}");
+    }));
+    
     Ok(())
 }
 

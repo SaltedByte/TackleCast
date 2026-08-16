@@ -391,7 +391,7 @@ impl NvjpegLib {
                 .filter_map(|e| e.ok())
                 .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
                 .collect();
-            versions.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+            versions.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
 
             for version_dir in versions {
                 // Check both bin/x64/ and bin/ subdirectories
@@ -658,9 +658,10 @@ impl NvjpegDecoder {
     }
 
     /// Initialize with DX12 shared buffers for zero-copy decode.
-    /// `shared_handles` contains NT handles + sizes for each double-buffer set.
+    /// `import_handles` contains NT handles + sizes for each double-buffer set.
+    /// The handles are consumed (imported into CUDA, then closed via Drop).
     pub fn try_new_shared(
-        shared_handles: &[crate::dx12_interop::SharedPlaneHandles],
+        mut import_handles: crate::dx12_interop::ImportHandles,
     ) -> Option<Self> {
         let cuda = CudaLib::try_load().or_else(|| {
             debug!("nvcuda.dll not found — GPU decode unavailable");
@@ -766,9 +767,9 @@ impl NvjpegDecoder {
                     })
                 };
 
-            let mut sets = Vec::with_capacity(shared_handles.len());
-            for (i, handles) in shared_handles.iter().enumerate() {
-                let y = match import_buffer(handles.y_handle, handles.y_size) {
+            let mut sets = Vec::with_capacity(import_handles.sets.len());
+            for (i, handle_set) in import_handles.sets.iter_mut().enumerate() {
+                let y = match import_buffer(handle_set.y_handle, handle_set.y_size) {
                     Some(b) => b,
                     None => {
                         warn!("failed to import Y shared buffer for set {i}");
@@ -781,7 +782,10 @@ impl NvjpegDecoder {
                         return None;
                     }
                 };
-                let u = match import_buffer(handles.u_handle, handles.u_size) {
+                // Handle was consumed by CUDA — null it so Drop won't close it
+                handle_set.take_y_handle();
+
+                let u = match import_buffer(handle_set.u_handle, handle_set.u_size) {
                     Some(b) => b,
                     None => {
                         warn!("failed to import U shared buffer for set {i}");
@@ -795,7 +799,9 @@ impl NvjpegDecoder {
                         return None;
                     }
                 };
-                let v = match import_buffer(handles.v_handle, handles.v_size) {
+                handle_set.take_u_handle();
+
+                let v = match import_buffer(handle_set.v_handle, handle_set.v_size) {
                     Some(b) => b,
                     None => {
                         warn!("failed to import V shared buffer for set {i}");
@@ -810,27 +816,31 @@ impl NvjpegDecoder {
                         return None;
                     }
                 };
+                handle_set.take_v_handle();
 
                 debug!("imported DX12 shared buffer set {i} into CUDA");
                 sets.push(SharedPlaneSet {
                     y,
                     u,
                     v,
-                    y_pitch: handles.y_pitch,
-                    uv_pitch: handles.uv_pitch,
+                    y_pitch: import_handles.layout.y_pitch,
+                    uv_pitch: import_handles.layout.uv_pitch,
                 });
             }
 
-            // Use first set's sizes for alloc dimensions
-            let first = &shared_handles[0];
+            // import_handles is dropped here — any handles that weren't
+            // successfully imported (nulled via take_*_handle) are closed by
+            // ImportHandleSet::drop(). Successfully imported ones were nulled
+            // so Drop is a no-op for them.
+
             let alloc_width = 2560_u32; // will be validated on first frame
             let alloc_height = 1440_u32;
 
             info!(
                 "nvJPEG GPU decoder initialized in zero-copy mode ({} buffer sets, Y={}B UV={}B)",
                 sets.len(),
-                first.y_size,
-                first.u_size,
+                import_handles.layout.y_size,
+                import_handles.layout.uv_size,
             );
 
             Some(Self {
@@ -951,14 +961,19 @@ impl NvjpegDecoder {
                 host_bufs,
                 host_index,
             } => {
-                // Fallback: copy decoded planes from device to host.
-                // Use double-buffered host buffers to avoid .to_vec() copies:
-                // decode into set N, then swap ownership of set N into CaptureFrame
-                // while the *other* set stays for the next decode.
+                // Fallback: copy decoded planes from device → host staging
+                // buffers → output CaptureFrame.
+                //
+                // The host_bufs serve as fixed staging memory for cuMemcpyDtoH.
+                // We then copy from the staging buffer into the CaptureFrame.
+                // In steady state, the CaptureFrame comes from the triple
+                // buffer's recycled back slot and already has Vec capacity —
+                // resize() is a no-op when capacity >= len, so zero allocation.
                 let y_size = (width * height) as usize;
                 let uv_size = ((width / 2) * height) as usize;
 
                 let idx = *host_index;
+                let len = host_bufs.len();
                 let buf = &mut host_bufs[idx];
 
                 unsafe {
@@ -990,27 +1005,175 @@ impl NvjpegDecoder {
                     }
                 }
 
-                // Swap ownership: move the filled buffer into CaptureFrame,
-                // replace with a fresh buffer of the same capacity (zero-alloc
-                // when capacity is already sufficient, which it always is after
-                // the first frame).
-                let y_data = std::mem::replace(&mut buf.y, vec![0u8; y_size]);
-                let u_data = std::mem::replace(&mut buf.u, vec![0u8; uv_size]);
-                let v_data = std::mem::replace(&mut buf.v, vec![0u8; uv_size]);
-
                 // Advance to the other host buffer set for next decode
-                *host_index = (idx + 1) % host_bufs.len();
+                *host_index = (idx + 1) % len;
 
+                // Build CaptureFrame from the staging data.
+                // Callers using the triple buffer should call decode_into()
+                // instead to avoid this allocation entirely.
                 Ok(CaptureFrame::Cpu {
                     width,
                     height,
                     format: PixelFormat::Yuvj422p,
-                    y_data,
-                    u_data,
-                    v_data,
+                    y_data: buf.y[..y_size].to_vec(),
+                    u_data: buf.u[..uv_size].to_vec(),
+                    v_data: buf.v[..uv_size].to_vec(),
                 })
             }
         }
+    }
+
+    /// Decode JPEG and write directly into the provided CaptureFrame's buffers.
+    ///
+    /// This is the zero-allocation path: the caller passes a recycled
+    /// CaptureFrame (from the triple buffer's back slot) whose Vecs already
+    /// have sufficient capacity. The decode writes directly into them.
+    ///
+    /// Returns the updated CaptureFrame on success, or the original frame
+    /// on error (so it can be put back).
+    pub fn decode_into(
+        &mut self,
+        jpeg_data: &[u8],
+        mut frame: CaptureFrame,
+    ) -> Result<CaptureFrame, (CaptureFrame, GpuDecodeError)> {
+        if jpeg_data.len() < 2 || jpeg_data[0] != 0xFF || jpeg_data[1] != 0xD8 {
+            return Err((
+                frame,
+                GpuDecodeError::InvalidData(
+                    "data does not start with JPEG SOI marker (FF D8)".into(),
+                ),
+            ));
+        }
+
+        let jpeg_data = ensure_dht(jpeg_data);
+
+        let (width, height) = if !self.validated {
+            let info = match self.get_image_info(&jpeg_data) {
+                Ok(info) => info,
+                Err(e) => return Err((frame, e)),
+            };
+            info!(
+                "nvJPEG first frame: {}x{}, subsampling={:?}, components={}",
+                info.0, info.1, info.2, info.3
+            );
+            self.validated = true;
+            (info.0, info.1)
+        } else {
+            (self.alloc_width, self.alloc_height)
+        };
+
+        if let Err(e) = self.ensure_buffers(width, height) {
+            return Err((frame, e));
+        }
+
+        // Check if we're in shared mode — if so, delegate to regular decode.
+        // We do this check before the mutable borrow of self.mode below.
+        if matches!(self.mode, DecodeMode::Shared { .. }) {
+            match self.decode(jpeg_data.as_ref()) {
+                Ok(result) => return Ok(result),
+                Err(e) => return Err((frame, e)),
+            }
+        }
+
+        // Owned mode: decode into device memory, copy to host staging, then into frame Vecs.
+        let DecodeMode::Owned {
+            d_y, d_u, d_v, host_bufs, host_index,
+        } = &mut self.mode else {
+            unreachable!();
+        };
+
+        let y_size = (width * height) as usize;
+        let uv_size = ((width / 2) * height) as usize;
+
+        // Set up nvJPEG output to decode into device memory
+        let mut output = NvjpegImage {
+            channel: [
+                d_y.ptr as *mut u8,
+                d_u.ptr as *mut u8,
+                d_v.ptr as *mut u8,
+                ptr::null_mut(),
+            ],
+            pitch: [width as usize, (width / 2) as usize, (width / 2) as usize, 0],
+        };
+
+        unsafe {
+            let res = (self.nvjpeg.decode)(
+                self.handle,
+                self.state,
+                (*jpeg_data).as_ptr(),
+                (*jpeg_data).len(),
+                NVJPEG_OUTPUT_YUV,
+                &mut output,
+                self.stream,
+            );
+            if res != NVJPEG_STATUS_SUCCESS {
+                return Err((frame, GpuDecodeError::Nvjpeg("nvjpegDecode", res)));
+            }
+
+            let res = (self.cuda.cu_stream_synchronize)(self.stream);
+            if res != CUDA_SUCCESS {
+                return Err((frame, GpuDecodeError::Cuda("cuStreamSynchronize", res)));
+            }
+        }
+
+        // Copy from device to host staging buffer
+        let idx = *host_index;
+        let buf = &mut host_bufs[idx];
+
+        unsafe {
+            let res = (self.cuda.cu_memcpy_dtoh)(
+                buf.y.as_mut_ptr() as *mut c_void,
+                d_y.ptr,
+                y_size,
+            );
+            if res != CUDA_SUCCESS {
+                return Err((frame, GpuDecodeError::Cuda("cuMemcpyDtoH (Y)", res)));
+            }
+            let res = (self.cuda.cu_memcpy_dtoh)(
+                buf.u.as_mut_ptr() as *mut c_void,
+                d_u.ptr,
+                uv_size,
+            );
+            if res != CUDA_SUCCESS {
+                return Err((frame, GpuDecodeError::Cuda("cuMemcpyDtoH (U)", res)));
+            }
+            let res = (self.cuda.cu_memcpy_dtoh)(
+                buf.v.as_mut_ptr() as *mut c_void,
+                d_v.ptr,
+                uv_size,
+            );
+            if res != CUDA_SUCCESS {
+                return Err((frame, GpuDecodeError::Cuda("cuMemcpyDtoH (V)", res)));
+            }
+        }
+
+        // Write directly into the CaptureFrame's Vecs (zero-alloc
+        // when capacity is already sufficient from recycling).
+        if let CaptureFrame::Cpu {
+            width: ref mut fw,
+            height: ref mut fh,
+            format: ref mut ff,
+            ref mut y_data,
+            ref mut u_data,
+            ref mut v_data,
+        } = frame
+        {
+            *fw = width;
+            *fh = height;
+            *ff = PixelFormat::Yuvj422p;
+
+            y_data.resize(y_size, 0);
+            u_data.resize(uv_size, 0);
+            v_data.resize(uv_size, 0);
+
+            y_data.copy_from_slice(&buf.y[..y_size]);
+            u_data.copy_from_slice(&buf.u[..uv_size]);
+            v_data.copy_from_slice(&buf.v[..uv_size]);
+        }
+
+        *host_index = (idx + 1) % host_bufs.len();
+
+        Ok(frame)
     }
 
     /// Query JPEG dimensions and subsampling from compressed data.
