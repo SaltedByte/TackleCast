@@ -16,7 +16,7 @@ mod triple_buffer;
 mod ui;
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use audio::AudioPassthrough;
 use capture::{CaptureConfig, CaptureSource, CaptureStats, CaptureThread, PixelFormat};
@@ -31,7 +31,7 @@ use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowAttributes};
 
@@ -39,6 +39,15 @@ const WINDOW_TITLE: &str = "TackleCast";
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 720;
 const APP_ID: &str = "tacklecast.tacklecast.v1";
+
+/// How often the event loop wakes when no frames are arriving, to poll the
+/// stats/error channels and run the cursor-idle and render-summary timers.
+/// Frames drive redraws through `AppEvent::FrameReady` and don't wait for this.
+const HOUSEKEEPING_TICK: Duration = Duration::from_millis(100);
+
+/// A capture counts as live while frames have arrived this recently. Used to
+/// decide whether to hold the display awake.
+const CAPTURE_LIVE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Events sent from background threads to the winit event loop.
 #[derive(Debug, Clone)]
@@ -152,6 +161,7 @@ struct App {
     render_frames_uploaded: u64,
     last_render_summary: Instant,
     last_cursor_moved: Instant,
+    last_frame_at: Option<Instant>,
     #[cfg(feature = "gpu-decode")]
     gpu_monitor: Option<gpu_monitor::GpuMonitor>,
 }
@@ -189,6 +199,7 @@ impl App {
             render_frames_uploaded: 0,
             last_render_summary: Instant::now(),
             last_cursor_moved: Instant::now(),
+            last_frame_at: None,
             #[cfg(feature = "gpu-decode")]
             gpu_monitor: gpu_monitor::GpuMonitor::try_new(),
         }
@@ -249,25 +260,46 @@ impl App {
         window
     }
 
-    /// Sets ES_DISPLAY_REQUIRED to prevent the display from going to sleep.
-    fn set_display_sleep_suppression(&mut self, should_suppress: bool) {
-        if should_suppress != self.is_sleep_suppressed {
-            info!(should_suppress, "updating display sleep suppression");
-            self.is_sleep_suppressed = should_suppress;
-            let flags = if should_suppress { ES_CONTINUOUS | ES_DISPLAY_REQUIRED } else { ES_CONTINUOUS };
-            unsafe {
-                SetThreadExecutionState(flags);
-            }
+    /// Recomputes whether the display should be held awake and pushes the
+    /// result to Windows via ES_DISPLAY_REQUIRED.
+    ///
+    /// The predicate is "frames are still arriving and the window is visible".
+    /// Deliberately not focus-based: watching a console on a second monitor
+    /// while working in another window is the normal case for this app, and
+    /// the screen shouldn't sleep underneath it. Frames stopping — capture card
+    /// unplugged, console powered off — does let the display sleep again.
+    ///
+    /// Cheap to call often; it early-returns unless the answer changed.
+    fn update_sleep_suppression(&mut self) {
+        let capture_live = self
+            .last_frame_at
+            .is_some_and(|at| at.elapsed() < CAPTURE_LIVE_TIMEOUT);
+        let should_suppress = capture_live && !self.is_minimized;
+
+        if should_suppress == self.is_sleep_suppressed {
+            return;
+        }
+
+        info!(should_suppress, "updating display sleep suppression");
+        self.is_sleep_suppressed = should_suppress;
+        let flags = if should_suppress {
+            ES_CONTINUOUS | ES_DISPLAY_REQUIRED
+        } else {
+            ES_CONTINUOUS
+        };
+        unsafe {
+            SetThreadExecutionState(flags);
         }
     }
 
     fn set_cursor_visible(&mut self, visible: bool) {
-        if visible != self.is_cursor_visible {
-            if let Some(window) = &self.window {
-                info!(self.is_cursor_visible, "updating cursor visibility");
-                self.is_cursor_visible = visible;
-                window.set_cursor_visible(visible);
-            }
+        if visible == self.is_cursor_visible {
+            return;
+        }
+        if let Some(window) = &self.window {
+            info!(visible, "updating cursor visibility");
+            self.is_cursor_visible = visible;
+            window.set_cursor_visible(visible);
         }
     }
 }
@@ -279,7 +311,10 @@ impl ApplicationHandler<AppEvent> for App {
         }
 
         let window = Arc::new(Self::create_window(event_loop));
-        let renderer = match pollster::block_on(Renderer::new(window.clone())) {
+        let renderer = match pollster::block_on(Renderer::new(
+            window.clone(),
+            self.settings.scaling_filter,
+        )) {
             Ok(renderer) => renderer,
             Err(error) => {
                 error!("renderer initialization failed: {error}");
@@ -344,10 +379,12 @@ impl ApplicationHandler<AppEvent> for App {
             }
         }
 
+        // Forward every event, not just while the menu is open: egui also
+        // tracks DPI, surface size, modifiers, and pointer position from these,
+        // and goes stale (wrong scale factor after a monitor change, unknown
+        // pointer position) if it only sees them some of the time.
         if let Some(ui) = &mut self.ui {
-            if ui.is_menu_open() {
-                ui.on_window_event(window, &event);
-            }
+            ui.on_window_event(window, &event);
         }
 
         match event {
@@ -365,7 +402,6 @@ impl ApplicationHandler<AppEvent> for App {
                 self.last_cursor_moved = Instant::now();
                 self.set_cursor_visible(true);
             }
-            WindowEvent::Focused(is_focused) => self.set_display_sleep_suppression(is_focused),
             WindowEvent::Resized(size) => {
                 self.is_minimized = size.width == 0 || size.height == 0;
                 if let Some(renderer) = &mut self.renderer {
@@ -374,14 +410,14 @@ impl ApplicationHandler<AppEvent> for App {
                 if !self.is_minimized {
                     window.request_redraw();
                 }
-                self.set_display_sleep_suppression(!self.is_minimized);
+                self.update_sleep_suppression();
             }
             WindowEvent::Occluded(occluded) => {
                 self.is_minimized = occluded;
                 if !self.is_minimized {
                     window.request_redraw();
                 }
-                self.set_display_sleep_suppression(!self.is_minimized);
+                self.update_sleep_suppression();
             }
             WindowEvent::RedrawRequested => {
                 if self.is_minimized {
@@ -444,17 +480,17 @@ impl ApplicationHandler<AppEvent> for App {
                 }
 
                 let mut uploaded = false;
-                if let Some(capture) = &mut self.capture {
+                if let (Some(capture), Some(renderer)) = (&mut self.capture, &mut self.renderer) {
                     if let Some(frame) = capture.latest_frame() {
-                        if let Some(renderer) = &mut self.renderer {
-                            renderer.upload_frame(&frame);
-                            uploaded = true;
-                        }
+                        renderer.upload_frame(frame);
+                        uploaded = true;
                     }
                 }
                 if uploaded {
                     self.latest_error = None;
                     self.render_frames_uploaded += 1;
+                    self.last_frame_at = Some(Instant::now());
+                    self.update_sleep_suppression();
                 }
 
                 if let Some(window) = &self.window {
@@ -464,7 +500,14 @@ impl ApplicationHandler<AppEvent> for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Frames arrive as user events, so the loop no longer spins. It still
+        // needs a slow tick, though: the channels below and the timers further
+        // down are only serviced here, and without a wakeup they'd stall
+        // whenever frames stop — leaving a capture error unreported and the
+        // overlay frozen on stale numbers.
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + HOUSEKEEPING_TICK));
+
         // Poll non-frame channels (stats, errors, negotiation).
         // These are low-frequency and don't need event-driven wakeup.
         if let Some(capture) = &mut self.capture {
@@ -520,9 +563,15 @@ impl ApplicationHandler<AppEvent> for App {
 
         // Hide cursor after 3s of inactivity if the ui menu is closed
         let cursor_idle_elapsed = self.last_cursor_moved.elapsed();
-        if self.is_cursor_visible && cursor_idle_elapsed >= std::time::Duration::from_secs(3) && self.ui.as_ref().is_none_or(|ui| !ui.is_menu_open()) {
+        if self.is_cursor_visible
+            && cursor_idle_elapsed >= Duration::from_secs(3)
+            && self.ui.as_ref().is_none_or(|ui| !ui.is_menu_open())
+        {
             self.set_cursor_visible(false);
         }
+
+        // Let the display sleep again once frames have stopped arriving.
+        self.update_sleep_suppression();
     }
 }
 
@@ -582,6 +631,7 @@ impl App {
             fps: self.latest_stats.map(|stats| stats.fps),
             show_overlay: self.settings.show_overlay && !self.is_minimized,
             filter: self.settings.scaling_filter,
+            detailed: self.settings.detailed_overlay,
             status_message,
             status_is_alert: self.latest_error.is_some() || self.latest_stats.is_none(),
         }
@@ -595,7 +645,6 @@ impl App {
             } else {
                 window.set_fullscreen(None);
             }
-            self.set_display_sleep_suppression(self.is_fullscreen);
         }
     }
 

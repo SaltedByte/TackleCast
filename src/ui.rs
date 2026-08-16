@@ -35,6 +35,8 @@ pub struct OverlayInfo {
     pub fps: Option<f32>,
     pub filter: ScaleFilter,
     pub show_overlay: bool,
+    /// Stack resolution, filter, and FPS over three lines instead of one.
+    pub detailed: bool,
     pub status_message: Option<String>,
     pub status_is_alert: bool,
 }
@@ -183,7 +185,6 @@ fn configure_style(ctx: &egui::Context) {
     style.visuals.selection.bg_fill = COLOR_ACCENT;
     style.visuals.selection.stroke = Stroke::new(1.0, COLOR_ACCENT);
     style.visuals.slider_trailing_fill = true;
-    style.wrap_mode = Some(egui::TextWrapMode::Extend);
     style.spacing.item_spacing = egui::vec2(10.0, 10.0);
     style.spacing.button_padding = egui::vec2(12.0, 8.0);
     ctx.set_style(style);
@@ -211,11 +212,18 @@ fn draw_overlay(ctx: &egui::Context, overlay: &OverlayInfo) {
                 .corner_radius(CornerRadius::same(24))
                 .inner_margin(Margin::symmetric(10, 6))
                 .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(text.unwrap_or_default())
-                            .font(FontId::proportional(14.0))
-                            .strong()
-                            .color(color),
+                    // Extend rather than wrap: the pill sizes itself to the
+                    // text, so wrapping would fold it onto a second line inside
+                    // a pill that's already the right width. Scoped to this
+                    // label so the menu keeps its normal wrapping.
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(text.unwrap_or_default())
+                                .font(FontId::proportional(14.0))
+                                .strong()
+                                .color(color),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Extend),
                     );
                 });
         });
@@ -337,6 +345,14 @@ fn draw_menu(
                             ));
                         });
 
+                        if draft.show_overlay {
+                            ui.add(Checkbox::new(
+                                &mut draft.detailed_overlay,
+                                RichText::new("Include Scaling Filter In Overlay")
+                                    .color(COLOR_TEXT_PRIMARY),
+                            ));
+                        }
+
                         separator(ui);
                         if exit_button(ui).clicked() {
                             output.exit_requested = true;
@@ -418,19 +434,13 @@ fn labeled_combo_static(
         });
 }
 
-fn scaling_filter_combo(
-    ui: &mut egui::Ui,
-    label: &str,
-    selected: &mut ScaleFilter
-) {
-    use crate::settings::ScaleFilter::*;
-
+fn scaling_filter_combo(ui: &mut egui::Ui, label: &str, selected: &mut ScaleFilter) {
     ui.label(RichText::new(label).color(COLOR_TEXT_SECONDARY));
     ComboBox::from_id_salt(label)
         .width(ui.available_width())
-        .selected_text(selected.clone().to_string())
+        .selected_text(selected.to_string())
         .show_ui(ui, |ui| {
-            for filter in [Bilinear, Bicubic, Lanczos] {
+            for filter in ScaleFilter::ALL {
                 ui.selectable_value(selected, filter, filter.to_string());
             }
         });
@@ -579,7 +589,11 @@ fn overlay_text(overlay: &OverlayInfo) -> Option<String> {
     }
 
     match (overlay.width, overlay.height, overlay.fps) {
-        (Some(width), Some(height), Some(fps)) => Some(format!("{width}x{height}\n{}\n{fps:.1} FPS", overlay.filter)),
+        (Some(width), Some(height), Some(fps)) => Some(if overlay.detailed {
+            format!("{width}x{height}\n{}\n{fps:.1} FPS", overlay.filter)
+        } else {
+            format!("{width}x{height} | {fps:.1} FPS")
+        }),
         _ => Some("Waiting For Video...".to_string()),
     }
 }

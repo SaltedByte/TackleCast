@@ -28,8 +28,7 @@ pub struct Renderer {
     size: PhysicalSize<u32>,
     video_pipeline: wgpu::RenderPipeline,
     video_bind_group_layout: wgpu::BindGroupLayout,
-    video_sampler: wgpu::Sampler,
-    nearest_sampler: wgpu::Sampler,
+    video_samplers: VideoSamplers,
     uniforms: wgpu::Buffer,
     scale_filter: ScaleFilter,
     video_frame: Option<VideoFrameResources>,
@@ -44,7 +43,13 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>) -> Result<Self, RenderError> {
+    /// `scale_filter` is the filter from saved settings. Taken as a constructor
+    /// argument rather than defaulted, so a renderer can't come up disagreeing
+    /// with the settings the menu is showing.
+    pub async fn new(
+        window: Arc<Window>,
+        scale_filter: ScaleFilter,
+    ) -> Result<Self, RenderError> {
         let size = window.inner_size();
         // Prefer DX12 on Windows so that CUDA ↔ DX12 zero-copy interop works.
         // Fall back to all backends if DX12 isn't available.
@@ -226,10 +231,12 @@ impl Renderer {
             size,
             video_pipeline,
             video_bind_group_layout,
-            video_sampler,
-            nearest_sampler,
+            video_samplers: VideoSamplers {
+                filtering: video_sampler,
+                nearest: nearest_sampler,
+            },
             uniforms,
-            scale_filter: ScaleFilter::Bilinear,
+            scale_filter,
             video_frame: None,
             egui_renderer,
             pad_scratch: Vec::new(),
@@ -302,8 +309,7 @@ impl Renderer {
             self.video_frame = Some(VideoFrameResources::new(
                 &self.device,
                 &self.video_bind_group_layout,
-                &self.video_sampler,
-                &self.nearest_sampler,
+                &self.video_samplers,
                 &self.uniforms,
                 width,
                 height,
@@ -417,8 +423,7 @@ impl Renderer {
             self.video_frame = Some(VideoFrameResources::new(
                 &self.device,
                 &self.video_bind_group_layout,
-                &self.video_sampler,
-                &self.nearest_sampler,
+                &self.video_samplers,
                 &self.uniforms,
                 width,
                 height,
@@ -571,6 +576,37 @@ impl Renderer {
             ui_texture_free.extend(ui.textures_delta.free.iter().copied());
         }
 
+        // Where the letterboxed video lands on screen. The shader needs this to
+        // work out the upscale ratio, so write it (and the filter selection)
+        // before opening the pass — queue writes are applied ahead of submitted
+        // commands regardless, but writing here keeps the ordering plain.
+        let video_viewport = self.video_frame.as_ref().map(|video_frame| {
+            calculate_video_viewport(
+                self.size.width as f32,
+                self.size.height as f32,
+                video_frame.width as f32,
+                video_frame.height as f32,
+            )
+        });
+
+        if let Some(viewport) = video_viewport {
+            #[repr(C)]
+            #[derive(Clone, Copy, Pod, Zeroable)]
+            struct FilterAndViewport {
+                filter_mode: u32,
+                viewport_size: [f32; 2],
+            }
+
+            self.queue.write_buffer(
+                &self.uniforms,
+                4, // past format_mode, which upload_frame() owns
+                bytemuck::bytes_of(&FilterAndViewport {
+                    filter_mode: self.scale_filter.as_u32(),
+                    viewport_size: [viewport.width, viewport.height],
+                }),
+            );
+        }
+
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("tacklecast-clear-pass"),
@@ -587,32 +623,9 @@ impl Renderer {
                 occlusion_query_set: None,
             });
 
-            if let Some(video_frame) = &self.video_frame {
-                let viewport = calculate_video_viewport(
-                    self.size.width as f32,
-                    self.size.height as f32,
-                    video_frame.width as f32,
-                    video_frame.height as f32,
-                );
+            if let (Some(video_frame), Some(viewport)) = (&self.video_frame, video_viewport) {
                 pass.set_pipeline(&self.video_pipeline);
                 pass.set_bind_group(0, &video_frame.bind_group, &[]);
-
-                #[repr(C)]
-                #[derive(Clone, Copy, Pod, Zeroable)]
-                struct FilterAndViewport {
-                    filter_mode: u32,
-                    viewport_size: [f32; 2],
-                }
-
-                self.queue.write_buffer(
-                    &self.uniforms,
-                    4, // past format_mode
-                    bytemuck::bytes_of(&FilterAndViewport {
-                        filter_mode: self.scale_filter.as_u32(),
-                        viewport_size: [viewport.width, viewport.height],
-                    }),
-                );
-
                 pass.set_viewport(
                     viewport.x,
                     viewport.y,
@@ -719,8 +732,7 @@ impl VideoFrameResources {
     fn new(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
-        video_sampler: &wgpu::Sampler,
-        nearest_sampler: &wgpu::Sampler,
+        samplers: &VideoSamplers,
         uniforms: &wgpu::Buffer,
         width: u32,
         height: u32,
@@ -756,7 +768,7 @@ impl VideoFrameResources {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::Sampler(video_sampler),
+                    resource: wgpu::BindingResource::Sampler(&samplers.filtering),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -764,7 +776,7 @@ impl VideoFrameResources {
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: wgpu::BindingResource::Sampler(nearest_sampler)
+                    resource: wgpu::BindingResource::Sampler(&samplers.nearest),
                 }
             ],
         });
@@ -931,6 +943,15 @@ mod tests {
     }
 }
 
+/// The two samplers the video pipeline binds. `filtering` serves the hardware
+/// bilinear path; `nearest` gives the manual filter kernels unblended texels,
+/// which is the whole point of weighting the taps ourselves.
+struct VideoSamplers {
+    filtering: wgpu::Sampler,
+    nearest: wgpu::Sampler,
+}
+
+#[derive(Clone, Copy)]
 struct Viewport {
     x: f32,
     y: f32,
@@ -1040,84 +1061,131 @@ fn lanczos_weight(x: f32, a: f32) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// Bicubic (4x4 taps, Catmull-Rom)
+// Separable kernels.
+//
+// All three filters below are separable: the 2D weight for tap (i,j) is just
+// wx[i] * wy[j]. So the per-axis weights are computed once into small arrays
+// rather than re-evaluated inside the tap loop — for Lanczos-3 that is 12
+// weight evaluations instead of 72, per plane, per pixel.
+//
+// Normalization follows from separability too: the sum of all 2D weights is
+// (sum of wx) * (sum of wy), so the two axis sums are all that's needed.
 // ---------------------------------------------------------------------------
 
+// Bicubic: 4x4 taps, Catmull-Rom.
 fn sample_bicubic(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
     let dims = vec2<f32>(textureDimensions(tex));
     let texel = uv * dims - 0.5;
     let base = floor(texel);
     let frac = texel - base;
-    var sum = 0.0;
-    var wsum = 0.0;
-    for (var j = -1; j <= 2; j = j + 1) {
-        for (var i = -1; i <= 2; i = i + 1) {
-            let w = cubic_weight(f32(i) - frac.x) * cubic_weight(f32(j) - frac.y);
-            let pos = (base + vec2<f32>(f32(i), f32(j)) + 0.5) / dims;
-            sum = sum + textureSample(tex, nearest_sampler, pos).r * w;
-            wsum = wsum + w;
-        }
+
+    var wx: array<f32, 4>;
+    var wy: array<f32, 4>;
+    var wx_sum = 0.0;
+    var wy_sum = 0.0;
+    for (var k = 0; k < 4; k = k + 1) {
+        let offset = f32(k - 1);
+        wx[k] = cubic_weight(offset - frac.x);
+        wy[k] = cubic_weight(offset - frac.y);
+        wx_sum = wx_sum + wx[k];
+        wy_sum = wy_sum + wy[k];
     }
-    return sum / wsum;
+
+    var sum = 0.0;
+    for (var j = 0; j < 4; j = j + 1) {
+        var row = 0.0;
+        for (var i = 0; i < 4; i = i + 1) {
+            let pos = (base + vec2<f32>(f32(i - 1), f32(j - 1)) + 0.5) / dims;
+            row = row + textureSample(tex, nearest_sampler, pos).r * wx[i];
+        }
+        sum = sum + row * wy[j];
+    }
+    return sum / max(wx_sum * wy_sum, 1e-5);
 }
 
-// ---------------------------------------------------------------------------
-// Lanczos — 2-lobe (4x4 taps) for moderate upscale, 3-lobe (6x6 taps) for
-// large upscale ratios (>2x). The wider kernel eliminates aliasing/ringing
-// artifacts that the 2-lobe version produces at high magnification.
-// ---------------------------------------------------------------------------
-
+// Lanczos, 2-lobe: 4x4 taps, for moderate upscale ratios.
 fn sample_lanczos2(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
     let a = 2.0;
     let dims = vec2<f32>(textureDimensions(tex));
     let texel = uv * dims - 0.5;
     let base = floor(texel);
     let frac = texel - base;
-    var sum = 0.0;
-    var wsum = 0.0;
-    for (var j = -1; j <= 2; j = j + 1) {
-        for (var i = -1; i <= 2; i = i + 1) {
-            let w = lanczos_weight(f32(i) - frac.x, a) * lanczos_weight(f32(j) - frac.y, a);
-            let pos = (base + vec2<f32>(f32(i), f32(j)) + 0.5) / dims;
-            sum = sum + textureSample(tex, nearest_sampler, pos).r * w;
-            wsum = wsum + w;
-        }
+
+    var wx: array<f32, 4>;
+    var wy: array<f32, 4>;
+    var wx_sum = 0.0;
+    var wy_sum = 0.0;
+    for (var k = 0; k < 4; k = k + 1) {
+        let offset = f32(k - 1);
+        wx[k] = lanczos_weight(offset - frac.x, a);
+        wy[k] = lanczos_weight(offset - frac.y, a);
+        wx_sum = wx_sum + wx[k];
+        wy_sum = wy_sum + wy[k];
     }
-    return sum / max(wsum, 1e-5);
+
+    var sum = 0.0;
+    for (var j = 0; j < 4; j = j + 1) {
+        var row = 0.0;
+        for (var i = 0; i < 4; i = i + 1) {
+            let pos = (base + vec2<f32>(f32(i - 1), f32(j - 1)) + 0.5) / dims;
+            row = row + textureSample(tex, nearest_sampler, pos).r * wx[i];
+        }
+        sum = sum + row * wy[j];
+    }
+    return sum / max(wx_sum * wy_sum, 1e-5);
 }
 
+// Lanczos, 3-lobe: 6x6 taps, for large upscale ratios (>2x). The wider kernel
+// avoids the aliasing/ringing the 2-lobe version shows at high magnification.
 fn sample_lanczos3(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
     let a = 3.0;
     let dims = vec2<f32>(textureDimensions(tex));
     let texel = uv * dims - 0.5;
     let base = floor(texel);
     let frac = texel - base;
-    var sum = 0.0;
-    var wsum = 0.0;
-    for (var j = -2; j <= 3; j = j + 1) {
-        for (var i = -2; i <= 3; i = i + 1) {
-            let w = lanczos_weight(f32(i) - frac.x, a) * lanczos_weight(f32(j) - frac.y, a);
-            let pos = (base + vec2<f32>(f32(i), f32(j)) + 0.5) / dims;
-            sum = sum + textureSample(tex, nearest_sampler, pos).r * w;
-            wsum = wsum + w;
-        }
+
+    var wx: array<f32, 6>;
+    var wy: array<f32, 6>;
+    var wx_sum = 0.0;
+    var wy_sum = 0.0;
+    for (var k = 0; k < 6; k = k + 1) {
+        let offset = f32(k - 2);
+        wx[k] = lanczos_weight(offset - frac.x, a);
+        wy[k] = lanczos_weight(offset - frac.y, a);
+        wx_sum = wx_sum + wx[k];
+        wy_sum = wy_sum + wy[k];
     }
-    return sum / max(wsum, 1e-5);
+
+    var sum = 0.0;
+    for (var j = 0; j < 6; j = j + 1) {
+        var row = 0.0;
+        for (var i = 0; i < 6; i = i + 1) {
+            let pos = (base + vec2<f32>(f32(i - 2), f32(j - 2)) + 0.5) / dims;
+            row = row + textureSample(tex, nearest_sampler, pos).r * wx[i];
+        }
+        sum = sum + row * wy[j];
+    }
+    return sum / max(wx_sum * wy_sum, 1e-5);
 }
 
 // ---------------------------------------------------------------------------
-// Filter dispatch — selects algorithm based on filter_mode uniform and
-// adapts kernel size based on viewport-to-source scale ratio.
+// Filter dispatch — selects the algorithm from the filter_mode uniform and
+// adapts kernel width to the viewport-to-source scale ratio.
 //
-// When the viewport is smaller than or equal to the source texture
-// (downscaling or 1:1), custom upscale filters are bypassed in favor of
-// hardware bilinear — upscale filters applied to minification would
-// undersample the source and produce aliasing.
+// When the viewport is no larger than the source texture (downscaling or 1:1),
+// the custom kernels are bypassed for hardware bilinear — an upscale kernel
+// applied to minification undersamples the source and aliases.
+//
+// The ratio is per plane, deliberately. Each plane has its own sampling
+// density: for 4:2:2 the chroma planes are half-width, so they are being
+// magnified 2x horizontally even when the luma plane maps 1:1 to the screen,
+// and they take the filtered path while luma takes the bilinear bypass. That
+// is the correct reading of the ratio — chroma really is upscaled there, and
+// filtering it properly is what keeps colour edges from bleeding. It does mean
+// the bypass rarely applies to chroma.
 // ---------------------------------------------------------------------------
 
 fn sample_plane(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
-    // Bypass custom filters when not upscaling (ratio <= 1.0).
-    // Hardware bilinear is correct for downscale/1:1 without mip chains.
     let src_dims = vec2<f32>(textureDimensions(tex));
     let scale = uniforms.viewport_size / max(src_dims, vec2<f32>(1.0));
     let max_scale = max(scale.x, scale.y);

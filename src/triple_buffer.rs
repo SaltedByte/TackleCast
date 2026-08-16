@@ -1,13 +1,13 @@
 //! Lock-free single-producer single-consumer triple buffer.
 //!
-//! The producer writes into its "back" slot and publishes it atomically.
-//! The consumer reads from its "front" slot and refreshes it from the
-//! latest published value when desired.
+//! The producer fills its "back" slot and publishes it atomically. The
+//! consumer refreshes its "front" slot from the latest published value and
+//! borrows it in place.
 //!
-//! Memory is bounded to exactly 3 instances of `T`. No heap allocation
-//! occurs after construction. The consumer returns its previous front slot
-//! back to the producer, enabling allocation reuse (e.g., recycling `Vec`
-//! capacity across frames).
+//! Memory is bounded to exactly 3 instances of `T`, and no heap allocation
+//! occurs after construction. Values are never moved out of their slots, so
+//! each slot keeps its allocations (a frame's `Vec` capacity, say) and cycles
+//! them back to the producer to be filled again.
 //!
 //! # Safety
 //!
@@ -16,34 +16,38 @@
 //! - The consumer exclusively owns its front slot.
 //! - The ready slot is in transit (no one accesses its contents).
 //!
-//! Ownership transfers atomically via the `ready` index.
+//! The three indices are always distinct, and ownership transfers only through
+//! `swap` on `ready`, so the invariant holds under any interleaving.
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
-/// Bit 2 of the ready byte: set when producer has published since last consumer read.
+/// Bit 2 of the ready byte: set when the producer has published since the
+/// consumer's last read.
 const DIRTY_BIT: u8 = 0x04;
+
+/// Bits 0-1 of the ready byte: the slot index.
+const INDEX_MASK: u8 = 0x03;
 
 /// Shared state between producer and consumer.
 struct Shared<T> {
-    slots: [UnsafeCell<Option<T>>; 3],
+    slots: [UnsafeCell<T>; 3],
     /// Packed: bits 0-1 = ready slot index (0..2), bit 2 = dirty flag.
     ready: AtomicU8,
 }
 
-// Safety: T: Send means we can transfer T between threads. The atomic ready
-// index ensures exclusive access to each slot — no two threads access the
-// same slot concurrently.
+// Safety: `T: Send` lets us transfer T between threads, and the atomic ready
+// index guarantees no two threads ever access the same slot concurrently.
 unsafe impl<T: Send> Sync for Shared<T> {}
 
-/// Producer half — call `write()` to publish a new value.
+/// Producer half — fill `back_slot()` then `publish()`, or just `write()`.
 pub struct Producer<T> {
     shared: Arc<Shared<T>>,
     back_index: u8,
 }
 
-/// Consumer half — call `read()` to get the latest published value.
+/// Consumer half — call `read()` to borrow the latest published value.
 pub struct Consumer<T> {
     shared: Arc<Shared<T>>,
     front_index: u8,
@@ -54,18 +58,18 @@ unsafe impl<T: Send> Send for Consumer<T> {}
 
 /// Create a new triple buffer, returning the producer and consumer halves.
 ///
-/// `init` is called three times to populate the initial slots. For frame
-/// buffers, pass a closure that creates an empty/default frame with
-/// pre-allocated capacity.
+/// `init` is called three times to populate the slots. For frame buffers, pass
+/// a closure that creates an empty frame; the slots grow to the working size on
+/// the first few frames and then stay there.
 pub fn triple_buffer<T, F>(mut init: F) -> (Producer<T>, Consumer<T>)
 where
     F: FnMut() -> T,
 {
     let shared = Arc::new(Shared {
         slots: [
-            UnsafeCell::new(Some(init())),
-            UnsafeCell::new(Some(init())),
-            UnsafeCell::new(Some(init())),
+            UnsafeCell::new(init()),
+            UnsafeCell::new(init()),
+            UnsafeCell::new(init()),
         ],
         // Initial: ready index = 1, not dirty
         ready: AtomicU8::new(1),
@@ -85,66 +89,68 @@ where
 }
 
 impl<T> Producer<T> {
-    /// Get a mutable reference to the back slot for in-place writing.
+    /// Borrow the back slot to fill in place.
     ///
-    /// The returned reference allows the producer to reuse the previous
-    /// value's allocations (e.g., writing into an existing `Vec` without
-    /// reallocating).
+    /// The slot still holds the previous value that occupied it, so its
+    /// allocations can be reused rather than reallocated.
     ///
     /// # Safety guarantee
     ///
-    /// The producer exclusively owns `back_index` — no other thread can
-    /// access this slot until `publish()` transfers it to the ready position.
-    pub fn back_slot(&mut self) -> &mut Option<T> {
-        // Safety: producer exclusively owns back_index's slot
+    /// The producer exclusively owns `back_index` — no other thread can access
+    /// this slot until `publish()` moves it to the ready position.
+    pub fn back_slot(&mut self) -> &mut T {
+        // Safety: the producer exclusively owns back_index's slot.
         unsafe { &mut *self.shared.slots[self.back_index as usize].get() }
     }
 
-    /// Publish the current back slot as the new ready value and reclaim
-    /// the old ready slot as the new back slot.
+    /// Publish the back slot as the new ready value and reclaim the old ready
+    /// slot as the new back slot.
     ///
-    /// This is wait-free: a single atomic swap.
+    /// Wait-free: a single atomic swap.
     pub fn publish(&mut self) {
-        let new_ready = self.back_index | DIRTY_BIT;
-        let old_ready = self.shared.ready.swap(new_ready, Ordering::AcqRel);
-        // The old ready slot becomes our new back slot
-        self.back_index = old_ready & 0x03;
+        let old_ready = self
+            .shared
+            .ready
+            .swap(self.back_index | DIRTY_BIT, Ordering::AcqRel);
+        // The old ready slot becomes our new back slot.
+        self.back_index = old_ready & INDEX_MASK;
     }
 
-    /// Convenience: write a value into the back slot and publish it.
+    /// Convenience: overwrite the back slot and publish it.
+    ///
+    /// This discards whatever the slot was holding. Prefer filling
+    /// `back_slot()` in place when the value owns heap allocations worth
+    /// reusing.
     pub fn write(&mut self, value: T) {
-        *self.back_slot() = Some(value);
+        *self.back_slot() = value;
         self.publish();
     }
 }
 
 impl<T> Consumer<T> {
-    /// Take the latest published value, returning `Some(T)` if a new value
-    /// was available since the last read, or `None` if the consumer is
-    /// already up-to-date.
+    /// Refresh the front slot from the latest published value and borrow it.
     ///
-    /// The consumer's previous front slot is returned to the producer for
-    /// reuse (allocation recycling).
-    pub fn read(&mut self) -> Option<T> {
-        // Only swap if dirty
-        let current = self.shared.ready.load(Ordering::Acquire);
-        if current & DIRTY_BIT == 0 {
+    /// Returns `None` when the producer has published nothing new since the
+    /// last call. Intermediate values are skipped — the consumer always jumps
+    /// to the newest.
+    ///
+    /// The value stays in its slot, so its allocations travel back to the
+    /// producer the next time the slots rotate.
+    pub fn read(&mut self) -> Option<&T> {
+        // Nothing new to pick up.
+        if self.shared.ready.load(Ordering::Acquire) & DIRTY_BIT == 0 {
             return None;
         }
 
-        // Swap our front index into the ready slot (clearing dirty flag)
-        let new_ready = self.front_index; // no dirty bit = clean
-        let old_ready = self.shared.ready.swap(new_ready, Ordering::AcqRel);
+        // Hand our front slot over (clean, so the producer's next publish sees
+        // no stale dirty bit) and claim whatever was in the ready position.
+        let old_ready = self.shared.ready.swap(self.front_index, Ordering::AcqRel);
+        self.front_index = old_ready & INDEX_MASK;
 
-        let new_front_index = old_ready & 0x03;
-        self.front_index = new_front_index;
-
-        // Safety: we now exclusively own new_front_index (it was the ready
-        // slot, and we've swapped our old front into ready — no one else
-        // will touch new_front_index until we swap it back).
-        
-
-        unsafe { (*self.shared.slots[new_front_index as usize].get()).take() }
+        // Safety: the slot we just claimed was the ready slot, and our previous
+        // front slot now sits in the ready position, so the producer cannot be
+        // touching this one until we swap it back.
+        Some(unsafe { &*self.shared.slots[self.front_index as usize].get() })
     }
 }
 
@@ -159,7 +165,7 @@ mod tests {
         assert!(consumer.read().is_none());
 
         producer.write(42);
-        assert_eq!(consumer.read(), Some(42));
+        assert_eq!(consumer.read(), Some(&42));
         assert!(consumer.read().is_none());
     }
 
@@ -172,35 +178,61 @@ mod tests {
         producer.write(3);
 
         // Consumer should get the latest value (3), intermediate values are lost
-        assert_eq!(consumer.read(), Some(3));
+        assert_eq!(consumer.read(), Some(&3));
         assert!(consumer.read().is_none());
     }
 
+    /// The reason this type exists rather than a channel: every slot that
+    /// reaches the producer must still carry the allocation it had before, so
+    /// steady-state frame decoding never hits the allocator.
+    ///
+    /// Mirrors the real pipeline — the producer fills the back slot in place
+    /// (as the decoder does) and the consumer borrows without taking (as the
+    /// renderer does).
     #[test]
-    fn recycling_preserves_capacity() {
-        let (mut producer, mut consumer) = triple_buffer(|| Vec::<u8>::with_capacity(1024));
+    fn slots_retain_capacity_across_many_cycles() {
+        const CAP: usize = 4096;
+        let (mut producer, mut consumer) = triple_buffer(|| Vec::<u8>::with_capacity(CAP));
 
-        // Write a value using the pre-allocated back slot
-        {
-            let slot = producer.back_slot();
-            let buf = slot.as_mut().unwrap();
+        for round in 0..20 {
+            let buf = producer.back_slot();
+            assert!(
+                buf.capacity() >= CAP,
+                "back slot arrived without its allocation on round {round} \
+                 (capacity {}) — frames would reallocate every time",
+                buf.capacity()
+            );
             buf.clear();
-            buf.extend_from_slice(&[1, 2, 3]);
+            buf.resize(CAP, 7);
+            producer.publish();
+
+            let frame = consumer.read().expect("a value was just published");
+            assert_eq!(frame.len(), CAP);
         }
-        producer.publish();
+    }
 
-        // Consumer reads
-        let frame = consumer.read().unwrap();
-        assert_eq!(frame, vec![1, 2, 3]);
+    /// The safety argument rests entirely on back, ready, and front always
+    /// being three different slots.
+    #[test]
+    fn slot_indices_stay_distinct() {
+        let (mut producer, mut consumer) = triple_buffer(|| 0_u32);
 
-        // Publish again so the consumer's old front slot cycles back to producer
-        producer.write(Vec::new());
-        let _ = consumer.read();
+        for i in 0..50_u32 {
+            producer.write(i);
 
-        // Producer's back slot should have capacity from the recycled initial slot
-        let slot = producer.back_slot();
-        let buf = slot.as_ref().unwrap();
-        assert!(buf.capacity() >= 1024);
+            let ready = producer.shared.ready.load(Ordering::Relaxed) & INDEX_MASK;
+            assert_ne!(producer.back_index, ready, "back aliased ready at {i}");
+            assert_ne!(consumer.front_index, ready, "front aliased ready at {i}");
+            assert_ne!(
+                producer.back_index, consumer.front_index,
+                "back aliased front at {i}"
+            );
+
+            // Read on an uneven cadence so the two halves interleave.
+            if i % 3 == 0 {
+                let _ = consumer.read();
+            }
+        }
     }
 
     #[test]
@@ -219,7 +251,7 @@ mod tests {
 
         let mut last_seen = None;
         loop {
-            if let Some(val) = consumer.read() {
+            if let Some(&val) = consumer.read() {
                 // Values should be monotonically non-decreasing
                 if let Some(prev) = last_seen {
                     assert!(val >= prev, "got {val} after {prev}");
