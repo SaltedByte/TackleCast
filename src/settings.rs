@@ -32,6 +32,10 @@ pub struct Settings {
     pub volume: f64,
     #[serde(default = "default_show_overlay")]
     pub show_overlay: bool,
+    /// When set, the overlay also reports the active scaling filter, stacked
+    /// over three lines. Off by default, keeping the overlay to one line.
+    #[serde(default)]
+    pub detailed_overlay: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,14 +47,30 @@ pub struct CaptureConfig {
     pub decode_threads: usize,
 }
 
+/// Upscaling filter applied to the video planes in the fragment shader.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum ScaleFilter { Bilinear, Bicubic, Lanczos }
-impl ScaleFilter {
-    pub(crate) fn as_u32(self) -> u32 {
-        match self { Self::Bilinear => 0, Self::Bicubic => 1, Self::Lanczos => 2 }
-    }
+pub enum ScaleFilter {
+    Bilinear,
+    Bicubic,
+    Lanczos,
 }
+
+impl ScaleFilter {
+    /// The `filter_mode` value the shader branches on. Must stay in step with
+    /// the `filter_mode` comparisons in `VIDEO_SHADER`.
+    pub fn as_u32(self) -> u32 {
+        match self {
+            Self::Bilinear => 0,
+            Self::Bicubic => 1,
+            Self::Lanczos => 2,
+        }
+    }
+
+    /// Every variant, in menu order.
+    pub const ALL: [Self; 3] = [Self::Bilinear, Self::Bicubic, Self::Lanczos];
+}
+
 impl Display for ScaleFilter {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -73,6 +93,7 @@ impl Default for Settings {
             custom_fps: default_custom_fps(),
             volume: default_volume(),
             show_overlay: default_show_overlay(),
+            detailed_overlay: false,
         }
     }
 }

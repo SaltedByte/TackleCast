@@ -63,6 +63,50 @@ impl CaptureFrame {
         }
     }
 
+    /// Reshape this frame into a `Cpu` frame with the given geometry, keeping
+    /// the existing plane buffers when it already is one, and return the planes
+    /// for the caller to fill.
+    ///
+    /// `Vec::resize` is a no-op once capacity is sufficient, so a frame
+    /// recycled from the triple buffer is reshaped without allocating.
+    #[cfg(feature = "gpu-decode")]
+    pub fn reshape_cpu(
+        &mut self,
+        new_width: u32,
+        new_height: u32,
+        new_format: PixelFormat,
+        y_len: usize,
+        uv_len: usize,
+    ) -> (&mut [u8], &mut [u8], &mut [u8]) {
+        if !matches!(self, Self::Cpu { .. }) {
+            *self = Self::empty();
+        }
+
+        match self {
+            Self::Cpu {
+                width,
+                height,
+                format,
+                y_data,
+                u_data,
+                v_data,
+            } => {
+                *width = new_width;
+                *height = new_height;
+                *format = new_format;
+                y_data.resize(y_len, 0);
+                u_data.resize(uv_len, 0);
+                v_data.resize(uv_len, 0);
+                (
+                    y_data.as_mut_slice(),
+                    u_data.as_mut_slice(),
+                    v_data.as_mut_slice(),
+                )
+            }
+            Self::Gpu { .. } => unreachable!("coerced to Cpu above"),
+        }
+    }
+
     pub fn width(&self) -> u32 {
         match self {
             Self::Cpu { width, .. } => *width,
@@ -197,9 +241,12 @@ impl CaptureThread {
         }
     }
 
-    /// Returns the latest frame if the capture thread has produced one since
+    /// Borrows the latest frame if the capture thread has produced one since
     /// the last call. Returns None if already up-to-date.
-    pub fn latest_frame(&mut self) -> Option<CaptureFrame> {
+    ///
+    /// The frame stays in its triple-buffer slot so its plane buffers can be
+    /// reused for a later frame — hence the borrow rather than an owned value.
+    pub fn latest_frame(&mut self) -> Option<&CaptureFrame> {
         self.frame_consumer.read()
     }
 
@@ -528,11 +575,17 @@ fn run_directshow_capture_inner(
         #[cfg(feature = "gpu-decode")]
         if let Some(ref mut gpu) = gpu_decoder {
             if let Some(data) = packet.data() {
+                // Decode straight into the back slot, reusing the plane buffers
+                // the previous frame in that slot left behind. Bound to a local
+                // so the borrow ends before the arms touch the producer again.
+                let decoded = gpu.decode_into(data, frame_producer.back_slot());
 
-                match gpu.decode_into(data, frame_producer.back_slot().take().unwrap_or_else(CaptureFrame::empty)) {
-                    Ok(frame) => {
-                        let width = frame.width();
-                        let height = frame.height();
+                match decoded {
+                    Ok(()) => {
+                        let slot = frame_producer.back_slot();
+                        let width = slot.width();
+                        let height = slot.height();
+                        let format = slot.format();
                         total_frames += 1;
                         gpu_errors = 0; // reset consecutive error count on success
 
@@ -540,11 +593,11 @@ fn run_directshow_capture_inner(
                             logged_first_frame = true;
                             info!(
                                 "first GPU-decoded frame from '{}' => {}x{} {:?}",
-                                device_name, width, height, frame.format()
+                                device_name, width, height, format
                             );
                         }
 
-                        frame_producer.write(frame);
+                        frame_producer.publish();
                         let _ = event_proxy.send_event(AppEvent::FrameReady);
 
                         stats_frame_counter += 1;
@@ -580,16 +633,13 @@ fn run_directshow_capture_inner(
                         }
                         continue; // skip software decode
                     }
-                    Err((recycled_frame, crate::gpu_decode::GpuDecodeError::InvalidData(_))) => {
+                    Err(crate::gpu_decode::GpuDecodeError::InvalidData(_)) => {
                         // Bad packet (e.g. config header) — skip to software decode
                         // for this packet, keep GPU decode active for the next one.
-                        // Put the recycled frame back into the back slot.
-                        *frame_producer.back_slot() = Some(recycled_frame);
+                        // The back slot is untouched and still holds its buffers.
                     }
-                    Err((recycled_frame, e)) => {
+                    Err(e) => {
                         // CUDA or nvJPEG error — count consecutive failures.
-                        // Put the recycled frame back.
-                        *frame_producer.back_slot() = Some(recycled_frame);
                         gpu_errors += 1;
                         if gpu_errors >= 3 {
                             warn!(
