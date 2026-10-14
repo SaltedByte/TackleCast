@@ -406,7 +406,8 @@ where
                     } else {
                         0.0
                     };
-                    data[offset + i] = T::from_sample(sample);
+                    // Cubic interpolation can overshoot even with bounded input.
+                    data[offset + i] = common::f32_to_sample(sample);
                 }
                 offset += chunk_len;
             }

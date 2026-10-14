@@ -36,5 +36,17 @@ if [[ -d "/dev" ]]; then
 fi
 
 # Launch
+if [[ -d "$SCRIPT_DIR/lib" ]]; then
+    export LD_LIBRARY_PATH="$SCRIPT_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+elif [[ -d "$ROOT_DIR/.deps/ffmpeg/lib" ]]; then
+    export LD_LIBRARY_PATH="$ROOT_DIR/.deps/ffmpeg/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+if command -v ldd >/dev/null; then
+    MISSING_LIBS=$(ldd "$BIN" | awk '/not found/ { print $1 }')
+    if [[ -n "$MISSING_LIBS" ]]; then
+        printf 'Required libraries are missing:\n%s\nKeep the bundled lib/ folder next to tacklecast and install your desktop audio/graphics runtime.\n' "$MISSING_LIBS" >&2
+        exit 1
+    fi
+fi
 echo "Starting TackleCast from $BIN..."
 exec "$BIN" "$@"

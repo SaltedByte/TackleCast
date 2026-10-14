@@ -41,6 +41,7 @@ use winit::window::{Window, WindowAttributes};
 const WINDOW_TITLE: &str = "TackleCast";
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 720;
+#[cfg(target_os = "windows")]
 const APP_ID: &str = "tacklecast.tacklecast.v1";
 
 /// How often the event loop wakes when no frames are arriving, to poll the

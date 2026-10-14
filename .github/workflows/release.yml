@@ -2,111 +2,149 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag (e.g. v2.2.0)"
-        required: false
-        default: "v2.2.0"
+        description: Existing version tag to build (must match Cargo.toml)
+        required: true
+        type: string
+      publish:
+        description: Publish the validated archives to GitHub Releases
+        required: true
+        type: boolean
+        default: false
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag_name || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
-  build-windows:
-    name: Build Windows Release (.exe)
-    runs-on: windows-latest
+  resolve:
+    name: Resolve release tag
+    runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.tag.outputs.commit }}
+      tag: ${{ steps.tag.outputs.tag }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess, tomllib
+          tag = os.environ['RELEASE_TAG']
+          if not re.fullmatch(r'v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?', tag):
+              raise SystemExit('Expected an existing vMAJOR.MINOR.PATCH tag')
+          commit = subprocess.check_output(['git', 'rev-parse', '--verify', f'refs/tags/{tag}^{{commit}}'], text=True).strip()
+          manifest = subprocess.check_output(['git', 'show', f'{commit}:Cargo.toml'], text=True)
+          if tomllib.loads(manifest)['package']['version'] != tag[1:]:
+              raise SystemExit('Release tag and Cargo.toml version disagree')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'commit={commit}\ntag={tag}\nprerelease={str("-" in tag).lower()}\n')
+          PY
 
-      - name: Setup Windows Toolchain & FFmpeg Dev Libraries
+  checks:
+    name: Validate selected commit
+    needs: resolve
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.resolve.outputs.commit }}
+
+  build:
+    name: Package ${{ matrix.os }}
+    needs: [resolve, checks]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            artifact: TackleCast-Windows-x86_64
+          - os: ubuntu-24.04
+            artifact: TackleCast-Linux-x86_64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
+        with:
+          toolchain: 1.93.1
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .deps
+          key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/setup_*_dependencies.*', 'scripts/windows-dependencies.json') }}
+      - name: Linux system dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential nasm libasound2-dev libclang-dev pkg-config xvfb libgl1-mesa-dri mesa-vulkan-drivers
+      - name: Windows runtime dependencies
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: .\scripts\setup_windows_dependencies.ps1 -IncludeGpuRuntime
+      - name: Windows package
+        if: runner.os == 'Windows'
         shell: powershell
         run: |
-          $ffmpegZip = "$env:TEMP\ffmpeg.zip"
-          Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip" -OutFile $ffmpegZip
-          Expand-Archive -Path $ffmpegZip -DestinationPath "C:\ffmpeg-extract"
-          $extractedDir = Get-ChildItem "C:\ffmpeg-extract" | Where-Object { $_.PSIsContainer } | Select-Object -First 1
-          Move-Item -Path $extractedDir.FullName -Destination "C:\ffmpeg"
-
-          "C:\ffmpeg\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          "FFMPEG_DIR=C:\ffmpeg" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "PKG_CONFIG_PATH=C:\ffmpeg\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Build & Package Windows Release
-        shell: powershell
+          .\scripts\package_rust_release.ps1 -PackageName TackleCast-Windows-x86_64 -RequireGpuDlls -Zip
+          Expand-Archive dist/TackleCast-Windows-x86_64.zip -DestinationPath dist/extracted-windows
+          python scripts/verify_package.py --package dist/extracted-windows --require-gpu --commit '${{ needs.resolve.outputs.commit }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Package verification failed' }
+          python scripts/smoke_test.py --binary dist/extracted-windows/TackleCast.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Synthetic rendering failed' }
+      - name: Linux package
+        if: runner.os == 'Linux'
         run: |
-          .\scripts\package_rust_release.ps1 -PackageName "TackleCast-Windows-x86_64" -Zip
-
-      - name: Upload Windows Artifact
-        uses: actions/upload-artifact@v4
+          bash scripts/package_linux_release.sh
+          mkdir -p dist/extracted-linux
+          tar -xzf dist/TackleCast-Linux-x86_64.tar.gz -C dist/extracted-linux
+          python3 scripts/verify_package.py --package dist/extracted-linux/TackleCast-Linux-x86_64 --commit '${{ needs.resolve.outputs.commit }}'
+          xvfb-run -a python3 scripts/smoke_test.py --binary dist/extracted-linux/TackleCast-Linux-x86_64/tacklecast
+      - name: Archive checksums
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib, pathlib
+          for path in pathlib.Path('dist').glob('TackleCast-*'):
+              if path.is_file() and path.name.endswith(('.zip', '.tar.gz')):
+                  path.with_name(path.name + '.sha256').write_text(hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + path.name + '\n')
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: TackleCast-Windows-x86_64
-          path: dist/TackleCast-Windows-x86_64.zip
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.artifact }}.zip
+            dist/${{ matrix.artifact }}.zip.sha256
+            dist/${{ matrix.artifact }}.tar.gz
+            dist/${{ matrix.artifact }}.tar.gz.sha256
+          if-no-files-found: error
 
-  build-linux:
-    name: Build Linux Release (.tar.gz)
-    runs-on: ubuntu-latest
+  publish:
+    name: Publish validated release
+    needs: [resolve, build]
+    if: github.repository == 'SaltedByte/TackleCast' && (github.event_name == 'push' || inputs.publish)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Linux Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libasound2-dev \
-            libv4l-dev \
-            libavcodec-dev \
-            libavformat-dev \
-            libavdevice-dev \
-            libavutil-dev \
-            libswresample-dev \
-            libswscale-dev \
-            libclang-dev \
-            clang \
-            pkg-config
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Build & Package Linux Release
-        run: |
-          chmod +x scripts/package_linux_release.sh scripts/run.sh
-          ./scripts/package_linux_release.sh
-
-      - name: Upload Linux Artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: TackleCast-Linux-x86_64
-          path: dist/TackleCast-Linux-x86_64.tar.gz
-
-  publish-release:
-    name: Publish GitHub Release
-    needs: [build-windows, build-linux]
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download Windows Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: TackleCast-Windows-x86_64
           path: release-assets
-
-      - name: Download Linux Artifact
-        uses: actions/download-artifact@v4
+          merge-multiple: true
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          name: TackleCast-Linux-x86_64
-          path: release-assets
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          target_commitish: ${{ needs.resolve.outputs.commit }}
           files: release-assets/*
+          fail_on_unmatched_files: true
           generate_release_notes: true
-          draft: false
-          prerelease: false
+          prerelease: ${{ needs.resolve.outputs.prerelease == 'true' }}

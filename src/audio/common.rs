@@ -230,11 +230,12 @@ pub fn convert_channels(
                 }
             }
         }
-        // Downmix multi-channel (>2) to stereo: take first two channels
+        // Fold center, LFE and surround speakers into normalized stereo.
         (n, 2) if n > 2 => {
             for chunk in input.chunks_exact(n).take(frame_count) {
-                output.push(chunk[0]);
-                output.push(chunk[1]);
+                let [left, right] = downmix_stereo(chunk);
+                output.push(left);
+                output.push(right);
             }
         }
         // Downmix multi-channel (>2) to mono: average all channels
@@ -249,9 +250,7 @@ pub fn convert_channels(
         (n, m) => {
             let min_ch = n.min(m);
             for chunk in input.chunks_exact(n).take(frame_count) {
-                for i in 0..min_ch {
-                    output.push(chunk[i]);
-                }
+                output.extend_from_slice(&chunk[..min_ch]);
                 for _ in min_ch..m {
                     output.push(0.0);
                 }
@@ -260,31 +259,60 @@ pub fn convert_channels(
     }
 }
 
-/// A high-quality, low-latency Catmull-Rom cubic Hermite audio resampler.
-/// Interpolates between input frames to produce audio at the target output rate.
-/// Preserves border history so chunk boundaries are completely seamless and click-free.
+/// Uses the conventional speaker order: FL, FR, FC, LFE, BL, BR, SL, SR.
+/// Quad omits FC/LFE; 5.0 omits LFE; 6.1 uses BC, SL, SR after LFE.
+/// CPAL does not expose channel masks. Devices with a different ordering should
+/// be routed to this order or configured for stereo PCM at the source.
+fn downmix_stereo(frame: &[f32]) -> [f32; 2] {
+    let surround = std::f32::consts::FRAC_1_SQRT_2;
+    let mut mix = [frame[0], frame[1]];
+    let mut weight = [1.0, 1.0];
+    for (index, &sample) in frame.iter().enumerate().skip(2) {
+        let gains = match (frame.len(), index) {
+            (4, 2) | (5, 3) => [surround, 0.0],
+            (4, 3) | (5, 4) => [0.0, surround],
+            (_, 2) => [surround, surround], // center
+            (7, 4) => [surround, surround], // back center
+            (7, 5) => [surround, 0.0],
+            (7, 6) => [0.0, surround],
+            (n, 3) if n >= 6 => [0.5, 0.5], // LFE
+            (_, i) if i % 2 == 0 => [surround, 0.0],
+            _ => [0.0, surround],
+        };
+        for channel in 0..2 {
+            mix[channel] += sample * gains[channel];
+            weight[channel] += gains[channel];
+        }
+    }
+    [mix[0] / weight[0], mix[1] / weight[1]]
+}
+
+/// Streaming Catmull-Rom interpolation with two frames of lookahead.
+/// Integer positions preserve the timeline across arbitrary callback boundaries.
+/// The four-frame history is allocated once, rather than on every callback.
 pub struct AudioResampler {
     in_rate: u32,
     out_rate: u32,
     channels: usize,
-    ratio: f64, // in_rate / out_rate
-    phase: f64, // Fractional frame position in the input stream [0.0, 1.0)
-    // History buffer of previous input frames (up to 3 frames) to support 4-point cubic interpolation across chunk edges
+    next_position: u64, // input-frame position in units of 1 / out_rate
+    frames_seen: u64,
     history: Vec<f32>,
-    history_frames: usize,
 }
 
 impl AudioResampler {
     pub fn new(in_rate: u32, out_rate: u32, channels: usize) -> Self {
+        assert!(
+            in_rate > 0 && out_rate > 0,
+            "audio sample rates must be positive"
+        );
         let channels = channels.max(1);
         Self {
             in_rate,
             out_rate,
             channels,
-            ratio: in_rate as f64 / out_rate as f64,
-            phase: 0.0,
+            next_position: 0,
+            frames_seen: 0,
             history: vec![0.0; channels * 4],
-            history_frames: 0,
         }
     }
 
@@ -305,9 +333,9 @@ impl AudioResampler {
 
     #[allow(dead_code)]
     pub fn reset(&mut self) {
-        self.phase = 0.0;
+        self.next_position = 0;
+        self.frames_seen = 0;
         self.history.fill(0.0);
-        self.history_frames = 0;
     }
 
     /// Resample interleaved multi-channel input samples into the output buffer.
@@ -318,82 +346,31 @@ impl AudioResampler {
             return;
         }
 
-        let in_frames = input.len() / self.channels;
-        if in_frames == 0 {
-            return;
-        }
-
-        // We combine the history frames with the new input frames to have a continuous sequence
-        // Total sequence has (history_frames + in_frames) frames.
-        let mut full_buffer = Vec::with_capacity((self.history_frames + in_frames) * self.channels);
-        full_buffer.extend_from_slice(&self.history[..self.history_frames * self.channels]);
-        full_buffer.extend_from_slice(&input[..in_frames * self.channels]);
-
-        let total_frames = self.history_frames + in_frames;
-        if total_frames < 2 {
-            // Not enough frames yet to interpolate; store in history and wait for next chunk
-            self.history[..full_buffer.len()].copy_from_slice(&full_buffer);
-            self.history_frames = total_frames;
-            return;
-        }
-
         let channels = self.channels;
-        let mut cur_pos = self.history_frames as f64 - 1.0 + self.phase;
-        if cur_pos < 0.0 {
-            cur_pos = 0.0;
-        }
-
-        let max_frame = total_frames - 1;
-
-        while cur_pos < (total_frames - 1) as f64 {
-            let i1 = cur_pos.floor() as usize;
-            let i0 = if i1 > 0 { i1 - 1 } else { 0 };
-            let i2 = (i1 + 1).min(max_frame);
-            let i3 = (i1 + 2).min(max_frame);
-            let t = (cur_pos - i1 as f64) as f32;
-
-            for ch in 0..channels {
-                let y0 = full_buffer[i0 * channels + ch];
-                let y1 = full_buffer[i1 * channels + ch];
-                let y2 = full_buffer[i2 * channels + ch];
-                let y3 = full_buffer[i3 * channels + ch];
-
-                // 4-point Catmull-Rom cubic interpolation
-                let a = -0.5 * y0 + 1.5 * y1 - 1.5 * y2 + 0.5 * y3;
-                let b = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
-                let c = -0.5 * y0 + 0.5 * y2;
-                let d = y1;
-
-                let val = ((a * t + b) * t + c) * t + d;
-                output.push(val);
+        for frame in input.chunks_exact(channels) {
+            if self.frames_seen == 0 {
+                for previous in self.history.chunks_exact_mut(channels) {
+                    previous.copy_from_slice(frame);
+                }
+            } else {
+                self.history.copy_within(channels.., 0);
+                self.history[3 * channels..].copy_from_slice(frame);
             }
-
-            cur_pos += self.ratio;
-        }
-
-        // Calculate phase for the next chunk relative to the remaining frames
-        let consumed_frames = cur_pos.floor() as usize;
-        if consumed_frames < total_frames {
-            let remain = total_frames - consumed_frames;
-            let keep_frames = remain.min(3);
-            let start = total_frames - keep_frames;
-            self.history[..keep_frames * channels]
-                .copy_from_slice(&full_buffer[start * channels..]);
-            self.history_frames = keep_frames;
-            self.phase = cur_pos - (total_frames - 1) as f64;
-            if self.phase < 0.0 {
-                self.phase = 0.0;
+            while self.next_position / self.out_rate as u64 + 2 <= self.frames_seen {
+                let t = (self.next_position % self.out_rate as u64) as f32 / self.out_rate as f32;
+                for ch in 0..channels {
+                    let y0 = self.history[ch];
+                    let y1 = self.history[channels + ch];
+                    let y2 = self.history[2 * channels + ch];
+                    let y3 = self.history[3 * channels + ch];
+                    let a = -0.5 * y0 + 1.5 * y1 - 1.5 * y2 + 0.5 * y3;
+                    let b = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+                    let c = -0.5 * y0 + 0.5 * y2;
+                    output.push(((a * t + b) * t + c) * t + y1);
+                }
+                self.next_position += self.in_rate as u64;
             }
-        } else {
-            let keep_frames = total_frames.min(3);
-            let start = total_frames - keep_frames;
-            self.history[..keep_frames * channels]
-                .copy_from_slice(&full_buffer[start * channels..]);
-            self.history_frames = keep_frames;
-            self.phase = cur_pos - total_frames as f64;
-            if self.phase < 0.0 {
-                self.phase = 0.0;
-            }
+            self.frames_seen += 1;
         }
     }
 }
@@ -574,11 +551,87 @@ mod tests {
 
     #[test]
     fn channel_conversion_multichannel_downmix() {
-        // 4 channels downmix to 2 (take front stereo channels)
-        let input = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        for channels in [3, 4, 5, 6, 7, 8] {
+            // Every speaker must remain audible, including center and LFE.
+            for speaker in 0..channels {
+                let mut input = vec![0.0; channels];
+                input[speaker] = 1.0;
+                let mut output = Vec::new();
+                convert_channels(&input, channels, 2, &mut output);
+                assert!(output.iter().any(|sample| *sample > 0.0));
+                if speaker == 2 && channels != 4 {
+                    assert_eq!(output[0], output[1], "center dialogue should be centered");
+                }
+            }
+            let mut output = Vec::new();
+            convert_channels(&vec![1.0; channels], channels, 2, &mut output);
+            assert!(output.iter().all(|sample| *sample <= 1.0));
+        }
+    }
+
+    #[test]
+    fn quad_surround_preserves_left_and_right() {
         let mut output = Vec::new();
-        convert_channels(&input, 4, 2, &mut output);
-        assert_eq!(output, vec![1.0, 2.0, 5.0, 6.0]);
+        convert_channels(&[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0], 4, 2, &mut output);
+        assert!(output[0] > 0.0 && output[1] == 0.0);
+        assert!(output[2] == 0.0 && output[3] > 0.0);
+    }
+
+    #[test]
+    fn resampling_is_independent_of_callback_boundaries() {
+        for (in_rate, out_rate) in [
+            (44100, 48000),
+            (48000, 44100),
+            (96000, 48000),
+            (48000, 96000),
+        ] {
+            for channels in [1, 2] {
+                let input: Vec<f32> = (0..9600 * channels)
+                    .map(|i| (i as f32 * 0.17).sin() * 0.9)
+                    .collect();
+                let mut expected = Vec::new();
+                AudioResampler::new(in_rate, out_rate, channels).process(&input, &mut expected);
+                for frames_per_callback in [1, 2, 3, 127, 256, 441, 1024] {
+                    let mut resampler = AudioResampler::new(in_rate, out_rate, channels);
+                    let mut actual = Vec::new();
+                    for chunk in input.chunks(frames_per_callback * channels) {
+                        resampler.process(chunk, &mut actual);
+                    }
+                    assert_eq!(actual, expected, "{in_rate}->{out_rate}, {channels}ch, {frames_per_callback} frames/callback");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resampling_retains_exact_downsample_timeline() {
+        let input: Vec<f32> = (0..9600).map(|i| i as f32).collect();
+        let mut resampler = AudioResampler::new(96000, 48000, 1);
+        let mut output = Vec::new();
+        for chunk in input.chunks(256) {
+            resampler.process(chunk, &mut output);
+        }
+        for (frame, sample) in output.iter().enumerate() {
+            assert_eq!(*sample, (frame * 2) as f32);
+        }
+    }
+
+    #[test]
+    fn resampler_reset_discards_previous_stream() {
+        let mut resampler = AudioResampler::new(44100, 48000, 2);
+        resampler.process(&[0.9; 256], &mut Vec::new());
+        resampler.reset();
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        resampler.process(&[0.2; 256], &mut actual);
+        AudioResampler::new(44100, 48000, 2).process(&[0.2; 256], &mut expected);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn output_conversion_clamps_interpolation_overshoot() {
+        assert_eq!(f32_to_sample::<i16>(1.25), i16::MAX);
+        assert_eq!(f32_to_sample::<i16>(-1.25), i16::MIN);
     }
 
     #[test]

@@ -1006,10 +1006,10 @@ fn find_dshow_format() -> Option<ffmpeg::Format> {
 #[cfg(target_os = "linux")]
 fn find_v4l2_format() -> Option<ffmpeg::Format> {
     device::input::video().find(|format| match format {
-        ffmpeg::Format::Input(input) => {
-            let name = input.name();
-            name == "video4linux2" || name == "v4l2"
-        }
+        ffmpeg::Format::Input(input) => input
+            .name()
+            .split(',')
+            .any(|name| matches!(name, "video4linux2" | "v4l2")),
         ffmpeg::Format::Output(_) => false,
     })
 }
@@ -1144,6 +1144,32 @@ fn generate_test_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn software_decoder_handles_capture_mjpeg() {
+        let codec =
+            codec::decoder::find(codec::Id::MJPEG).expect("FFmpeg must include MJPEG decoding");
+        let mut decoder = codec::Context::new_with_codec(codec)
+            .decoder()
+            .video()
+            .unwrap();
+        let packet = ffmpeg::Packet::copy(include_bytes!("../assets/tests/nvjpeg-422.jpg"));
+        decoder.send_packet(&packet).unwrap();
+        let mut frame = Video::empty();
+        decoder.receive_frame(&mut frame).unwrap();
+        assert_eq!((frame.width(), frame.height()), (16, 8));
+        assert_eq!(frame.format(), ffmpeg::format::Pixel::YUVJ422P);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn discovers_installed_v4l2_format() {
+        ffmpeg::init().unwrap();
+        assert!(
+            find_v4l2_format().is_some(),
+            "FFmpeg must recognize its V4L2 aliases"
+        );
+    }
 
     #[test]
     #[allow(irrefutable_let_patterns)]

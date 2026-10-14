@@ -1,5 +1,7 @@
 # Rust
 /target
+/.deps
+__pycache__/
 
 # User settings
 tacklecast_settings.json

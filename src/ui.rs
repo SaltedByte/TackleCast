@@ -233,6 +233,7 @@ fn draw_overlay(ctx: &egui::Context, overlay: &OverlayInfo) {
         });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_menu(
     ctx: &egui::Context,
     draft: &mut Settings,

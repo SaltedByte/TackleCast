@@ -1,11 +1,16 @@
 param(
     [string]$PackageName = "TackleCast-Rust",
     [switch]$Zip,
-    [switch]$SkipGpuDlls
+    [switch]$SkipGpuDlls,
+    [switch]$RequireGpuDlls
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+if ($PackageName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
+    throw 'PackageName must be a directory name, without path separators.'
+}
+if ($SkipGpuDlls -and $RequireGpuDlls) { throw 'GPU runtime cannot be both skipped and required.' }
 
 function Resolve-Root {
     Split-Path -Path $PSScriptRoot -Parent
@@ -21,7 +26,9 @@ function Ensure-Exists {
 $root = Resolve-Root
 $distRoot = Join-Path $root "dist"
 $outDir = Join-Path $distRoot $PackageName
-$releaseExe = Join-Path $root "target\release\tacklecast.exe"
+$targetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root 'target' }
+if (-not [IO.Path]::IsPathRooted($targetRoot)) { $targetRoot = Join-Path $root $targetRoot }
+$releaseExe = Join-Path $targetRoot "release\tacklecast.exe"
 $settingsSrc = Join-Path $root "tacklecast_settings.json"
 $iconSrc = Join-Path $root "assets\icon.ico"
 $ffmpegDir = $env:FFMPEG_DIR
@@ -38,17 +45,19 @@ Ensure-Exists -Path $ffmpegBin -Message "FFMPEG_DIR\bin not found: $ffmpegBin"
 
 Push-Location $root
 try {
-    if (-not (Test-Path -LiteralPath $releaseExe)) {
-        Write-Host "Building release binary..."
-        cargo build --release
-    } else {
-        Write-Host "Using release binary at $releaseExe"
-    }
+    Write-Host "Building current release binary..."
+    cargo build --release --locked
+    if ($LASTEXITCODE -ne 0) { throw "Release build failed ($LASTEXITCODE)" }
 
     Ensure-Exists -Path $releaseExe -Message "Release executable missing: $releaseExe"
     Ensure-Exists -Path $iconSrc -Message "Icon missing: $iconSrc"
 
     if (Test-Path -LiteralPath $outDir) {
+        $absoluteOut = [IO.Path]::GetFullPath($outDir)
+        $absoluteDist = [IO.Path]::GetFullPath($distRoot) + [IO.Path]::DirectorySeparatorChar
+        if (-not $absoluteOut.StartsWith($absoluteDist, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Package directory is outside dist: $absoluteOut"
+        }
         Remove-Item -LiteralPath $outDir -Recurse -Force
     }
 
@@ -58,6 +67,13 @@ try {
 
     Copy-Item -LiteralPath $releaseExe -Destination (Join-Path $outDir "TackleCast.exe")
     Copy-Item -LiteralPath $iconSrc -Destination (Join-Path $outDir "assets\icon.ico")
+    Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $outDir
+    $licensesDir = Join-Path $outDir 'licenses'
+    New-Item -ItemType Directory -Force -Path $licensesDir | Out-Null
+    if (Test-Path (Join-Path $ffmpegDir 'LICENSE.txt')) {
+        Copy-Item (Join-Path $ffmpegDir 'LICENSE.txt') (Join-Path $licensesDir 'FFmpeg-LICENSE.txt')
+    }
+    Copy-Item (Join-Path $PSScriptRoot 'windows-dependencies.json') (Join-Path $licensesDir 'dependency-sources.json')
 
     if (Test-Path -LiteralPath $settingsSrc) {
         Copy-Item -LiteralPath $settingsSrc -Destination (Join-Path $outDir "tacklecast_settings.json")
@@ -92,6 +108,7 @@ try {
     $gpuDllsCopied = @()
     if (-not $SkipGpuDlls) {
         $searchDirs = New-Object System.Collections.Generic.List[string]
+        if ($env:GPU_RUNTIME_DIR) { $searchDirs.Add($env:GPU_RUNTIME_DIR) }
         if ($env:CUDA_PATH) {
             $searchDirs.Add((Join-Path $env:CUDA_PATH "bin\x64"))
             $searchDirs.Add((Join-Path $env:CUDA_PATH "bin"))
@@ -120,10 +137,22 @@ try {
                 $gpuDllsCopied += $found.Name
                 Write-Host "Bundled GPU DLL: $($found.Name)"
             } else {
+                if ($RequireGpuDlls) { throw "Required GPU runtime '$pattern' is missing." }
                 Write-Warning "Could not find '$pattern' - GPU decode will fall back to software on machines without the CUDA Toolkit. Searched: $($searchDirs -join '; ')"
             }
         }
     }
+    if ($env:GPU_RUNTIME_DIR -and (Test-Path (Join-Path $env:GPU_RUNTIME_DIR 'licenses'))) {
+        Copy-Item (Join-Path $env:GPU_RUNTIME_DIR 'licenses\*') $licensesDir -Force
+    }
+    $commit = git -C $root rev-parse HEAD
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot record the source commit.' }
+    @{
+        version = (Select-String -Path (Join-Path $root 'Cargo.toml') -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
+        commit = $commit
+        platform = 'windows-x86_64'
+        gpu_runtime_bundled = ($gpuDllsCopied.Count -eq 2)
+    } | ConvertTo-Json | Set-Content (Join-Path $outDir 'build-info.json')
 
     if ($gpuDllsCopied.Count -gt 0) {
         $gpuNote = @"
@@ -133,7 +162,7 @@ GPU decode
 Bundled: $($gpuDllsCopied -join ', ')
 
 GPU (nvJPEG) decode needs an NVIDIA GPU and a recent driver. These DLLs are from
-the CUDA 13 runtime, which requires NVIDIA driver 570 or newer. On an older
+the CUDA runtime, which requires a compatible NVIDIA driver. On an older
 driver the app logs that CUDA is unavailable and falls back to software decode -
 it still works, just with more CPU load.
 

@@ -801,6 +801,7 @@ impl VideoFrameResources {
 }
 
 /// Align a byte count up to the next multiple of `alignment`.
+#[cfg(all(target_os = "windows", feature = "gpu-decode"))]
 fn align_up(value: u32, alignment: u32) -> u32 {
     (value + alignment - 1) & !(alignment - 1)
 }

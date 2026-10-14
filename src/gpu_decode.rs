@@ -1182,3 +1182,67 @@ impl Drop for NvjpegDecoder {
         info!("nvJPEG GPU decoder destroyed");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn jpeg_fixture() -> Vec<u8> {
+        // Known 4:2:2 MJPEG fixture matching the capture pipeline's plane layout.
+        include_bytes!("../assets/tests/nvjpeg-422.jpg").to_vec()
+    }
+
+    #[test]
+    #[ignore = "requires an NVIDIA GPU, compatible driver and nvJPEG runtime"]
+    fn hardware_nvjpeg_decodes_owned_frame() {
+        let mut decoder = NvjpegDecoder::try_new().expect("NVIDIA decode must initialize");
+        let mut frame = CaptureFrame::empty();
+        decoder.decode_into(&jpeg_fixture(), &mut frame).unwrap();
+        let CaptureFrame::Cpu {
+            width,
+            height,
+            y_data,
+            u_data,
+            v_data,
+            ..
+        } = frame
+        else {
+            panic!("owned decoding must return CPU planes");
+        };
+        assert_eq!((width, height), (16, 8));
+        assert_eq!(y_data.len(), 16 * 8);
+        assert!(y_data.iter().any(|sample| *sample > 0));
+        assert!(!u_data.is_empty() && !v_data.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires an NVIDIA GPU, DX12/CUDA interop and nvJPEG runtime"]
+    fn hardware_nvjpeg_decodes_shared_frame() {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12,
+            ..Default::default()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            ..Default::default()
+        }))
+        .expect("DX12 adapter must be available");
+        let (device, _queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+                .unwrap();
+        let (_buffers, handles) =
+            crate::dx12_interop::SharedGpuBuffers::try_new(&device, 16, 8).unwrap();
+        let mut decoder =
+            NvjpegDecoder::try_new_shared(handles).expect("CUDA must import the shared buffers");
+        let mut frame = CaptureFrame::empty();
+        decoder.decode_into(&jpeg_fixture(), &mut frame).unwrap();
+        assert!(matches!(
+            frame,
+            CaptureFrame::Gpu {
+                width: 16,
+                height: 8,
+                ..
+            }
+        ));
+    }
+}

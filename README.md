@@ -13,7 +13,7 @@ Built for capture cards like the Genki ShadowCast, Elgato, AVerMedia, and other 
 - **GPU-accelerated rendering** via wgpu with a custom YUV-to-RGB shader
 - **NVIDIA GPU MJPEG decode** via nvJPEG/CUDA (automatic fallback to software decode)
 - **Zero-copy GPU pipeline** - decoded frames never leave the GPU (CUDA to DX12 to wgpu)
-- **Low-latency audio passthrough** via WASAPI (Windows) and PipeWire / ALSA (Linux)
+- **Low-latency audio passthrough** via WASAPI (Windows) and ALSA, including PipeWire/PulseAudio compatibility plugins (Linux)
 - **Robust audio resampling & channel conversion** - handles mono, stereo, and variable sample rates (e.g. PS4/PS5/Switch audio over USB capture cards)
 - **Audio mute toggle & UI status** - mute control with real-time audio connection status
 - **Cross-platform video capture** - DirectShow on Windows, V4L2 on Linux
@@ -33,7 +33,15 @@ Built for capture cards like the Genki ShadowCast, Elgato, AVerMedia, and other 
    - **Windows**: Download `TackleCast-Windows-x86_64.zip`, extract anywhere, and double-click `TackleCast.exe`.
    - **Linux**: Download `TackleCast-Linux-x86_64.tar.gz`, extract (`tar -xzvf TackleCast-Linux-x86_64.tar.gz`), and run `./run.sh`.
 
-No additional software required.
+FFmpeg is bundled on both platforms. Windows packages also include the CUDA/nvJPEG runtime; GPU decoding needs a compatible NVIDIA GPU and driver. Official Linux archives target x86_64 Ubuntu 24.04 or newer and use your desktop's ALSA and Vulkan/OpenGL drivers.
+
+### PS4 audio and video
+
+Connect the PS4's HDMI output to your capture card and the card to your PC over USB. For gameplay capture, clear **Settings > System > Enable HDCP** ([PlayStation guide](https://manuals.playstation.net/document/en/ps4/settings/hdcp.html)). Set **Settings > Sound and Screen > Audio Output Settings > Audio Format (Priority)** to **Linear PCM** ([PlayStation guide](https://manuals.playstation.net/document/en/ps4/settings/audiooutput.html)).
+
+In TackleCast, press Escape and select the capture card's audio input and your speakers/headphones as output. Check that audio is Connected and unmuted. Mono input is duplicated to stereo, and different input/output sample rates are converted. For the widest capture-card compatibility, use stereo PCM; surround conversion assumes the conventional speaker order described in [BUILD.md](BUILD.md).
+
+If sound is missing, check the selected input is the capture card rather than your microphone or desktop's default source, and inspect the input/output formats in `logs/`. Unit tests cover channel conversion and resampling; console-specific behavior still depends on the card and needs hardware validation.
 
 ## Building from Source
 

@@ -2,77 +2,93 @@ name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [main]
   pull_request:
-    branches: [ "main" ]
+    branches: [main]
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact commit to validate for a release
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
 
 jobs:
   format:
-    name: Code Formatting
-    runs-on: ubuntu-latest
+    name: Formatting
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
+        with:
+          toolchain: 1.93.1
           components: rustfmt
-      - name: Check Formatting
-        run: cargo fmt --all --check
+      - run: cargo fmt --all --check
+      - run: python3 -m py_compile scripts/verify_package.py scripts/smoke_test.py
+      - run: git diff --check
 
   build-and-test:
-    name: ${{ matrix.name }}
+    name: ${{ matrix.os }} / ${{ matrix.features }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: Ubuntu Linux (V4L2 + PipeWire/ALSA)
-            os: ubuntu-latest
-          - name: Windows (DirectShow + WASAPI)
-            os: windows-latest
-
+        os: [ubuntu-24.04, windows-2022]
+        features: [default, software]
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Linux System Dependencies
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
+        with:
+          toolchain: 1.93.1
+          components: clippy
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          key: ${{ matrix.features }}
+          env-vars: FFMPEG_DIR PKG_CONFIG_PATH
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .deps
+          key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/setup_*_dependencies.*', 'scripts/windows-dependencies.json') }}
+      - name: Linux compiler and audio headers
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libasound2-dev \
-            libv4l-dev \
-            libavcodec-dev \
-            libavformat-dev \
-            libavdevice-dev \
-            libavutil-dev \
-            libswresample-dev \
-            libswscale-dev \
-            libclang-dev \
-            clang \
-            pkg-config
-
-      - name: Setup Windows Toolchain & FFmpeg Dev Libraries
+        run: sudo apt-get update && sudo apt-get install -y build-essential nasm libasound2-dev libclang-dev pkg-config
+      - name: Linux FFmpeg
+        if: runner.os == 'Linux'
+        run: bash scripts/setup_linux_dependencies.sh
+      - name: Windows FFmpeg
         if: runner.os == 'Windows'
         shell: powershell
+        run: .\scripts\setup_windows_dependencies.ps1
+      - name: Tests
+        shell: bash
+        env:
+          FEATURES: ${{ matrix.features }}
         run: |
-          $ffmpegZip = "$env:TEMP\ffmpeg.zip"
-          Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip" -OutFile $ffmpegZip
-          Expand-Archive -Path $ffmpegZip -DestinationPath "C:\ffmpeg-extract"
-          $extractedDir = Get-ChildItem "C:\ffmpeg-extract" | Where-Object { $_.PSIsContainer } | Select-Object -First 1
-          Move-Item -Path $extractedDir.FullName -Destination "C:\ffmpeg"
-
-          "C:\ffmpeg\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          "FFMPEG_DIR=C:\ffmpeg" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "PKG_CONFIG_PATH=C:\ffmpeg\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Run Unit Tests
-        run: cargo test --verbose
-
-      - name: Run Clippy
-        run: cargo clippy -- -D warnings || true
-
-      - name: Build Release Binary
-        run: cargo build --release
+          flags=()
+          if [[ "$FEATURES" == software ]]; then flags+=(--no-default-features); fi
+          cargo test --locked "${flags[@]}"
+      - name: Clippy
+        shell: bash
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: |
+          flags=()
+          if [[ "$FEATURES" == software ]]; then flags+=(--no-default-features); fi
+          cargo clippy --locked --all-targets "${flags[@]}" -- -D warnings
+      - name: Release build
+        shell: bash
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: |
+          flags=()
+          if [[ "$FEATURES" == software ]]; then flags+=(--no-default-features); fi
+          cargo build --release --locked "${flags[@]}"
