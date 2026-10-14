@@ -52,7 +52,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
-          key: ${{ matrix.features }}
+          key: ${{ matrix.features }}-${{ hashFiles('scripts/setup_*_dependencies.*', 'scripts/windows-dependencies.json') }}
           env-vars: FFMPEG_DIR PKG_CONFIG_PATH
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
