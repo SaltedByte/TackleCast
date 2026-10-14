@@ -1,5 +1,8 @@
 use crate::devices::AudioDevice;
-use crate::settings::{Settings, ScaleFilter, FPS_MODE_30, FPS_MODE_120, FPS_MODE_60, FPS_MODE_CUSTOM, MAX_FPS, MIN_FPS};
+use crate::settings::{
+    ScaleFilter, Settings, FPS_MODE_120, FPS_MODE_30, FPS_MODE_60, FPS_MODE_CUSTOM, MAX_FPS,
+    MIN_FPS,
+};
 use egui::{
     Align, Align2, Button, Checkbox, Color32, ComboBox, CornerRadius, FontId, Frame, Layout,
     Margin, RichText, Slider, Stroke,
@@ -48,6 +51,7 @@ pub struct UiFrame<'a> {
     pub audio_inputs: &'a [AudioDevice],
     pub audio_outputs: &'a [AudioDevice],
     pub is_fullscreen: bool,
+    pub audio_status: &'a str,
 }
 
 pub struct PreparedUi {
@@ -116,10 +120,7 @@ impl UiState {
         let mut raw_input = self.egui_winit.take_egui_input(window);
         if self.menu_open {
             raw_input.events.retain(|event| {
-                !matches!(
-                    event,
-                    egui::Event::MouseWheel { .. } | egui::Event::Zoom(_)
-                )
+                !matches!(event, egui::Event::MouseWheel { .. } | egui::Event::Zoom(_))
             });
         }
         let mut ui_output = UiOutput::default();
@@ -133,6 +134,7 @@ impl UiState {
                     frame.audio_inputs,
                     frame.audio_outputs,
                     frame.is_fullscreen,
+                    frame.audio_status,
                     &mut ui_output,
                 );
             }
@@ -146,7 +148,9 @@ impl UiState {
         }
 
         let pixels_per_point = egui_winit::pixels_per_point(&self.egui_ctx, window);
-        let clipped_primitives = self.egui_ctx.tessellate(full_output.shapes, pixels_per_point);
+        let clipped_primitives = self
+            .egui_ctx
+            .tessellate(full_output.shapes, pixels_per_point);
         let size = window.inner_size();
 
         PreparedUi {
@@ -167,23 +171,23 @@ fn configure_style(ctx: &egui::Context) {
     style.visuals.override_text_color = Some(COLOR_TEXT_PRIMARY);
     style.visuals.panel_fill = Color32::TRANSPARENT;
     style.visuals.window_fill = menu_background();
-    style.visuals.window_stroke = Stroke::new(1.0, COLOR_MENU_BORDER);
+    style.visuals.window_stroke = Stroke::new(1.0_f32, COLOR_MENU_BORDER);
     style.visuals.window_corner_radius = CornerRadius::same(12);
     style.visuals.menu_corner_radius = CornerRadius::same(12);
     style.visuals.widgets.noninteractive.bg_fill = COLOR_PANEL_BG;
-    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, COLOR_BORDER);
+    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, COLOR_BORDER);
     style.visuals.widgets.noninteractive.fg_stroke.color = COLOR_TEXT_PRIMARY;
     style.visuals.widgets.inactive.bg_fill = COLOR_PANEL_BG;
-    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, COLOR_BORDER);
+    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, COLOR_BORDER);
     style.visuals.widgets.inactive.fg_stroke.color = COLOR_TEXT_PRIMARY;
     style.visuals.widgets.hovered.bg_fill = COLOR_PANEL_BG;
-    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, COLOR_ACCENT);
+    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, COLOR_ACCENT);
     style.visuals.widgets.hovered.fg_stroke.color = COLOR_TEXT_PRIMARY;
     style.visuals.widgets.active.bg_fill = COLOR_PANEL_BG;
-    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0, COLOR_ACCENT);
+    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, COLOR_ACCENT);
     style.visuals.widgets.active.fg_stroke.color = COLOR_TEXT_PRIMARY;
     style.visuals.selection.bg_fill = COLOR_ACCENT;
-    style.visuals.selection.stroke = Stroke::new(1.0, COLOR_ACCENT);
+    style.visuals.selection.stroke = Stroke::new(1.0_f32, COLOR_ACCENT);
     style.visuals.slider_trailing_fill = true;
     style.spacing.item_spacing = egui::vec2(10.0, 10.0);
     style.spacing.button_padding = egui::vec2(12.0, 8.0);
@@ -229,6 +233,7 @@ fn draw_overlay(ctx: &egui::Context, overlay: &OverlayInfo) {
         });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_menu(
     ctx: &egui::Context,
     draft: &mut Settings,
@@ -236,6 +241,7 @@ fn draw_menu(
     audio_inputs: &[AudioDevice],
     audio_outputs: &[AudioDevice],
     is_fullscreen: bool,
+    audio_status: &str,
     output: &mut UiOutput,
 ) {
     let screen_rect = ctx.screen_rect();
@@ -263,7 +269,7 @@ fn draw_menu(
         .show(ctx, |ui| {
             Frame::new()
                 .fill(menu_background())
-                .stroke(Stroke::new(1.0, COLOR_MENU_BORDER))
+                .stroke(Stroke::new(1.0_f32, COLOR_MENU_BORDER))
                 .corner_radius(CornerRadius::same(12))
                 .inner_margin(Margin::same(18))
                 .show(ui, |ui| {
@@ -328,6 +334,27 @@ fn draw_menu(
                         labeled_audio_combo(ui, "Audio Output", &mut draft.audio_output, audio_outputs);
                         labeled_volume(ui, draft);
 
+                        ui.horizontal(|ui| {
+                            ui.add(Checkbox::new(
+                                &mut draft.audio_muted,
+                                RichText::new("Mute Audio").color(COLOR_TEXT_PRIMARY),
+                            ));
+                        });
+
+                        let status_color = if audio_status.starts_with("Connected") {
+                            Color32::from_rgb(0x4E, 0xCD, 0xC4)
+                        } else if audio_status.starts_with("Stopped") {
+                            COLOR_TEXT_SECONDARY
+                        } else {
+                            COLOR_ACCENT
+                        };
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(format!("Audio: {audio_status}"))
+                                .size(13.0 * text_scale)
+                                .color(status_color),
+                        );
+
                         separator(ui);
                         section_header(ui, "DISPLAY", text_scale);
                         ui.horizontal(|ui| {
@@ -386,7 +413,7 @@ fn separator(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
     ui.painter().line_segment(
         [rect.left_center(), rect.right_center()],
-        Stroke::new(1.0, COLOR_MENU_BORDER),
+        Stroke::new(1.0_f32, COLOR_MENU_BORDER),
     );
     ui.add_space(4.0);
 }
@@ -417,12 +444,7 @@ fn labeled_combo_string(
         });
 }
 
-fn labeled_combo_static(
-    ui: &mut egui::Ui,
-    label: &str,
-    selected: &mut String,
-    options: &[&str],
-) {
+fn labeled_combo_static(ui: &mut egui::Ui, label: &str, selected: &mut String, options: &[&str]) {
     ui.label(RichText::new(label).color(COLOR_TEXT_SECONDARY));
     ComboBox::from_id_salt(label)
         .width(ui.available_width())
@@ -507,9 +529,9 @@ fn labeled_volume(ui: &mut egui::Ui, draft: &mut Settings) {
         let changed = ui
             .scope(|ui| {
                 let visuals = &mut ui.visuals_mut().widgets;
-                visuals.inactive.fg_stroke = Stroke::new(2.0, COLOR_ACCENT);
-                visuals.hovered.fg_stroke = Stroke::new(2.0, COLOR_ACCENT);
-                visuals.active.fg_stroke = Stroke::new(2.0, COLOR_ACCENT);
+                visuals.inactive.fg_stroke = Stroke::new(2.0_f32, COLOR_ACCENT);
+                visuals.hovered.fg_stroke = Stroke::new(2.0_f32, COLOR_ACCENT);
+                visuals.active.fg_stroke = Stroke::new(2.0_f32, COLOR_ACCENT);
                 ui.add(slider).changed()
             })
             .inner;
@@ -528,7 +550,7 @@ fn styled_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         Button::new(RichText::new(text).color(COLOR_TEXT_PRIMARY))
             .fill(COLOR_PANEL_BG)
-            .stroke(Stroke::new(1.0, COLOR_BORDER)),
+            .stroke(Stroke::new(1.0_f32, COLOR_BORDER)),
     )
 }
 
@@ -537,7 +559,7 @@ fn exit_button(ui: &mut egui::Ui) -> egui::Response {
         ui.add(
             Button::new(RichText::new("Exit TackleCast").color(COLOR_TEXT_PRIMARY))
                 .fill(COLOR_EXIT_BG)
-                .stroke(Stroke::new(1.0, COLOR_ACCENT))
+                .stroke(Stroke::new(1.0_f32, COLOR_ACCENT))
                 .min_size(egui::vec2(ui.available_width(), 0.0)),
         )
     })

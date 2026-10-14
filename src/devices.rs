@@ -1,14 +1,21 @@
 use cpal::traits::{DeviceTrait, HostTrait};
+#[cfg(target_os = "windows")]
 use tracing::warn;
+
+#[cfg(target_os = "windows")]
 use windows::core::{GUID, HSTRING, VARIANT};
+#[cfg(target_os = "windows")]
 use windows::Win32::Media::DirectShow::ICreateDevEnum;
+#[cfg(target_os = "windows")]
 use windows::Win32::Media::MediaFoundation::{
     CLSID_SystemDeviceEnum, CLSID_VideoInputDeviceCategory,
 };
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Com::StructuredStorage::IPropertyBag;
+#[cfg(target_os = "windows")]
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
 };
-use windows::Win32::System::Com::StructuredStorage::IPropertyBag;
 
 #[allow(dead_code)]
 const IGNORED_KEYWORDS: &[&str] = &["pro", "the", "and"];
@@ -20,15 +27,27 @@ pub struct AudioDevice {
 }
 
 pub fn enumerate_video_devices() -> Vec<String> {
-    match enumerate_video_devices_dshow() {
-        Ok(devices) => devices,
-        Err(error) => {
-            warn!("DirectShow video device enumeration failed: {error}");
-            Vec::new()
+    #[cfg(target_os = "windows")]
+    {
+        match enumerate_video_devices_dshow() {
+            Ok(devices) => devices,
+            Err(error) => {
+                warn!("DirectShow video device enumeration failed: {error}");
+                Vec::new()
+            }
         }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        enumerate_video_devices_v4l2()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        Vec::new()
     }
 }
 
+#[cfg(target_os = "windows")]
 fn enumerate_video_devices_dshow() -> Result<Vec<String>, String> {
     unsafe {
         // COM may already be initialized on this thread; ignore errors from re-init.
@@ -64,8 +83,7 @@ fn enumerate_video_devices_dshow() -> Result<Vec<String>, String> {
                 break;
             };
 
-            let bag: Result<IPropertyBag, _> =
-                moniker.BindToStorage(None, None);
+            let bag: Result<IPropertyBag, _> = moniker.BindToStorage(None, None);
             let Ok(bag) = bag else {
                 continue;
             };
@@ -83,6 +101,26 @@ fn enumerate_video_devices_dshow() -> Result<Vec<String>, String> {
 
         Ok(devices)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn enumerate_video_devices_v4l2() -> Vec<String> {
+    let mut devices = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/sys/class/video4linux") {
+        let mut v4l2_entries: Vec<_> = entries.filter_map(Result::ok).collect();
+        v4l2_entries.sort_by_key(|e| e.file_name());
+        for entry in v4l2_entries {
+            let name_file = entry.path().join("name");
+            if let Ok(name) = std::fs::read_to_string(name_file) {
+                let name = name.trim().to_string();
+                if !name.is_empty() {
+                    let dev_node = format!("/dev/{}", entry.file_name().to_string_lossy());
+                    devices.push(format!("{name} ({dev_node})"));
+                }
+            }
+        }
+    }
+    devices
 }
 
 pub fn enumerate_audio_inputs() -> Vec<AudioDevice> {
@@ -104,7 +142,10 @@ pub fn find_audio_input_for_video(video_device_name: &str, inputs: &[AudioDevice
     let mut best_score = 0;
     for device in inputs {
         let haystack = device.name.to_ascii_lowercase();
-        let score = keywords.iter().filter(|keyword| haystack.contains(keyword.as_str())).count();
+        let score = keywords
+            .iter()
+            .filter(|keyword| haystack.contains(keyword.as_str()))
+            .count();
         if score > best_score {
             best_score = score;
             best_index = Some(device.index);

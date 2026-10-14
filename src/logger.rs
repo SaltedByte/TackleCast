@@ -21,7 +21,9 @@ pub fn init_logging() -> Result<(), Box<dyn std::error::Error>> {
         "tacklecast_{}.log",
         OffsetDateTime::now_local()
             .unwrap_or_else(|_| OffsetDateTime::now_utc())
-            .format(&format_description!("[year][month][day]_[hour][minute][second]"))?
+            .format(&format_description!(
+                "[year][month][day]_[hour][minute][second]"
+            ))?
     ));
 
     let file = File::create(file_path)?;
@@ -42,11 +44,11 @@ pub fn init_logging() -> Result<(), Box<dyn std::error::Error>> {
         .with_filter(default_log_filter());
 
     tracing_subscriber::registry().with(file_layer).try_init()?;
-    
+
     std::panic::set_hook(Box::new(|info| {
         tracing::error!("panic: {info}");
     }));
-    
+
     Ok(())
 }
 

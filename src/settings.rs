@@ -30,6 +30,8 @@ pub struct Settings {
     pub custom_fps: u32,
     #[serde(default = "default_volume")]
     pub volume: f64,
+    #[serde(default)]
+    pub audio_muted: bool,
     #[serde(default = "default_show_overlay")]
     pub show_overlay: bool,
     /// When set, the overlay also reports the active scaling filter, stacked
@@ -92,6 +94,7 @@ impl Default for Settings {
             fps_mode: default_fps_mode(),
             custom_fps: default_custom_fps(),
             volume: default_volume(),
+            audio_muted: false,
             show_overlay: default_show_overlay(),
             detailed_overlay: false,
         }
@@ -114,8 +117,8 @@ impl Settings {
             fs::create_dir_all(parent)?;
         }
 
-        let json = serde_json::to_string_pretty(self)
-            .expect("settings serialization should not fail");
+        let json =
+            serde_json::to_string_pretty(self).expect("settings serialization should not fail");
         fs::write(path, json)
     }
 
@@ -257,6 +260,20 @@ mod tests {
         assert_eq!(settings.fps_mode, "120");
         assert_eq!(settings.get_fps(), 120);
         assert!(settings.show_overlay);
+        assert!(!settings.audio_muted);
+    }
+
+    #[test]
+    fn settings_with_audio_muted_deserializes() {
+        let json = r#"{
+  "video_device": "Cam Link",
+  "volume": 0.6,
+  "audio_muted": true
+}"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.video_device, "Cam Link");
+        assert!((settings.volume - 0.6).abs() < 1e-4);
+        assert!(settings.audio_muted);
     }
 
     #[test]

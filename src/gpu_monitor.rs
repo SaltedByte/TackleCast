@@ -1,3 +1,5 @@
+#![cfg(all(target_os = "windows", feature = "gpu-decode"))]
+
 use libloading::{Library, Symbol};
 use std::ffi::CStr;
 use tracing::{info, warn};
@@ -46,8 +48,10 @@ impl GpuMonitor {
             }
 
             // Log GPU name
-            let get_name: Result<Symbol<unsafe extern "system" fn(usize, *mut u8, u32) -> NvmlReturn>, _> =
-                lib.get(b"nvmlDeviceGetName\0");
+            let get_name: Result<
+                Symbol<unsafe extern "system" fn(usize, *mut u8, u32) -> NvmlReturn>,
+                _,
+            > = lib.get(b"nvmlDeviceGetName\0");
             if let Ok(get_name) = get_name {
                 let mut name_buf = [0u8; 128];
                 if get_name(device, name_buf.as_mut_ptr(), 128) == NVML_SUCCESS {
@@ -85,7 +89,8 @@ impl GpuMonitor {
             let mut temp: u32 = 0;
             let mut util = NvmlUtilization::default();
 
-            let temp_ok = (self.get_temp)(self.device, NVML_TEMPERATURE_GPU, &mut temp) == NVML_SUCCESS;
+            let temp_ok =
+                (self.get_temp)(self.device, NVML_TEMPERATURE_GPU, &mut temp) == NVML_SUCCESS;
             let util_ok = (self.get_util)(self.device, &mut util) == NVML_SUCCESS;
 
             GpuSnapshot {

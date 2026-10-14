@@ -16,14 +16,14 @@
 //! closing handles in its `Drop` impl, making leaks impossible by
 //! construction.
 
-#![cfg(feature = "gpu-decode")]
+#![cfg(all(target_os = "windows", feature = "gpu-decode"))]
 
 use std::ffi::c_void;
 use tracing::{debug, info, warn};
 use wgpu::hal::api::Dx12;
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::PCWSTR;
 
 /// Number of double-buffer sets.
 pub const NUM_BUFFER_SETS: usize = 2;
@@ -122,7 +122,12 @@ fn plane_sizes(width: u32, height: u32) -> SharedBufferLayout {
     let uv_pitch = ((width / 2) + align - 1) & !(align - 1);
     let y_size = (y_pitch as u64) * (height as u64);
     let uv_size = (uv_pitch as u64) * (height as u64);
-    SharedBufferLayout { y_pitch, uv_pitch, y_size, uv_size }
+    SharedBufferLayout {
+        y_pitch,
+        uv_pitch,
+        y_size,
+        uv_size,
+    }
 }
 
 impl SharedGpuBuffers {
@@ -252,26 +257,32 @@ fn create_shared_buffer_set(
     let (y_resource, y_handle) =
         create_shared_committed_buffer(device, y_size, &format!("Y-{set_index}"))?;
 
-    let (u_resource, u_handle) = match create_shared_committed_buffer(device, uv_size, &format!("U-{set_index}")) {
-        Ok(result) => result,
-        Err(e) => {
-            unsafe { close_handle_ptr(y_handle); }
-            return Err(e);
-        }
-    };
+    let (u_resource, u_handle) =
+        match create_shared_committed_buffer(device, uv_size, &format!("U-{set_index}")) {
+            Ok(result) => result,
+            Err(e) => {
+                unsafe {
+                    close_handle_ptr(y_handle);
+                }
+                return Err(e);
+            }
+        };
 
-    let (v_resource, v_handle) = match create_shared_committed_buffer(device, uv_size, &format!("V-{set_index}")) {
-        Ok(result) => result,
-        Err(e) => {
-            unsafe { close_handle_ptr(y_handle); }
-            unsafe { close_handle_ptr(u_handle); }
-            return Err(e);
-        }
-    };
+    let (v_resource, v_handle) =
+        match create_shared_committed_buffer(device, uv_size, &format!("V-{set_index}")) {
+            Ok(result) => result,
+            Err(e) => {
+                unsafe {
+                    close_handle_ptr(y_handle);
+                }
+                unsafe {
+                    close_handle_ptr(u_handle);
+                }
+                return Err(e);
+            }
+        };
 
-    debug!(
-        "DX12 shared buffer set {set_index}: Y={y_size}B U={uv_size}B V={uv_size}B"
-    );
+    debug!("DX12 shared buffer set {set_index}: Y={y_size}B U={uv_size}B V={uv_size}B");
 
     Ok(RawBufferSet {
         y_resource,
@@ -326,18 +337,21 @@ fn create_shared_committed_buffer(
                 None,
                 &mut resource,
             )
-            .map_err(|e| {
-                format!("CreateCommittedResource failed for {label}: {e}")
-            })?;
+            .map_err(|e| format!("CreateCommittedResource failed for {label}: {e}"))?;
     }
 
-    let resource = resource
-        .ok_or_else(|| format!("CreateCommittedResource returned null for {label}"))?;
+    let resource =
+        resource.ok_or_else(|| format!("CreateCommittedResource returned null for {label}"))?;
 
     // Create an NT shared handle for CUDA import.
     let handle = unsafe {
         device
-            .CreateSharedHandle(&resource, None, windows::Win32::Foundation::GENERIC_ALL.0, PCWSTR::null())
+            .CreateSharedHandle(
+                &resource,
+                None,
+                windows::Win32::Foundation::GENERIC_ALL.0,
+                PCWSTR::null(),
+            )
             .map_err(|e| format!("CreateSharedHandle failed for {label}: {e}"))?
     };
 
@@ -347,14 +361,9 @@ fn create_shared_committed_buffer(
 }
 
 /// Wrap a raw DX12 ID3D12Resource as a high-level wgpu::Buffer.
-fn wrap_as_wgpu_buffer(
-    device: &wgpu::Device,
-    resource: ID3D12Resource,
-    size: u64,
-) -> wgpu::Buffer {
+fn wrap_as_wgpu_buffer(device: &wgpu::Device, resource: ID3D12Resource, size: u64) -> wgpu::Buffer {
     unsafe {
-        let hal_buffer =
-            wgpu::hal::dx12::Device::buffer_from_raw(resource, size);
+        let hal_buffer = wgpu::hal::dx12::Device::buffer_from_raw(resource, size);
 
         device.create_buffer_from_hal::<Dx12>(
             hal_buffer,

@@ -7,20 +7,23 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use ffmpeg_next as ffmpeg;
 use ffmpeg::{
-    codec, device, format, media, threading, Dictionary,
+    codec, device, format, media,
     software::scaling::{flag::Flags as ScaleFlags, Context as ScaleContext},
+    threading,
     util::frame::video::Video,
+    Dictionary,
 };
+use ffmpeg_next as ffmpeg;
 use tracing::{info, warn};
+#[cfg(target_os = "windows")]
 use windows::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
 };
 use winit::event_loop::EventLoopProxy;
 
-use crate::AppEvent;
 use crate::triple_buffer::Producer;
+use crate::AppEvent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
@@ -42,7 +45,7 @@ pub enum CaptureFrame {
     /// Frame data lives in a shared DX12/CUDA GPU buffer (zero-copy path).
     /// The renderer knows where the actual buffers are; this just carries
     /// the dimensions and which double-buffer set to read from.
-    #[cfg(feature = "gpu-decode")]
+    #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
     Gpu {
         width: u32,
         height: u32,
@@ -69,7 +72,7 @@ impl CaptureFrame {
     ///
     /// `Vec::resize` is a no-op once capacity is sufficient, so a frame
     /// recycled from the triple buffer is reshaped without allocating.
-    #[cfg(feature = "gpu-decode")]
+    #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
     pub fn reshape_cpu(
         &mut self,
         new_width: u32,
@@ -110,7 +113,7 @@ impl CaptureFrame {
     pub fn width(&self) -> u32 {
         match self {
             Self::Cpu { width, .. } => *width,
-            #[cfg(feature = "gpu-decode")]
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
             Self::Gpu { width, .. } => *width,
         }
     }
@@ -118,7 +121,7 @@ impl CaptureFrame {
     pub fn height(&self) -> u32 {
         match self {
             Self::Cpu { height, .. } => *height,
-            #[cfg(feature = "gpu-decode")]
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
             Self::Gpu { height, .. } => *height,
         }
     }
@@ -126,7 +129,7 @@ impl CaptureFrame {
     pub fn format(&self) -> Option<PixelFormat> {
         match self {
             Self::Cpu { format, .. } => Some(*format),
-            #[cfg(feature = "gpu-decode")]
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
             Self::Gpu { .. } => Some(PixelFormat::Yuvj422p), // nvJPEG always outputs YUV 4:2:2
         }
     }
@@ -155,21 +158,32 @@ pub struct CaptureConfig {
     pub source: CaptureSource,
 }
 
+#[allow(dead_code)]
 pub enum CaptureSource {
     TestPattern {
         alternate_formats: bool,
         force_format: Option<PixelFormat>,
     },
+    Device {
+        device_name: String,
+        pixel_format: String,
+        decode_threads: usize,
+        #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+        shared_gpu_handles: Option<crate::dx12_interop::ImportHandles>,
+    },
+    #[cfg(target_os = "windows")]
     DirectShow {
         device_name: String,
         pixel_format: String,
         decode_threads: usize,
-        /// Shared DX12 buffer handles for zero-copy GPU decode.
-        /// When present, the capture thread will try to use these for
-        /// nvJPEG decode directly into GPU memory. The handles are consumed
-        /// (imported + closed) during decoder initialization.
         #[cfg(feature = "gpu-decode")]
         shared_gpu_handles: Option<crate::dx12_interop::ImportHandles>,
+    },
+    #[cfg(target_os = "linux")]
+    V4L2 {
+        device_name: String,
+        pixel_format: String,
+        decode_threads: usize,
     },
 }
 
@@ -207,13 +221,13 @@ impl CaptureThread {
                 stats_tx,
                 &event_proxy,
             ),
-            CaptureSource::DirectShow {
+            CaptureSource::Device {
                 device_name,
                 pixel_format,
                 decode_threads,
-                #[cfg(feature = "gpu-decode")]
+                #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
                 shared_gpu_handles,
-            } => run_directshow_capture(
+            } => run_device_capture(
                 device_name,
                 config.width,
                 config.height,
@@ -226,8 +240,50 @@ impl CaptureThread {
                 error_tx,
                 negotiated_tx,
                 &event_proxy,
+                #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+                shared_gpu_handles,
+            ),
+            #[cfg(target_os = "windows")]
+            CaptureSource::DirectShow {
+                device_name,
+                pixel_format,
+                decode_threads,
                 #[cfg(feature = "gpu-decode")]
                 shared_gpu_handles,
+            } => run_device_capture(
+                device_name,
+                config.width,
+                config.height,
+                config.fps.max(1),
+                pixel_format,
+                decode_threads,
+                thread_stop_flag,
+                frame_producer,
+                stats_tx,
+                error_tx,
+                negotiated_tx,
+                &event_proxy,
+                #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+                shared_gpu_handles,
+            ),
+            #[cfg(target_os = "linux")]
+            CaptureSource::V4L2 {
+                device_name,
+                pixel_format,
+                decode_threads,
+            } => run_device_capture(
+                device_name,
+                config.width,
+                config.height,
+                config.fps.max(1),
+                pixel_format,
+                decode_threads,
+                thread_stop_flag,
+                frame_producer,
+                stats_tx,
+                error_tx,
+                negotiated_tx,
+                &event_proxy,
             ),
         });
 
@@ -326,7 +382,7 @@ fn run_test_pattern(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_directshow_capture(
+fn run_device_capture(
     device_name: String,
     requested_width: u32,
     requested_height: u32,
@@ -339,9 +395,11 @@ fn run_directshow_capture(
     error_tx: Sender<String>,
     negotiated_tx: Sender<NegotiatedConfig>,
     event_proxy: &EventLoopProxy<AppEvent>,
-    #[cfg(feature = "gpu-decode")]
-    mut shared_gpu_handles: Option<crate::dx12_interop::ImportHandles>,
+    #[cfg(all(target_os = "windows", feature = "gpu-decode"))] mut shared_gpu_handles: Option<
+        crate::dx12_interop::ImportHandles,
+    >,
 ) {
+    #[cfg(target_os = "windows")]
     unsafe {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
@@ -350,11 +408,8 @@ fn run_directshow_capture(
     // Build list of (width, height, fps) tiers to try. Start with the
     // requested settings, then fall back to common resolutions/framerates
     // that most USB capture devices and webcams support.
-    let resolution_tiers = resolution_fallback_tiers(
-        requested_width,
-        requested_height,
-        requested_fps,
-    );
+    let resolution_tiers =
+        resolution_fallback_tiers(requested_width, requested_height, requested_fps);
 
     let mut last_error: Option<String> = None;
 
@@ -372,7 +427,7 @@ fn run_directshow_capture(
                 device_name, format_label, try_w, try_h, try_fps
             );
 
-            match run_directshow_capture_inner(
+            match run_device_capture_inner(
                 &device_name,
                 try_w,
                 try_h,
@@ -383,12 +438,15 @@ fn run_directshow_capture(
                 &mut frame_producer,
                 stats_tx.clone(),
                 event_proxy,
-                #[cfg(feature = "gpu-decode")]
+                #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
                 shared_gpu_handles.take(),
             ) {
                 Ok(()) => {
                     // Notify if we fell back to different settings
-                    if try_w != requested_width || try_h != requested_height || try_fps != requested_fps {
+                    if try_w != requested_width
+                        || try_h != requested_height
+                        || try_fps != requested_fps
+                    {
                         info!(
                             "capture negotiated fallback: {}x{} @ {}fps (requested {}x{} @ {}fps)",
                             try_w, try_h, try_fps, requested_width, requested_height, requested_fps
@@ -418,7 +476,7 @@ fn run_directshow_capture(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_directshow_capture_inner(
+fn run_device_capture_inner(
     device_name: &str,
     requested_width: u32,
     requested_height: u32,
@@ -429,28 +487,51 @@ fn run_directshow_capture_inner(
     frame_producer: &mut Producer<CaptureFrame>,
     stats_tx: Sender<CaptureStats>,
     event_proxy: &EventLoopProxy<AppEvent>,
-    #[cfg(feature = "gpu-decode")]
-    shared_gpu_handles: Option<crate::dx12_interop::ImportHandles>,
+    #[cfg(all(target_os = "windows", feature = "gpu-decode"))] shared_gpu_handles: Option<
+        crate::dx12_interop::ImportHandles,
+    >,
 ) -> Result<(), String> {
-    let dshow_format = find_dshow_format()
-        .ok_or_else(|| "DirectShow input format was not found in FFmpeg".to_string())?;
+    let (input_format, format_label) = find_input_format()?;
     let mut options = Dictionary::new();
-    options.set("video_size", &format!("{requested_width}x{requested_height}"));
+    options.set(
+        "video_size",
+        &format!("{requested_width}x{requested_height}"),
+    );
     options.set("framerate", &requested_fps.to_string());
     options.set("rtbufsize", "16M");
     options.set("probesize", "5000000");
     options.set("analyzeduration", "1000000");
+
+    #[cfg(target_os = "windows")]
+    let url = format!("video={device_name}");
+    #[cfg(target_os = "linux")]
+    let url = resolve_v4l2_node(device_name);
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    let url = device_name.to_string();
+
     if let Some(format_name) = requested_pixel_format {
-        if format_name.eq_ignore_ascii_case("mjpeg") {
-            options.set("vcodec", "mjpeg");
-        } else {
-            options.set("pixel_format", format_name);
+        #[cfg(target_os = "windows")]
+        {
+            if format_name.eq_ignore_ascii_case("mjpeg") {
+                options.set("vcodec", "mjpeg");
+            } else {
+                options.set("pixel_format", format_name);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if format_name.eq_ignore_ascii_case("mjpeg") {
+                options.set("input_format", "mjpeg");
+            } else {
+                options.set("input_format", format_name);
+            }
         }
     }
 
-    let url = format!("video={device_name}");
-    let mut input = format::open_with(&url, &dshow_format, options)
-        .map_err(|error| format!("failed to open DirectShow input for '{device_name}': {error}"))?
+    let mut input = format::open_with(&url, &input_format, options)
+        .map_err(|error| {
+            format!("failed to open {format_label} input for '{device_name}' ({url}): {error}")
+        })?
         .input();
 
     let input_stream = input
@@ -483,9 +564,14 @@ fn run_directshow_capture_inner(
     let actual_height = decoder.height();
     info!(
         "stream negotiated: {}x{} @ {:.2}fps (time_base={}/{}), requested: {}x{} @ {}fps",
-        actual_width, actual_height, actual_fps_f64,
-        actual_rate.0, actual_rate.1,
-        requested_width, requested_height, requested_fps,
+        actual_width,
+        actual_height,
+        actual_fps_f64,
+        actual_rate.0,
+        actual_rate.1,
+        requested_width,
+        requested_height,
+        requested_fps,
     );
     if (actual_fps_f64 - requested_fps as f64).abs() > 1.0 && actual_fps_f64 > 0.0 {
         warn!(
@@ -513,31 +599,34 @@ fn run_directshow_capture_inner(
     let mut scaled_frame = Video::empty();
 
     // Try to initialize GPU-accelerated MJPEG decode (NVIDIA nvJPEG)
-    #[cfg(feature = "gpu-decode")]
-    let mut gpu_decoder = if requested_pixel_format.is_some_and(|f| f.eq_ignore_ascii_case("mjpeg")) {
+    #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+    let mut gpu_decoder = if requested_pixel_format.is_some_and(|f| f.eq_ignore_ascii_case("mjpeg"))
+    {
         // Try zero-copy shared buffer mode first, then fall back to owned mode
         if let Some(handles) = shared_gpu_handles {
             info!("attempting zero-copy GPU decode with shared DX12 buffers");
-            crate::gpu_decode::NvjpegDecoder::try_new_shared(handles)
-                .or_else(|| {
-                    info!("zero-copy init failed, falling back to owned GPU decode");
-                    crate::gpu_decode::NvjpegDecoder::try_new()
-                })
+            crate::gpu_decode::NvjpegDecoder::try_new_shared(handles).or_else(|| {
+                info!("zero-copy init failed, falling back to owned GPU decode");
+                crate::gpu_decode::NvjpegDecoder::try_new()
+            })
         } else {
             crate::gpu_decode::NvjpegDecoder::try_new()
         }
     } else {
         None
     };
-    #[cfg(feature = "gpu-decode")]
+    #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
     let use_gpu = gpu_decoder.is_some();
-    #[cfg(feature = "gpu-decode")]
-    let is_zero_copy = gpu_decoder.as_ref().map(|d| d.is_zero_copy()).unwrap_or(false);
-    #[cfg(feature = "gpu-decode")]
+    #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+    let is_zero_copy = gpu_decoder
+        .as_ref()
+        .map(|d| d.is_zero_copy())
+        .unwrap_or(false);
+    #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
     let mut gpu_errors = 0_u32;
-    #[cfg(not(feature = "gpu-decode"))]
+    #[cfg(not(all(target_os = "windows", feature = "gpu-decode")))]
     let use_gpu = false;
-    #[cfg(not(feature = "gpu-decode"))]
+    #[cfg(not(all(target_os = "windows", feature = "gpu-decode")))]
     let is_zero_copy = false;
 
     info!(
@@ -572,7 +661,7 @@ fn run_directshow_capture_inner(
         last_packet_at = Some(now);
 
         // Try GPU decode first when available (MJPEG only)
-        #[cfg(feature = "gpu-decode")]
+        #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
         if let Some(ref mut gpu) = gpu_decoder {
             if let Some(data) = packet.data() {
                 // Decode straight into the back slot, reusing the plane buffers
@@ -611,12 +700,17 @@ fn run_directshow_capture_inner(
                         }
                         let summary_elapsed = last_summary_at.elapsed();
                         if summary_elapsed >= Duration::from_secs(30) {
-                            let avg_fps = summary_frame_counter as f64 / summary_elapsed.as_secs_f64();
+                            let avg_fps =
+                                summary_frame_counter as f64 / summary_elapsed.as_secs_f64();
                             let arrival_info = if arrival_count > 0 {
-                                let avg_ms = (arrival_sum_us as f64 / arrival_count as f64) / 1000.0;
+                                let avg_ms =
+                                    (arrival_sum_us as f64 / arrival_count as f64) / 1000.0;
                                 let min_ms = arrival_min_us as f64 / 1000.0;
                                 let max_ms = arrival_max_us as f64 / 1000.0;
-                                format!(", frame_arrival: avg={:.1}ms min={:.1}ms max={:.1}ms", avg_ms, min_ms, max_ms)
+                                format!(
+                                    ", frame_arrival: avg={:.1}ms min={:.1}ms max={:.1}ms",
+                                    avg_ms, min_ms, max_ms
+                                )
                             } else {
                                 String::new()
                             };
@@ -674,7 +768,7 @@ fn run_directshow_capture_inner(
                 &mut scaled_frame,
                 requested_fps > 60,
             )
-                .map_err(|error| format!("failed to convert decoded frame: {error}"))?;
+            .map_err(|error| format!("failed to convert decoded frame: {error}"))?;
             let width = frame.width();
             let height = frame.height();
             total_frames += 1;
@@ -683,7 +777,10 @@ fn run_directshow_capture_inner(
                 logged_first_frame = true;
                 info!(
                     "first decoded frame from '{}' => {}x{} {:?}",
-                    device_name, width, height, frame.format()
+                    device_name,
+                    width,
+                    height,
+                    frame.format()
                 );
             }
 
@@ -706,7 +803,10 @@ fn run_directshow_capture_inner(
                     let avg_ms = (arrival_sum_us as f64 / arrival_count as f64) / 1000.0;
                     let min_ms = arrival_min_us as f64 / 1000.0;
                     let max_ms = arrival_max_us as f64 / 1000.0;
-                    format!(", frame_arrival: avg={:.1}ms min={:.1}ms max={:.1}ms", avg_ms, min_ms, max_ms)
+                    format!(
+                        ", frame_arrival: avg={:.1}ms min={:.1}ms max={:.1}ms",
+                        avg_ms, min_ms, max_ms
+                    )
                 } else {
                     String::new()
                 };
@@ -846,11 +946,7 @@ fn resolution_fallback_tiers(width: u32, height: u32, fps: u32) -> Vec<(u32, u32
     }
 
     // Tier 3: standard fallback resolutions
-    let fallbacks: &[(u32, u32)] = &[
-        (1920, 1080),
-        (1280, 720),
-        (640, 480),
-    ];
+    let fallbacks: &[(u32, u32)] = &[(1920, 1080), (1280, 720), (640, 480)];
     for &(fw, fh) in fallbacks {
         if fw >= width && fh >= height {
             continue; // skip resolutions >= what we already tried
@@ -865,7 +961,10 @@ fn resolution_fallback_tiers(width: u32, height: u32, fps: u32) -> Vec<(u32, u32
 fn pixel_format_attempts(requested_pixel_format: &str) -> Vec<Option<String>> {
     let mut attempts = Vec::new();
     let mut push_unique = |value: Option<&str>| {
-        if attempts.iter().any(|existing: &Option<String>| existing.as_deref() == value) {
+        if attempts
+            .iter()
+            .any(|existing: &Option<String>| existing.as_deref() == value)
+        {
             return;
         }
         attempts.push(value.map(str::to_string));
@@ -896,6 +995,7 @@ fn copy_plane(frame: &Video, plane: usize, row_bytes: usize, rows: usize) -> Vec
     output
 }
 
+#[cfg(target_os = "windows")]
 fn find_dshow_format() -> Option<ffmpeg::Format> {
     device::input::video().find(|format| match format {
         ffmpeg::Format::Input(input) => input.name() == "dshow",
@@ -903,7 +1003,67 @@ fn find_dshow_format() -> Option<ffmpeg::Format> {
     })
 }
 
-fn generate_test_frame(width: u32, height: u32, frame_index: u64, format: PixelFormat) -> CaptureFrame {
+#[cfg(target_os = "linux")]
+fn find_v4l2_format() -> Option<ffmpeg::Format> {
+    device::input::video().find(|format| match format {
+        ffmpeg::Format::Input(input) => input
+            .name()
+            .split(',')
+            .any(|name| matches!(name, "video4linux2" | "v4l2")),
+        ffmpeg::Format::Output(_) => false,
+    })
+}
+
+fn find_input_format() -> Result<(ffmpeg::Format, String), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let format = find_dshow_format()
+            .ok_or_else(|| "DirectShow input format was not found in FFmpeg".to_string())?;
+        Ok((format, "DirectShow".to_string()))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let format = find_v4l2_format().ok_or_else(|| {
+            "V4L2 (video4linux2) input format was not found in FFmpeg".to_string()
+        })?;
+        Ok((format, "V4L2".to_string()))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        Err("Unsupported operating system for video capture".to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_v4l2_node(device_name: &str) -> String {
+    if device_name.starts_with("/dev/") {
+        return device_name.to_string();
+    }
+    if let Some(start) = device_name.rfind('(') {
+        if let Some(end) = device_name.rfind(')') {
+            let candidate = &device_name[start + 1..end];
+            if candidate.starts_with("/dev/") {
+                return candidate.to_string();
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir("/dev") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("video") {
+                return format!("/dev/{}", name.to_string_lossy());
+            }
+        }
+    }
+    "/dev/video0".to_string()
+}
+
+fn generate_test_frame(
+    width: u32,
+    height: u32,
+    frame_index: u64,
+    format: PixelFormat,
+) -> CaptureFrame {
     let y_len = (width * height) as usize;
     let chroma_width = (width / 2) as usize;
     let chroma_height_420 = (height / 2) as usize;
@@ -986,9 +1146,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn software_decoder_handles_capture_mjpeg() {
+        let codec =
+            codec::decoder::find(codec::Id::MJPEG).expect("FFmpeg must include MJPEG decoding");
+        let mut decoder = codec::Context::new_with_codec(codec)
+            .decoder()
+            .video()
+            .unwrap();
+        let packet = ffmpeg::Packet::copy(include_bytes!("../assets/tests/nvjpeg-422.jpg"));
+        decoder.send_packet(&packet).unwrap();
+        let mut frame = Video::empty();
+        decoder.receive_frame(&mut frame).unwrap();
+        assert_eq!((frame.width(), frame.height()), (16, 8));
+        assert_eq!(frame.format(), ffmpeg::format::Pixel::YUVJ422P);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn discovers_installed_v4l2_format() {
+        ffmpeg::init().unwrap();
+        assert!(
+            find_v4l2_format().is_some(),
+            "FFmpeg must recognize its V4L2 aliases"
+        );
+    }
+
+    #[test]
+    #[allow(irrefutable_let_patterns)]
     fn generates_expected_plane_sizes_for_nv12() {
         let frame = generate_test_frame(1280, 720, 0, PixelFormat::Nv12);
-        let CaptureFrame::Cpu { y_data, u_data, v_data, .. } = &frame else {
+        let CaptureFrame::Cpu {
+            y_data,
+            u_data,
+            v_data,
+            ..
+        } = &frame
+        else {
             panic!("expected Cpu frame");
         };
         assert_eq!(y_data.len(), 1280 * 720);
@@ -997,9 +1190,16 @@ mod tests {
     }
 
     #[test]
+    #[allow(irrefutable_let_patterns)]
     fn generates_expected_plane_sizes_for_yuvj422p() {
         let frame = generate_test_frame(1280, 720, 0, PixelFormat::Yuvj422p);
-        let CaptureFrame::Cpu { y_data, u_data, v_data, .. } = &frame else {
+        let CaptureFrame::Cpu {
+            y_data,
+            u_data,
+            v_data,
+            ..
+        } = &frame
+        else {
             panic!("expected Cpu frame");
         };
         assert_eq!(y_data.len(), 1280 * 720);
@@ -1010,7 +1210,10 @@ mod tests {
     #[test]
     fn pixel_format_attempts_include_fallbacks_without_duplicates() {
         let attempts = pixel_format_attempts("nv12");
-        let labels: Vec<_> = attempts.iter().map(|s| s.as_deref().unwrap_or("auto")).collect();
+        let labels: Vec<_> = attempts
+            .iter()
+            .map(|s| s.as_deref().unwrap_or("auto"))
+            .collect();
         assert!(labels.contains(&"nv12"));
         assert!(labels.contains(&"mjpeg"));
         assert!(labels.contains(&"auto"));

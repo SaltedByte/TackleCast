@@ -38,7 +38,7 @@ pub struct Renderer {
     nv12_u_scratch: Vec<u8>,
     nv12_v_scratch: Vec<u8>,
     // Shared DX12 buffers for zero-copy GPU decode (None = not available)
-    #[cfg(feature = "gpu-decode")]
+    #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
     shared_gpu_buffers: Option<crate::dx12_interop::SharedGpuBuffers>,
 }
 
@@ -46,10 +46,7 @@ impl Renderer {
     /// `scale_filter` is the filter from saved settings. Taken as a constructor
     /// argument rather than defaulted, so a renderer can't come up disagreeing
     /// with the settings the menu is showing.
-    pub async fn new(
-        window: Arc<Window>,
-        scale_filter: ScaleFilter,
-    ) -> Result<Self, RenderError> {
+    pub async fn new(window: Arc<Window>, scale_filter: ScaleFilter) -> Result<Self, RenderError> {
         let size = window.inner_size();
         // Prefer DX12 on Windows so that CUDA ↔ DX12 zero-copy interop works.
         // Fall back to all backends if DX12 isn't available.
@@ -75,12 +72,15 @@ impl Renderer {
             .ok_or(RenderError::AdapterUnavailable)?;
 
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("tacklecast-device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            }, None)
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("tacklecast-device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    memory_hints: wgpu::MemoryHints::Performance,
+                },
+                None,
+            )
             .await
             .map_err(RenderError::RequestDevice)?;
 
@@ -242,7 +242,7 @@ impl Renderer {
             pad_scratch: Vec::new(),
             nv12_u_scratch: Vec::new(),
             nv12_v_scratch: Vec::new(),
-            #[cfg(feature = "gpu-decode")]
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
             shared_gpu_buffers: None,
         })
     }
@@ -277,7 +277,7 @@ impl Renderer {
                 u_data,
                 v_data,
             } => self.upload_cpu_frame(*width, *height, *format, y_data, u_data, v_data),
-            #[cfg(feature = "gpu-decode")]
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
             CaptureFrame::Gpu {
                 width,
                 height,
@@ -386,7 +386,7 @@ impl Renderer {
     /// Try to initialize shared DX12 ↔ CUDA buffers for zero-copy.
     /// Returns import handles for the CUDA side if successful.
     /// The handles are ephemeral — CUDA imports them and they're closed on drop.
-    #[cfg(feature = "gpu-decode")]
+    #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
     pub fn try_init_shared_buffers(
         &mut self,
         width: u32,
@@ -398,7 +398,7 @@ impl Renderer {
         Some(import_handles)
     }
 
-    #[cfg(feature = "gpu-decode")]
+    #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
     fn upload_gpu_frame(&mut self, width: u32, height: u32, buffer_index: usize) {
         let Some(shared) = &self.shared_gpu_buffers else {
             tracing::warn!("GPU frame received but no shared buffers initialized");
@@ -561,8 +561,12 @@ impl Renderer {
 
         if let Some(ui) = ui.as_ref() {
             for (texture_id, image_delta) in &ui.textures_delta.set {
-                self.egui_renderer
-                    .update_texture(&self.device, &self.queue, *texture_id, image_delta);
+                self.egui_renderer.update_texture(
+                    &self.device,
+                    &self.queue,
+                    *texture_id,
+                    image_delta,
+                );
             }
 
             ui_user_command_buffers = self.egui_renderer.update_buffers(
@@ -658,8 +662,11 @@ impl Renderer {
                 .render(&mut pass, &ui.paint_jobs, &ui.screen_descriptor);
         }
 
-        self.queue
-            .submit(ui_user_command_buffers.into_iter().chain(std::iter::once(encoder.finish())));
+        self.queue.submit(
+            ui_user_command_buffers
+                .into_iter()
+                .chain(std::iter::once(encoder.finish())),
+        );
 
         for texture_id in ui_texture_free {
             self.egui_renderer.free_texture(&texture_id);
@@ -777,7 +784,7 @@ impl VideoFrameResources {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: wgpu::BindingResource::Sampler(&samplers.nearest),
-                }
+                },
             ],
         });
 
@@ -794,6 +801,7 @@ impl VideoFrameResources {
 }
 
 /// Align a byte count up to the next multiple of `alignment`.
+#[cfg(all(target_os = "windows", feature = "gpu-decode"))]
 fn align_up(value: u32, alignment: u32) -> u32 {
     (value + alignment - 1) & !(alignment - 1)
 }

@@ -1,7 +1,10 @@
 fn main() {
-    if std::env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
+    #[cfg(windows)]
+    {
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/icon.ico");
-        res.compile().unwrap();
+        if let Err(e) = res.compile() {
+            eprintln!("cargo:warning=Failed to compile Windows resource: {e}");
+        }
     }
 }

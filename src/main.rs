@@ -1,13 +1,13 @@
-#![windows_subsystem = "windows"]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod audio;
 mod capture;
 mod devices;
-#[cfg(feature = "gpu-decode")]
+#[cfg(all(target_os = "windows", feature = "gpu-decode"))]
 mod dx12_interop;
-#[cfg(feature = "gpu-decode")]
+#[cfg(all(target_os = "windows", feature = "gpu-decode"))]
 mod gpu_decode;
-#[cfg(feature = "gpu-decode")]
+#[cfg(all(target_os = "windows", feature = "gpu-decode"))]
 mod gpu_monitor;
 mod logger;
 mod render;
@@ -25,8 +25,11 @@ use render::Renderer;
 use settings::{get_capture_config, Settings};
 use tracing::{error, info, warn};
 use ui::{OverlayInfo, UiFrame, UiState};
+#[cfg(target_os = "windows")]
 use windows::core::HSTRING;
+#[cfg(target_os = "windows")]
 use windows::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED};
+#[cfg(target_os = "windows")]
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -38,6 +41,7 @@ use winit::window::{Window, WindowAttributes};
 const WINDOW_TITLE: &str = "TackleCast";
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 720;
+#[cfg(target_os = "windows")]
 const APP_ID: &str = "tacklecast.tacklecast.v1";
 
 /// How often the event loop wakes when no frames are arriving, to poll the
@@ -108,18 +112,46 @@ fn main() {
     info!("version: {}", env!("CARGO_PKG_VERSION"));
     info!(
         "build: {}",
-        if cfg!(debug_assertions) { "debug" } else { "release" }
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
     );
+    #[cfg(target_os = "windows")]
     let _ = unsafe { SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(APP_ID)) };
 
     let settings = Settings::load();
-    info!("loaded settings from {}", settings::settings_path().display());
+    info!(
+        "loaded settings from {}",
+        settings::settings_path().display()
+    );
     let video_devices = devices::enumerate_video_devices();
     let audio_inputs = devices::enumerate_audio_inputs();
     let audio_outputs = devices::enumerate_audio_outputs();
-    info!("video devices: {:?}", video_devices);
-    info!("audio inputs: {:?}", audio_inputs);
-    info!("audio outputs: {:?}", audio_outputs);
+
+    info!("=== Audio & Video Diagnostics at Startup ===");
+    info!("detected video capture devices ({}):", video_devices.len());
+    for (i, dev) in video_devices.iter().enumerate() {
+        info!("  [{i}] {dev}");
+    }
+    info!("detected audio input devices ({}):", audio_inputs.len());
+    for dev in &audio_inputs {
+        info!("  [{}] {}", dev.index, dev.name);
+    }
+    info!("detected audio output devices ({}):", audio_outputs.len());
+    for dev in &audio_outputs {
+        info!("  [{}] {}", dev.index, dev.name);
+    }
+    info!(
+        "initial settings: video='{}', audio_in={}, audio_out={}, vol={:.0}%, muted={}",
+        settings.video_device,
+        settings.audio_input,
+        settings.audio_output,
+        settings.volume,
+        settings.audio_muted
+    );
+    info!("============================================");
 
     let event_loop = EventLoop::<AppEvent>::with_user_event()
         .build()
@@ -162,7 +194,7 @@ struct App {
     last_render_summary: Instant,
     last_cursor_moved: Instant,
     last_frame_at: Option<Instant>,
-    #[cfg(feature = "gpu-decode")]
+    #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
     gpu_monitor: Option<gpu_monitor::GpuMonitor>,
 }
 
@@ -200,7 +232,7 @@ impl App {
             last_render_summary: Instant::now(),
             last_cursor_moved: Instant::now(),
             last_frame_at: None,
-            #[cfg(feature = "gpu-decode")]
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
             gpu_monitor: gpu_monitor::GpuMonitor::try_new(),
         }
     }
@@ -211,23 +243,26 @@ impl App {
                 WindowAttributes::default()
                     .with_title(WINDOW_TITLE)
                     .with_resizable(true)
-                    .with_inner_size(PhysicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT))
+                    .with_inner_size(PhysicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT)),
             )
             .expect("failed to create window");
 
         // Apply window icon from exe resources
+        #[cfg(target_os = "windows")]
         unsafe {
             use windows::core::PCWSTR;
             use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
             use windows::Win32::System::LibraryLoader::GetModuleHandleW;
             use windows::Win32::UI::WindowsAndMessaging::{
-                LoadImageW, SendMessageW, HICON, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED,
-                ICON_BIG, ICON_SMALL, WM_SETICON,
+                LoadImageW, SendMessageW, HICON, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE,
+                LR_SHARED, WM_SETICON,
             };
             use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
             // 1. Fetch the HWND from winit's HasWindowHandle structure
-            let handle_abstract = window.window_handle().expect("Failed to read window handle");
+            let handle_abstract = window
+                .window_handle()
+                .expect("Failed to read window handle");
             if let RawWindowHandle::Win32(win32_handle) = handle_abstract.as_raw() {
                 let hwnd = HWND(win32_handle.hwnd.get() as *mut std::ffi::c_void);
 
@@ -250,8 +285,18 @@ impl App {
 
                     if !h_icon.is_invalid() {
                         // 5. Send messages to assign to taskbar and titlebar context
-                        SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(h_icon.0 as isize));
-                        SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(h_icon.0 as isize));
+                        SendMessageW(
+                            hwnd,
+                            WM_SETICON,
+                            WPARAM(ICON_SMALL as usize),
+                            LPARAM(h_icon.0 as isize),
+                        );
+                        SendMessageW(
+                            hwnd,
+                            WM_SETICON,
+                            WPARAM(ICON_BIG as usize),
+                            LPARAM(h_icon.0 as isize),
+                        );
                     }
                 }
             }
@@ -282,13 +327,16 @@ impl App {
 
         info!(should_suppress, "updating display sleep suppression");
         self.is_sleep_suppressed = should_suppress;
-        let flags = if should_suppress {
-            ES_CONTINUOUS | ES_DISPLAY_REQUIRED
-        } else {
-            ES_CONTINUOUS
-        };
-        unsafe {
-            SetThreadExecutionState(flags);
+        #[cfg(target_os = "windows")]
+        {
+            let flags = if should_suppress {
+                ES_CONTINUOUS | ES_DISPLAY_REQUIRED
+            } else {
+                ES_CONTINUOUS
+            };
+            unsafe {
+                SetThreadExecutionState(flags);
+            }
         }
     }
 
@@ -311,17 +359,15 @@ impl ApplicationHandler<AppEvent> for App {
         }
 
         let window = Arc::new(Self::create_window(event_loop));
-        let renderer = match pollster::block_on(Renderer::new(
-            window.clone(),
-            self.settings.scaling_filter,
-        )) {
-            Ok(renderer) => renderer,
-            Err(error) => {
-                error!("renderer initialization failed: {error}");
-                event_loop.exit();
-                return;
-            }
-        };
+        let renderer =
+            match pollster::block_on(Renderer::new(window.clone(), self.settings.scaling_filter)) {
+                Ok(renderer) => renderer,
+                Err(error) => {
+                    error!("renderer initialization failed: {error}");
+                    event_loop.exit();
+                    return;
+                }
+            };
 
         let ui = UiState::new(&window, renderer.max_texture_side());
 
@@ -424,6 +470,7 @@ impl ApplicationHandler<AppEvent> for App {
                     return;
                 }
                 let overlay = self.overlay_info();
+                let audio_status = self.audio.status().to_string();
                 if let (Some(renderer), Some(ui)) = (&mut self.renderer, &mut self.ui) {
                     let prepared_ui = ui.prepare(
                         window,
@@ -434,6 +481,7 @@ impl ApplicationHandler<AppEvent> for App {
                             audio_inputs: &self.audio_inputs,
                             audio_outputs: &self.audio_outputs,
                             is_fullscreen: self.is_fullscreen,
+                            audio_status: &audio_status,
                         },
                     );
                     let toggle_fullscreen = prepared_ui.output.toggle_fullscreen;
@@ -527,11 +575,8 @@ impl ApplicationHandler<AppEvent> for App {
                     "updating settings to match negotiated capture: {}x{} @ {}fps",
                     negotiated.width, negotiated.height, negotiated.fps
                 );
-                self.settings.apply_negotiated(
-                    negotiated.width,
-                    negotiated.height,
-                    negotiated.fps,
-                );
+                self.settings
+                    .apply_negotiated(negotiated.width, negotiated.height, negotiated.fps);
                 if let Err(error) = self.settings.save() {
                     error!("failed to save negotiated settings: {error}");
                 }
@@ -544,9 +589,12 @@ impl ApplicationHandler<AppEvent> for App {
             let render_fps = self.render_frame_counter as f64 / render_elapsed.as_secs_f64();
             let upload_fps = self.render_frames_uploaded as f64 / render_elapsed.as_secs_f64();
 
-            #[cfg(feature = "gpu-decode")]
-            let gpu_info = self.gpu_monitor.as_ref().map(|m| format!(", {}", m.snapshot()));
-            #[cfg(not(feature = "gpu-decode"))]
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+            let gpu_info = self
+                .gpu_monitor
+                .as_ref()
+                .map(|m| format!(", {}", m.snapshot()));
+            #[cfg(not(all(target_os = "windows", feature = "gpu-decode")))]
             let gpu_info: Option<String> = None;
 
             info!(
@@ -593,6 +641,7 @@ impl App {
             || old_settings.audio_input != self.settings.audio_input
             || old_settings.audio_output != self.settings.audio_output;
 
+        let mute_changed = old_settings.audio_muted != self.settings.audio_muted;
         let scaling_changed = old_settings.scaling_filter != self.settings.scaling_filter;
 
         if video_changed {
@@ -605,8 +654,13 @@ impl App {
         if audio_device_changed {
             self.audio.stop();
             self.start_audio();
-        } else if (old_settings.volume - self.settings.volume).abs() > f64::EPSILON {
-            self.audio.set_volume(self.settings.volume);
+        } else {
+            if (old_settings.volume - self.settings.volume).abs() > f64::EPSILON {
+                self.audio.set_volume(self.settings.volume);
+            }
+            if mute_changed {
+                self.audio.set_muted(self.settings.audio_muted);
+            }
         }
 
         if scaling_changed {
@@ -680,7 +734,7 @@ impl App {
         }
 
         // Try to initialize shared DX12 buffers for zero-copy GPU decode
-        #[cfg(feature = "gpu-decode")]
+        #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
         let shared_gpu_handles = if let Some(renderer) = &mut self.renderer {
             renderer.try_init_shared_buffers(capture_config.width, capture_config.height)
         } else {
@@ -688,7 +742,7 @@ impl App {
         };
 
         info!(
-            "starting DirectShow capture: device='{}' {}x{} @ {}fps ({}, threads={})",
+            "starting capture: device='{}' {}x{} @ {}fps ({}, threads={})",
             video_device,
             capture_config.width,
             capture_config.height,
@@ -696,18 +750,21 @@ impl App {
             capture_config.pixel_format,
             capture_config.decode_threads
         );
-        self.capture = Some(CaptureThread::start(CaptureConfig {
-            width: capture_config.width,
-            height: capture_config.height,
-            fps: capture_config.fps,
-            source: CaptureSource::DirectShow {
-                device_name: video_device,
-                pixel_format: capture_config.pixel_format.to_string(),
-                decode_threads: capture_config.decode_threads,
-                #[cfg(feature = "gpu-decode")]
-                shared_gpu_handles,
+        self.capture = Some(CaptureThread::start(
+            CaptureConfig {
+                width: capture_config.width,
+                height: capture_config.height,
+                fps: capture_config.fps,
+                source: CaptureSource::Device {
+                    device_name: video_device,
+                    pixel_format: capture_config.pixel_format.to_string(),
+                    decode_threads: capture_config.decode_threads,
+                    #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+                    shared_gpu_handles,
+                },
             },
-        }, self.event_proxy.clone()));
+            self.event_proxy.clone(),
+        ));
     }
 
     fn start_test_capture(&mut self, width: u32, height: u32, fps: u32, reason: &str) {
@@ -717,16 +774,22 @@ impl App {
             TestPatternMode::Yuvj422p => (false, Some(PixelFormat::Yuvj422p)),
         };
 
-        info!("starting test-pattern capture: {}x{} @ {}fps ({reason})", width, height, fps);
-        self.capture = Some(CaptureThread::start(CaptureConfig {
-            width,
-            height,
-            fps,
-            source: CaptureSource::TestPattern {
-                alternate_formats,
-                force_format,
+        info!(
+            "starting test-pattern capture: {}x{} @ {}fps ({reason})",
+            width, height, fps
+        );
+        self.capture = Some(CaptureThread::start(
+            CaptureConfig {
+                width,
+                height,
+                fps,
+                source: CaptureSource::TestPattern {
+                    alternate_formats,
+                    force_format,
+                },
             },
-        }, self.event_proxy.clone()));
+            self.event_proxy.clone(),
+        ));
     }
 
     fn start_audio(&mut self) {
@@ -750,6 +813,7 @@ impl App {
             self.settings.audio_input,
             self.settings.audio_output,
             self.settings.volume,
+            self.settings.audio_muted,
         );
     }
 }
