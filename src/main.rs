@@ -1,10 +1,13 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod audio;
+mod capabilities;
 mod capture;
+mod color;
 mod devices;
 #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
 mod dx12_interop;
+mod frame_rate;
 #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
 mod gpu_decode;
 #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
@@ -100,6 +103,10 @@ impl CliArgs {
 }
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    if capabilities::handle_probe_args() {
+        return;
+    }
     if let Err(error) = logger::init_logging() {
         eprintln!("failed to initialize logging: {error}");
     }
@@ -121,12 +128,48 @@ fn main() {
     #[cfg(target_os = "windows")]
     let _ = unsafe { SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(APP_ID)) };
 
-    let settings = Settings::load();
+    let mut settings = Settings::load();
     info!(
         "loaded settings from {}",
         settings::settings_path().display()
     );
     let video_devices = devices::enumerate_video_devices();
+    settings.video_device = devices::restore_video_device(&settings.video_device, &video_devices);
+    let mode_query = std::env::args()
+        .find(|arg| arg == "--list-capture-modes" || arg.starts_with("--list-capture-modes="));
+    if let Some(query) = mode_query {
+        let selected = query.split_once('=').map(|(_, value)| value);
+        for device in &video_devices {
+            if selected.is_some_and(|value| {
+                device != value && devices::video_device_label(device) != value
+            }) {
+                continue;
+            }
+            let caps = capabilities::query_device_capabilities(device);
+            println!(
+                "Device: {} [{}]",
+                devices::video_device_label(device),
+                device
+            );
+            for mode in caps.modes {
+                println!(
+                    "  {}x{} | {} | {} FPS ({})",
+                    mode.width,
+                    mode.height,
+                    mode.format,
+                    mode.rate,
+                    mode.rate.key()
+                );
+            }
+            if let Some(message) = caps.message {
+                println!("  {message}");
+            }
+        }
+        return;
+    }
+    if !settings.video_device.is_empty() && !std::env::args().any(|arg| arg.starts_with("--test")) {
+        capabilities::prime_device_capabilities(&settings.video_device);
+    }
     let audio_inputs = devices::enumerate_audio_inputs();
     let audio_outputs = devices::enumerate_audio_outputs();
 
@@ -194,6 +237,7 @@ struct App {
     last_render_summary: Instant,
     last_cursor_moved: Instant,
     last_frame_at: Option<Instant>,
+    next_ui_redraw: Option<Instant>,
     #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
     gpu_monitor: Option<gpu_monitor::GpuMonitor>,
 }
@@ -232,6 +276,7 @@ impl App {
             last_render_summary: Instant::now(),
             last_cursor_moved: Instant::now(),
             last_frame_at: None,
+            next_ui_redraw: None,
             #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
             gpu_monitor: gpu_monitor::GpuMonitor::try_new(),
         }
@@ -359,15 +404,23 @@ impl ApplicationHandler<AppEvent> for App {
         }
 
         let window = Arc::new(Self::create_window(event_loop));
-        let renderer =
-            match pollster::block_on(Renderer::new(window.clone(), self.settings.scaling_filter)) {
-                Ok(renderer) => renderer,
-                Err(error) => {
-                    error!("renderer initialization failed: {error}");
-                    event_loop.exit();
-                    return;
-                }
-            };
+        let renderer = match pollster::block_on(Renderer::new(
+            window.clone(),
+            self.settings.scaling_filter,
+            self.settings.color_space,
+            self.settings.color_range,
+            self.settings.brightness,
+            self.settings.contrast,
+            self.settings.saturation,
+            self.settings.gamma,
+        )) {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                error!("renderer initialization failed: {error}");
+                event_loop.exit();
+                return;
+            }
+        };
 
         let ui = UiState::new(&window, renderer.max_texture_side());
 
@@ -389,7 +442,7 @@ impl ApplicationHandler<AppEvent> for App {
         window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
-        let Some(window) = &self.window else {
+        let Some(window) = self.window.clone() else {
             return;
         };
 
@@ -430,7 +483,9 @@ impl ApplicationHandler<AppEvent> for App {
         // and goes stale (wrong scale factor after a monitor change, unknown
         // pointer position) if it only sees them some of the time.
         if let Some(ui) = &mut self.ui {
-            ui.on_window_event(window, &event);
+            if ui.on_window_event(&window, &event) {
+                window.request_redraw();
+            }
         }
 
         match event {
@@ -473,7 +528,7 @@ impl ApplicationHandler<AppEvent> for App {
                 let audio_status = self.audio.status().to_string();
                 if let (Some(renderer), Some(ui)) = (&mut self.renderer, &mut self.ui) {
                     let prepared_ui = ui.prepare(
-                        window,
+                        &window,
                         UiFrame {
                             overlay: &overlay,
                             settings: &self.settings,
@@ -487,6 +542,18 @@ impl ApplicationHandler<AppEvent> for App {
                     let toggle_fullscreen = prepared_ui.output.toggle_fullscreen;
                     let exit_requested = prepared_ui.output.exit_requested;
                     let apply_settings = prepared_ui.output.apply_settings.clone();
+                    if let Some(live) = &prepared_ui.output.live_video {
+                        renderer.set_picture_settings(
+                            live.brightness,
+                            live.contrast,
+                            live.saturation,
+                            live.gamma,
+                        );
+                        renderer.set_color_settings(live.color_space, live.color_range);
+                        renderer.set_scale_filter(live.scaling_filter);
+                    }
+                    self.next_ui_redraw =
+                        Instant::now().checked_add(prepared_ui.output.repaint_after);
                     if let Err(error) = renderer.render(Some(prepared_ui)) {
                         error!("render error: {error}");
                     }
@@ -601,12 +668,22 @@ impl ApplicationHandler<AppEvent> for App {
                 "render summary: {:.1} rendered fps, {:.1} uploaded fps, decode fps={:.1}{}",
                 render_fps,
                 upload_fps,
-                self.latest_stats.map(|s| s.fps).unwrap_or(0.0),
+                self.latest_stats.as_ref().map(|s| s.fps).unwrap_or(0.0),
                 gpu_info.as_deref().unwrap_or(""),
             );
             self.render_frame_counter = 0;
             self.render_frames_uploaded = 0;
             self.last_render_summary = Instant::now();
+        }
+
+        if self
+            .next_ui_redraw
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.next_ui_redraw = None;
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
         }
 
         // Hide cursor after 3s of inactivity if the ui menu is closed
@@ -624,7 +701,8 @@ impl ApplicationHandler<AppEvent> for App {
 }
 
 impl App {
-    fn apply_settings(&mut self, new_settings: Settings) {
+    fn apply_settings(&mut self, mut new_settings: Settings) {
+        new_settings.sanitize();
         let old_settings = self.settings.clone();
         self.settings = new_settings;
 
@@ -633,6 +711,7 @@ impl App {
         }
 
         let video_changed = old_settings.video_device != self.settings.video_device
+            || old_settings.video_format != self.settings.video_format
             || old_settings.resolution != self.settings.resolution
             || old_settings.fps_mode != self.settings.fps_mode
             || old_settings.custom_fps != self.settings.custom_fps;
@@ -642,7 +721,6 @@ impl App {
             || old_settings.audio_output != self.settings.audio_output;
 
         let mute_changed = old_settings.audio_muted != self.settings.audio_muted;
-        let scaling_changed = old_settings.scaling_filter != self.settings.scaling_filter;
 
         if video_changed {
             if let Some(capture) = &mut self.capture {
@@ -663,10 +741,18 @@ impl App {
             }
         }
 
-        if scaling_changed {
-            if let Some(renderer) = &mut self.renderer {
-                renderer.set_scale_filter(self.settings.scaling_filter);
-            }
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_scale_filter(self.settings.scaling_filter);
+            renderer.set_color_settings(self.settings.color_space, self.settings.color_range);
+            renderer.set_picture_settings(
+                self.settings.brightness,
+                self.settings.contrast,
+                self.settings.saturation,
+                self.settings.gamma,
+            );
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 
@@ -680,11 +766,30 @@ impl App {
         };
 
         OverlayInfo {
-            width: self.latest_stats.map(|stats| stats.width),
-            height: self.latest_stats.map(|stats| stats.height),
-            fps: self.latest_stats.map(|stats| stats.fps),
+            width: self.latest_stats.as_ref().map(|stats| stats.width),
+            height: self.latest_stats.as_ref().map(|stats| stats.height),
+            fps: self.latest_stats.as_ref().map(|stats| stats.fps),
             show_overlay: self.settings.show_overlay && !self.is_minimized,
-            filter: self.settings.scaling_filter,
+            filter: self
+                .renderer
+                .as_ref()
+                .map(Renderer::scale_filter)
+                .unwrap_or(self.settings.scaling_filter),
+            color_space: self.settings.color_space,
+            color_range: self.settings.color_range,
+            color_info: self
+                .renderer
+                .as_ref()
+                .map(Renderer::color_info)
+                .unwrap_or_default(),
+            active_format: self
+                .latest_stats
+                .as_ref()
+                .map(|stats| stats.format_label.clone()),
+            nominal_rate: self
+                .latest_stats
+                .as_ref()
+                .and_then(|stats| stats.nominal_rate),
             detailed: self.settings.detailed_overlay,
             status_message,
             status_is_alert: self.latest_error.is_some() || self.latest_stats.is_none(),
@@ -705,7 +810,11 @@ impl App {
     fn start_capture(&mut self) {
         self.latest_stats = None;
         self.latest_error = None;
-        let capture_config = get_capture_config(&self.settings.resolution, self.settings.get_fps());
+        let capture_config = get_capture_config(
+            &self.settings.resolution,
+            self.settings.get_fps(),
+            self.settings.video_format,
+        );
         if self.test_mode {
             self.start_test_capture(
                 capture_config.width,
@@ -767,7 +876,13 @@ impl App {
         ));
     }
 
-    fn start_test_capture(&mut self, width: u32, height: u32, fps: u32, reason: &str) {
+    fn start_test_capture(
+        &mut self,
+        width: u32,
+        height: u32,
+        fps: frame_rate::FrameRate,
+        reason: &str,
+    ) {
         let (alternate_formats, force_format) = match self.test_pattern {
             TestPatternMode::Alternate => (true, None),
             TestPatternMode::Nv12 => (false, Some(PixelFormat::Nv12)),

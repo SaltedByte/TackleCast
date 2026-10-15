@@ -21,7 +21,11 @@ def verify(package, require_gpu=False, commit=None):
                     raise RuntimeError(f'Expected one {component} runtime DLL, found {libraries}')
                 ctypes.WinDLL(str(libraries[0]), winmode=0x1100)
             if require_gpu:
-                for name in ['nvjpeg64_13.dll', 'cudart64_13.dll']:
+                pairs = [(f'nvjpeg64_{major}.dll', f'cudart64_{major}.dll' if major != 11 else 'cudart64_110.dll') for major in (13, 12, 11)]
+                found = [pair for pair in pairs if all((package / name).is_file() for name in pair)]
+                if len(found) != 1:
+                    raise RuntimeError('Expected exactly one complete supported nvJPEG/CUDA runtime pair')
+                for name in found[0]:
                     ctypes.WinDLL(str(package / name), winmode=0x1100)
     else:
         library_dir = package / 'lib'

@@ -2,7 +2,8 @@ param(
     [string]$PackageName = "TackleCast-Rust",
     [switch]$Zip,
     [switch]$SkipGpuDlls,
-    [switch]$RequireGpuDlls
+    [switch]$RequireGpuDlls,
+    [string]$CudaDllDir
 )
 
 Set-StrictMode -Version Latest
@@ -24,6 +25,7 @@ function Ensure-Exists {
 }
 
 $root = Resolve-Root
+. (Join-Path $PSScriptRoot 'windows_build_environment.ps1')
 $distRoot = Join-Path $root "dist"
 $outDir = Join-Path $distRoot $PackageName
 $targetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root 'target' }
@@ -107,7 +109,11 @@ try {
     # driver and has to match the driver on the target machine.
     $gpuDllsCopied = @()
     if (-not $SkipGpuDlls) {
+        if ($CudaDllDir -and -not (Test-Path -LiteralPath $CudaDllDir -PathType Container)) {
+            throw "CudaDllDir does not exist: $CudaDllDir"
+        }
         $searchDirs = New-Object System.Collections.Generic.List[string]
+        if ($CudaDllDir) { $searchDirs.Add($CudaDllDir) }
         if ($env:GPU_RUNTIME_DIR) { $searchDirs.Add($env:GPU_RUNTIME_DIR) }
         if ($env:CUDA_PATH) {
             $searchDirs.Add((Join-Path $env:CUDA_PATH "bin\x64"))
@@ -117,33 +123,40 @@ try {
         if (Test-Path -LiteralPath $cudaRoot) {
             # Newest toolkit first.
             Get-ChildItem -LiteralPath $cudaRoot -Directory |
-                Sort-Object Name -Descending |
+                Sort-Object { [version]($_.Name -replace '^v', '') } -Descending |
                 ForEach-Object {
                     $searchDirs.Add((Join-Path $_.FullName "bin\x64"))
                     $searchDirs.Add((Join-Path $_.FullName "bin"))
                 }
         }
 
-        foreach ($pattern in @("nvjpeg64_*.dll", "cudart64_*.dll")) {
-            $found = $null
-            foreach ($dir in $searchDirs) {
-                if (-not (Test-Path -LiteralPath $dir)) { continue }
-                $hit = Get-ChildItem -LiteralPath $dir -Filter $pattern -File -ErrorAction SilentlyContinue |
-                    Select-Object -First 1
-                if ($hit) { $found = $hit; break }
+        $selectedGpuDir = $null
+        foreach ($dir in $searchDirs) {
+            if (-not (Test-Path -LiteralPath $dir)) { continue }
+            foreach ($major in @(13, 12, 11)) {
+                $jpeg = Join-Path $dir "nvjpeg64_$major.dll"
+                $runtimeName = if ($major -eq 11) { 'cudart64_110.dll' } else { "cudart64_$major.dll" }
+                $runtime = Join-Path $dir $runtimeName
+                if ((Test-Path -LiteralPath $jpeg) -and (Test-Path -LiteralPath $runtime)) {
+                    foreach ($dllPath in @($jpeg, $runtime)) {
+                        Copy-Item -LiteralPath $dllPath -Destination $outDir
+                        $gpuDllsCopied += [IO.Path]::GetFileName($dllPath)
+                    }
+                    $selectedGpuDir = $dir
+                    break
+                }
             }
-            if ($found) {
-                Copy-Item -LiteralPath $found.FullName -Destination (Join-Path $outDir $found.Name)
-                $gpuDllsCopied += $found.Name
-                Write-Host "Bundled GPU DLL: $($found.Name)"
-            } else {
-                if ($RequireGpuDlls) { throw "Required GPU runtime '$pattern' is missing." }
-                Write-Warning "Could not find '$pattern' - GPU decode will fall back to software on machines without the CUDA Toolkit. Searched: $($searchDirs -join '; ')"
+            if ($selectedGpuDir) { break }
+            if ($CudaDllDir -and $dir -eq $CudaDllDir) {
+                throw "CudaDllDir must contain a supported nvJPEG/CUDA pair from the same major runtime: $dir"
             }
         }
-    }
-    if ($env:GPU_RUNTIME_DIR -and (Test-Path (Join-Path $env:GPU_RUNTIME_DIR 'licenses'))) {
-        Copy-Item (Join-Path $env:GPU_RUNTIME_DIR 'licenses\*') $licensesDir -Force
+        if (-not $selectedGpuDir) {
+            if ($RequireGpuDlls) { throw 'A complete compatible nvJPEG/CUDA runtime pair is required.' }
+            Write-Warning 'No complete compatible nvJPEG/CUDA pair was found; this bundle uses software decoding.'
+        } elseif (Test-Path -LiteralPath (Join-Path $selectedGpuDir 'licenses')) {
+            Copy-Item (Join-Path $selectedGpuDir 'licenses\*') $licensesDir -Force
+        }
     }
     $commit = git -C $root rev-parse HEAD
     if ($LASTEXITCODE -ne 0) { throw 'Cannot record the source commit.' }
@@ -151,6 +164,7 @@ try {
         version = (Select-String -Path (Join-Path $root 'Cargo.toml') -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
         commit = $commit
         platform = 'windows-x86_64'
+        working_tree_changes = [bool](git -C $root status --porcelain)
         gpu_runtime_bundled = ($gpuDllsCopied.Count -eq 2)
     } | ConvertTo-Json | Set-Content (Join-Path $outDir 'build-info.json')
 
@@ -204,9 +218,19 @@ $gpuNote
 
 Scaling filters
 ---------------
-Settings has a Scaling Filter option: Bilinear, Bicubic, or Lanczos. It only
-affects the image when the window is larger than the capture resolution. Tick
-"Include Scaling Filter In Overlay" to see which one is live while comparing.
+Settings has Video, Picture, Audio, and Display tabs in TackleCast's original
+coral/navy colors. Scaling choices are Bilinear, Bicubic, and Lanczos.
+Picture sliders update live, with no backdrop dimming while a slider is active.
+Color Space and Color Range can use source metadata or manual overrides.
+Auto labels identify any default explicitly. BT.2020 selects a matrix, not HDR.
+
+Capture modes
+-------------
+Resolution, frame rate, and pixel format are matched to the selected device.
+Fractional nominal rates remain distinct from measured delivered FPS.
+Auto shows the opened format, for example Auto (NV12). Manual format requests
+are checked against the opened stream; resolution/FPS are not silently lowered.
+If mode discovery fails, the UI reports the failure rather than inventing modes.
 
 If something goes wrong
 -----------------------

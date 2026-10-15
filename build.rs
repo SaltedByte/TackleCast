@@ -1,4 +1,10 @@
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo:rerun-if-changed=src/capabilities/v4l2.c");
+        cc::Build::new()
+            .file("src/capabilities/v4l2.c")
+            .compile("tacklecast_v4l2_caps");
+    }
     #[cfg(windows)]
     {
         let mut res = winresource::WindowsResource::new();

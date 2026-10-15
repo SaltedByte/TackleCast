@@ -1,7 +1,9 @@
 #![allow(clippy::items_after_test_module)]
 
+use crate::color::ColorInfo;
+
 use crate::capture::{CaptureFrame, PixelFormat};
-use crate::settings::ScaleFilter;
+use crate::settings::{ColorRange, ColorSpace, ScaleFilter};
 use crate::ui::PreparedUi;
 use bytemuck::{Pod, Zeroable};
 use egui_wgpu::Renderer as EguiRenderer;
@@ -19,6 +21,10 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
+#[cfg(test)]
+#[path = "render_gpu_tests.rs"]
+mod gpu_tests;
+
 pub struct Renderer {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -31,6 +37,13 @@ pub struct Renderer {
     video_samplers: VideoSamplers,
     uniforms: wgpu::Buffer,
     scale_filter: ScaleFilter,
+    source_color: ColorInfo,
+    color_space: ColorSpace,
+    color_range: ColorRange,
+    brightness: f32,
+    contrast: f32,
+    saturation: f32,
+    gamma: f32,
     video_frame: Option<VideoFrameResources>,
     egui_renderer: EguiRenderer,
     // Reusable scratch buffers to avoid per-frame allocations
@@ -43,10 +56,20 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    /// `scale_filter` is the filter from saved settings. Taken as a constructor
-    /// argument rather than defaulted, so a renderer can't come up disagreeing
-    /// with the settings the menu is showing.
-    pub async fn new(window: Arc<Window>, scale_filter: ScaleFilter) -> Result<Self, RenderError> {
+    /// `scale_filter`, `color_space`, and `color_range` are from saved settings.
+    /// Taken as constructor arguments rather than defaulted, so a renderer can't
+    /// come up disagreeing with the settings the menu is showing.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new(
+        window: Arc<Window>,
+        scale_filter: ScaleFilter,
+        color_space: ColorSpace,
+        color_range: ColorRange,
+        brightness: f32,
+        contrast: f32,
+        saturation: f32,
+        gamma: f32,
+    ) -> Result<Self, RenderError> {
         let size = window.inner_size();
         // Prefer DX12 on Windows so that CUDA ↔ DX12 zero-copy interop works.
         // Fall back to all backends if DX12 isn't available.
@@ -237,6 +260,13 @@ impl Renderer {
             },
             uniforms,
             scale_filter,
+            source_color: ColorInfo::default(),
+            color_space,
+            color_range,
+            brightness,
+            contrast,
+            saturation,
+            gamma,
             video_frame: None,
             egui_renderer,
             pad_scratch: Vec::new(),
@@ -267,7 +297,34 @@ impl Renderer {
         self.scale_filter = filter;
     }
 
+    pub fn set_picture_settings(
+        &mut self,
+        brightness: f32,
+        contrast: f32,
+        saturation: f32,
+        gamma: f32,
+    ) {
+        self.brightness = brightness;
+        self.contrast = contrast;
+        self.saturation = saturation;
+        self.gamma = gamma;
+    }
+
+    pub fn set_color_settings(&mut self, color_space: ColorSpace, color_range: ColorRange) {
+        self.color_space = color_space;
+        self.color_range = color_range;
+    }
+
+    pub fn scale_filter(&self) -> ScaleFilter {
+        self.scale_filter
+    }
+
+    pub fn color_info(&self) -> ColorInfo {
+        self.source_color
+    }
+
     pub fn upload_frame(&mut self, frame: &CaptureFrame) {
+        self.source_color = frame.color_info();
         match frame {
             CaptureFrame::Cpu {
                 width,
@@ -276,12 +333,14 @@ impl Renderer {
                 y_data,
                 u_data,
                 v_data,
+                ..
             } => self.upload_cpu_frame(*width, *height, *format, y_data, u_data, v_data),
             #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
             CaptureFrame::Gpu {
                 width,
                 height,
                 buffer_index,
+                ..
             } => self.upload_gpu_frame(*width, *height, *buffer_index),
         }
     }
@@ -320,12 +379,6 @@ impl Renderer {
         let Some(video_frame) = &self.video_frame else {
             return;
         };
-
-        self.queue.write_buffer(
-            &self.uniforms,
-            0,
-            bytemuck::bytes_of(&VideoUniforms::format_mode_for(format)),
-        );
 
         upload_plane_r8(
             &self.queue,
@@ -434,12 +487,6 @@ impl Renderer {
         let Some(video_frame) = &self.video_frame else {
             return;
         };
-
-        self.queue.write_buffer(
-            &self.uniforms,
-            0,
-            bytemuck::bytes_of(&VideoUniforms::format_mode_for(format)),
-        );
 
         let buf_set = &shared.0[buffer_index];
         let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -581,9 +628,8 @@ impl Renderer {
         }
 
         // Where the letterboxed video lands on screen. The shader needs this to
-        // work out the upscale ratio, so write it (and the filter selection)
-        // before opening the pass — queue writes are applied ahead of submitted
-        // commands regardless, but writing here keeps the ordering plain.
+        // work out the upscale ratio, so write it (and the filter selection, color space,
+        // and color range) before opening the pass.
         let video_viewport = self.video_frame.as_ref().map(|video_frame| {
             calculate_video_viewport(
                 self.size.width as f32,
@@ -593,25 +639,27 @@ impl Renderer {
             )
         });
 
-        if let Some(viewport) = video_viewport {
-            #[repr(C)]
-            #[derive(Clone, Copy, Pod, Zeroable)]
-            struct FilterAndViewport {
-                filter_mode: u32,
-                viewport_size: [f32; 2],
-            }
+        if let (Some(video_frame), Some(viewport)) = (&self.video_frame, video_viewport) {
+            let resolved_space = self
+                .source_color
+                .resolve_space(self.color_space, video_frame.height);
+            let resolved_range = self.source_color.resolve_range(self.color_range);
+            let uniforms = VideoUniforms {
+                format_mode: VideoUniforms::format_mode_for(video_frame.format),
+                filter_mode: self.scale_filter.as_u32(),
+                color_space: resolved_space.as_u32(),
+                color_range: resolved_range.as_u32(),
+                viewport_size: [viewport.width, viewport.height],
+                _padding: [0.0; 2],
+                brightness: self.brightness,
+                contrast: self.contrast,
+                saturation: self.saturation,
+                gamma: self.gamma,
+            };
 
-            self.queue.write_buffer(
-                &self.uniforms,
-                4, // past format_mode, which upload_frame() owns
-                bytemuck::bytes_of(&FilterAndViewport {
-                    filter_mode: self.scale_filter.as_u32(),
-                    viewport_size: [viewport.width, viewport.height],
-                }),
-            );
-        }
+            self.queue
+                .write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
-        {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("tacklecast-clear-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -627,19 +675,32 @@ impl Renderer {
                 occlusion_query_set: None,
             });
 
-            if let (Some(video_frame), Some(viewport)) = (&self.video_frame, video_viewport) {
-                pass.set_pipeline(&self.video_pipeline);
-                pass.set_bind_group(0, &video_frame.bind_group, &[]);
-                pass.set_viewport(
-                    viewport.x,
-                    viewport.y,
-                    viewport.width.max(1.0),
-                    viewport.height.max(1.0),
-                    0.0,
-                    1.0,
-                );
-                pass.draw(0..6, 0..1);
-            }
+            pass.set_pipeline(&self.video_pipeline);
+            pass.set_bind_group(0, &video_frame.bind_group, &[]);
+            pass.set_viewport(
+                viewport.x,
+                viewport.y,
+                viewport.width.max(1.0),
+                viewport.height.max(1.0),
+                0.0,
+                1.0,
+            );
+            pass.draw(0..6, 0..1);
+        } else {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("tacklecast-clear-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
         }
 
         if let Some(ui) = ui.as_ref() {
@@ -708,15 +769,18 @@ impl std::error::Error for RenderError {}
 struct VideoUniforms {
     format_mode: u32,
     filter_mode: u32,
+    color_space: u32,
+    color_range: u32,
     viewport_size: [f32; 2],
-    // WGSL struct has _padding0: vec3<u32> (12 bytes) for 16-byte alignment.
-    // Total struct size = 28 bytes, but uniform buffers round up to 16-byte
-    // alignment so we pad to 32 bytes.
-    _padding: [u32; 4],
+    // Uniform buffers round up to 16-byte alignment, so 32 + 16 = 48 bytes total.
+    _padding: [f32; 2],
+    brightness: f32,
+    contrast: f32,
+    saturation: f32,
+    gamma: f32,
 }
 
 impl VideoUniforms {
-    /// Returns just the format_mode value for a partial buffer write at offset 0.
     fn format_mode_for(format: PixelFormat) -> u32 {
         match format {
             PixelFormat::Nv12 => 0,
@@ -949,6 +1013,11 @@ mod tests {
         assert!(viewport.width < 1920.0);
         assert_eq!(viewport.height, 1080.0);
     }
+
+    #[test]
+    fn video_uniforms_layout() {
+        assert_eq!(std::mem::size_of::<VideoUniforms>(), 48);
+    }
 }
 
 /// The two samplers the video pipeline binds. `filtering` serves the hardware
@@ -999,8 +1068,14 @@ const VIDEO_SHADER: &str = r#"
 struct VideoUniforms {
     format_mode: u32,
     filter_mode: u32,
+    color_space: u32,
+    color_range: u32,
     viewport_size: vec2<f32>,
-    _padding0: vec3<u32>,
+    _padding: vec2<f32>,
+    brightness: f32,
+    contrast: f32,
+    saturation: f32,
+    gamma: f32,
 };
 
 @group(0) @binding(0) var y_tex: texture_2d<f32>;
@@ -1218,39 +1293,67 @@ fn sample_plane(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
 // YUV → RGB color conversion
 // ---------------------------------------------------------------------------
 
-fn sample_yuvj422p(uv: vec2<f32>) -> vec3<f32> {
-    let y = sample_plane(y_tex, uv);
-    let u = sample_plane(u_tex, uv) - 0.5;
-    let v = sample_plane(v_tex, uv) - 0.5;
-    return vec3<f32>(
-        y + 1.402 * v,
-        y - 0.344136 * u - 0.714136 * v,
-        y + 1.772 * u,
-    );
-}
+fn decode_yuv_to_rgb(uv: vec2<f32>) -> vec3<f32> {
+    let y_raw = sample_plane(y_tex, uv);
+    let u_raw = sample_plane(u_tex, uv);
+    let v_raw = sample_plane(v_tex, uv);
 
-fn sample_nv12(uv: vec2<f32>) -> vec3<f32> {
-    let y = sample_plane(y_tex, uv);
-    let u = sample_plane(u_tex, uv);
-    let v = sample_plane(v_tex, uv);
-    let y_limited = clamp((y - (16.0 / 255.0)) * (255.0 / 219.0), 0.0, 1.0);
-    let u_limited = (u - (128.0 / 255.0)) * (255.0 / 224.0);
-    let v_limited = (v - (128.0 / 255.0)) * (255.0 / 224.0);
-    return vec3<f32>(
-        y_limited + 1.402 * v_limited,
-        y_limited - 0.344136 * u_limited - 0.714136 * v_limited,
-        y_limited + 1.772 * u_limited,
-    );
+    var y: f32;
+    var cb: f32;
+    var cr: f32;
+
+    // Range decompression
+    // uniforms.color_range: 0u = Limited (16-235), 1u = Full (0-255)
+    if uniforms.color_range == 0u {
+        y = clamp((y_raw - (16.0 / 255.0)) * (255.0 / 219.0), 0.0, 1.0);
+        cb = (u_raw - (128.0 / 255.0)) * (255.0 / 224.0);
+        cr = (v_raw - (128.0 / 255.0)) * (255.0 / 224.0);
+    } else {
+        y = y_raw;
+        cb = u_raw - (128.0 / 255.0);
+        cr = v_raw - (128.0 / 255.0);
+    }
+
+    var rgb: vec3<f32>;
+
+    // Color space matrix
+    // uniforms.color_space: 0u = Rec.709, 1u = BT.601, 2u = BT.2020
+    if uniforms.color_space == 0u {
+        // Rec. 709 (BT.709)
+        rgb = vec3<f32>(
+            y + 1.5748 * cr,
+            y - 0.187324 * cb - 0.468124 * cr,
+            y + 1.8556 * cb,
+        );
+    } else if uniforms.color_space == 1u {
+        // BT.601
+        rgb = vec3<f32>(
+            y + 1.402 * cr,
+            y - 0.344136 * cb - 0.714136 * cr,
+            y + 1.772 * cb,
+        );
+    } else {
+        // BT.2020
+        rgb = vec3<f32>(
+            y + 1.4746 * cr,
+            y - 0.164553 * cb - 0.571353 * cr,
+            y + 1.8814 * cb,
+        );
+    }
+
+    return rgb;
 }
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    var rgb: vec3<f32>;
-    if uniforms.format_mode == 0u {
-        rgb = sample_nv12(in.uv);
-    } else {
-        rgb = sample_yuvj422p(in.uv);
-    }
+    var rgb = decode_yuv_to_rgb(in.uv);
+
+    // Picture adjustments: brightness, contrast, saturation, gamma
+    rgb = (rgb - 0.5) * uniforms.contrast + 0.5 + uniforms.brightness;
+    let luma = dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    rgb = mix(vec3<f32>(luma), rgb, uniforms.saturation);
+    rgb = pow(max(rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / max(uniforms.gamma, 0.01)));
+
     return vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
 "#;

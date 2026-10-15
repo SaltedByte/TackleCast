@@ -1,6 +1,18 @@
 # TackleCast — Current Progress
 
-Last updated: 2026-04-05
+Last updated: 2026-10-14
+
+## Current local integration
+
+PR #20 is being integrated with main's Windows/Linux and audio changes. Current behavior is documented in README.md and BUILD.md. Device modes and rational frame rates replace generic menus and resolution/FPS fallback. Auto format shows the actual stream format; color metadata and explicitly labeled defaults replace format-based guesses. Picture adjustments are live, and the four tabs retain the coral/navy branding. FSR is excluded for a separate implementation. Packaging does not require postproc, and Windows environment defaults are session-local.
+
+Picture rows use uniform slider lengths and aligned two-decimal value fields. All four tabs share one menu size, with blank space beneath shorter pages and scrolling on small windows. Native Windows mode queries run in a disposable process with a timeout so a failed vendor driver cannot crash the viewer.
+
+Local validation covers default/software-only tests and Clippy, production shader pixel comparisons on Windows and Linux, and NVIDIA owned/shared decoding on Windows. The attached ShadowCast 3 opened 1080p60 and 1080p59.94 in NV12, plus 4K59.94 in MJPEG with GPU decoding. Nominal rates and measured delivery remain separate. Linux has no attached capture card; physical V4L2 negotiation remains unverified on that machine.
+
+The notes below record earlier development and hardware observations. Their fixed FPS menus, format heuristics, and Windows-only architecture describe those older builds rather than this integration.
+
+## Earlier development notes (April 2026)
 
 ## What is TackleCast?
 
@@ -75,6 +87,9 @@ Eliminates all CPU-side data movement for the GPU decode path. Three-tier fallba
 ### Settings Menu (30/60/120/Custom FPS)
 - Frame rate dropdown: 30 FPS, 60 FPS, 120 FPS, Custom (30-240)
 - Resolution dropdown: 720p, 1080p, 1440p, 4K
+- Scaling filter dropdown: Bilinear, Bicubic, Lanczos
+- Color space dropdown: Auto, Rec. 709, BT.601, BT.2020
+- Color range dropdown: Auto, Limited (16-235), Full (0-255)
 - Video device, audio input/output, volume slider
 - Fullscreen toggle, FPS overlay toggle
 - Exit button
@@ -98,8 +113,12 @@ Tested with ShadowCast 3 with zero-copy pipeline:
 - **60fps NV12 works perfectly** on this hardware — zero decode overhead and ~330 MB/s data rate.
 - **RTX 3050 laptop has PCIe 4.0 x4** (half the bandwidth of desktop x16), which was the bottleneck before zero-copy.
 
-### Color Range Mismatch Between NV12 and MJPEG Modes (TODO)
-At 60fps the capture card sends NV12 (limited range YUV, 16-235). At 120fps it sends MJPEG which decodes to Yuvj422p (full range YUV, 0-255 — the "j" means JPEG/full range). The YUV-to-RGB shader currently treats both the same, causing colors to look duller in MJPEG/120fps mode compared to NV12/60fps mode. Fix: pass the pixel format through to the shader and apply the correct YUV-to-RGB matrix for each range (BT.601 limited vs full).
+### Color Range and Color Space Selection (Completed)
+Resolved the color range mismatch between NV12 and MJPEG modes and added full color space matrix transformations:
+- In WGSL shader: decoupled range decompression (Limited 16-235 vs Full 0-255) from color space matrix transformation (Rec. 709, BT.601, BT.2020).
+- In UI settings: interactive dropdowns for Color Space and Color Range.
+- Smart Auto defaults: NV12 -> Limited, MJPEG/YUVJ422P -> Full; >= 720p -> Rec. 709, < 720p -> BT.601.
+- Immediate real-time application in shader uniforms without capture thread restart.
 
 ### ShadowCast 2 Pro: Thermal Throttling at 1440p@120 MJPEG
 The ShadowCast 2 Pro's internal MJPEG encoder thermally throttles under sustained 1440p@120fps load. Confirmed via frame arrival timing diagnostics:
@@ -157,5 +176,17 @@ Each vendor path would follow the same pattern as nvJPEG: dynamic library loadin
 ### Other Future Work
 - Broader hardware validation across more capture card brands
 - UI/menu polish pass based on live feedback
-- Release automation and versioned packaging workflow
 - Audio polish and edge case handling
+
+### Capture settings integration (local validation)
+- Integrates the capture controls with the current Windows/Linux and audio code.
+- Reads actual DirectShow media headers, checks common rates within interval bounds,
+  and confirms the returned rate; Linux uses native V4L2 format/size/interval enumeration.
+- Preserves fractional nominal rates separately from measured delivery FPS.
+- Auto format selection uses device modes; explicit format requests are strict.
+- Tracks source range/matrix metadata independently of plane layout and labels defaults.
+- Adds live Picture adjustments and four branded tabs; sliders clear backdrop dimming.
+- FSR and its sharpness controls are excluded for a future independent feature PR.
+- Windows build defaults are session-local helpers and never leak Windows paths into Linux Cargo builds.
+- Packaging requires no postproc library and selects complete GPU runtime pairs from explicit/toolkit sources.
+- Calibration and full-screen settings with a separate video preview remain future work.

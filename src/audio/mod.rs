@@ -69,8 +69,9 @@ impl AudioPassthrough {
         info!("discovered audio inputs: {:?}", inputs);
         info!("discovered audio outputs: {:?}", outputs);
 
+        let video_label = devices::video_device_label(video_device_name);
         let input_device =
-            match platform::resolve_input_device(&host, input_index, video_device_name, &inputs) {
+            match platform::resolve_input_device(&host, input_index, &video_label, &inputs) {
                 Ok(device) => device,
                 Err(error) => {
                     let msg = format!("audio input unavailable: {error}");
