@@ -30,7 +30,7 @@ On Ubuntu/Debian, install the build tools and audio headers:
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y build-essential nasm libasound2-dev libclang-dev pkg-config
+sudo apt-get install -y build-essential nasm libasound2-dev libclang-dev pkg-config libxkbcommon-x11-0
 bash scripts/setup_linux_dependencies.sh
 export PKG_CONFIG_PATH="$PWD/.deps/ffmpeg/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 export LD_LIBRARY_PATH="$PWD/.deps/ffmpeg/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -41,7 +41,7 @@ bash scripts/package_linux_release.sh
 
 The setup verifies and builds FFmpeg 8.1.3 from source, enabling V4L2 input, MJPEG/raw video/H.264 decoding, parsing, and scaling. External codec libraries, networking, and command-line programs are disabled. `BUILD_JOBS` controls FFmpeg build concurrency (default 2). Source, build outputs, and shared libraries remain in `.deps/`.
 
-The Linux archive includes all seven FFmpeg shared libraries in `lib/`, with their symlinks, license, source URL, and build configuration. Launch with `./run.sh`; it searches the bundled directory before system libraries. FFmpeg need not be installed on the user's PC. Official archives are built for x86_64 Ubuntu 24.04 or newer. The desktop still supplies glibc, ALSA, and Vulkan/OpenGL graphics drivers. Other distributions can build from source.
+The Linux archive includes all seven FFmpeg shared libraries in `lib/`, with their symlinks, license, source URL, and build configuration. Launch with `./run.sh`; it searches the bundled directory before system libraries. FFmpeg need not be installed on the user's PC. Official archives are built for x86_64 Ubuntu 24.04 or newer. The desktop still supplies glibc, ALSA, its X11/Wayland libraries, and Vulkan/OpenGL graphics drivers. X11 sessions require the `libxkbcommon-x11` runtime (`libxkbcommon-x11-0` on Ubuntu/Debian). Other distributions can build from source.
 
 CPAL 0.15 uses ALSA on Linux. PipeWire and PulseAudio work through their ALSA compatibility plugins, rather than native CPAL backends. If automatic audio selection chooses a default source, explicitly select your capture card's audio input. Ensure the logged-in user has access to `/dev/video*`; synthetic tests do not require a capture device.
 
