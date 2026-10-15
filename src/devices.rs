@@ -1,4 +1,6 @@
 use cpal::traits::{DeviceTrait, HostTrait};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 #[cfg(target_os = "windows")]
 use tracing::warn;
 
@@ -14,8 +16,39 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Com::StructuredStorage::IPropertyBag;
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CreateBindCtx, CLSCTX_INPROC_SERVER,
+    COINIT_APARTMENTTHREADED,
 };
+
+static VIDEO_LABELS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+pub fn video_device_label(id: &str) -> String {
+    VIDEO_LABELS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .get(id)
+        .cloned()
+        .unwrap_or_else(|| id.to_string())
+}
+
+pub fn restore_video_device(saved: &str, devices: &[String]) -> String {
+    if saved.is_empty() {
+        return devices.first().cloned().unwrap_or_default();
+    }
+    if devices.iter().any(|device| device == saved) {
+        return saved.to_string();
+    }
+    let matches: Vec<_> = devices
+        .iter()
+        .filter(|id| video_device_label(id) == saved)
+        .collect();
+    if matches.len() == 1 {
+        matches[0].clone()
+    } else {
+        saved.to_string()
+    }
+}
 
 #[allow(dead_code)]
 const IGNORED_KEYWORDS: &[&str] = &["pro", "the", "and"];
@@ -94,7 +127,21 @@ fn enumerate_video_devices_dshow() -> Result<Vec<String>, String> {
                 let name = format!("{}", var);
                 let name = name.trim().to_string();
                 if !name.is_empty() {
-                    devices.push(name);
+                    let context = CreateBindCtx(0).ok();
+                    let id = context
+                        .and_then(|context| moniker.GetDisplayName(&context, None).ok())
+                        .and_then(|value| {
+                            let id = value.to_string().ok();
+                            CoTaskMemFree(Some(value.0.cast()));
+                            id.map(|value| value.replace(':', "_"))
+                        })
+                        .unwrap_or_else(|| name.clone());
+                    VIDEO_LABELS
+                        .get_or_init(Default::default)
+                        .lock()
+                        .unwrap()
+                        .insert(id.clone(), name);
+                    devices.push(id);
                 }
             }
         }
@@ -115,7 +162,23 @@ fn enumerate_video_devices_v4l2() -> Vec<String> {
                 let name = name.trim().to_string();
                 if !name.is_empty() {
                     let dev_node = format!("/dev/{}", entry.file_name().to_string_lossy());
-                    devices.push(format!("{name} ({dev_node})"));
+                    let mut id = dev_node.clone();
+                    if let Ok(links) = std::fs::read_dir("/dev/v4l/by-id") {
+                        let mut links: Vec<_> = links.filter_map(Result::ok).collect();
+                        links.sort_by_key(|entry| entry.file_name());
+                        if let Some(link) = links.into_iter().find(|entry| {
+                            std::fs::canonicalize(entry.path()).ok().as_deref()
+                                == Some(std::path::Path::new(&dev_node))
+                        }) {
+                            id = link.path().to_string_lossy().into_owned();
+                        }
+                    }
+                    VIDEO_LABELS
+                        .get_or_init(Default::default)
+                        .lock()
+                        .unwrap()
+                        .insert(id.clone(), format!("{name} ({dev_node})"));
+                    devices.push(id);
                 }
             }
         }
@@ -133,7 +196,7 @@ pub fn enumerate_audio_outputs() -> Vec<AudioDevice> {
 
 #[allow(dead_code)]
 pub fn find_audio_input_for_video(video_device_name: &str, inputs: &[AudioDevice]) -> Option<i32> {
-    let keywords = keywords_for_device_name(video_device_name);
+    let keywords = keywords_for_device_name(&video_device_label(video_device_name));
     if keywords.is_empty() {
         return None;
     }

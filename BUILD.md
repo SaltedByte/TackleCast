@@ -8,6 +8,7 @@ Install Rust, Visual Studio C++ Build Tools (MSVC), and LLVM/libclang. No CUDA S
 
 ```powershell
 .\scripts\setup_windows_dependencies.ps1 -IncludeGpuRuntime
+. .\scripts\windows_build_environment.ps1
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --no-default-features
@@ -17,7 +18,9 @@ cargo clippy --locked --all-targets --no-default-features -- -D warnings
 
 The setup downloads an exact FFmpeg 8.1.3 LGPL build and NVIDIA redistributables, verifies their SHA256 hashes, and extracts them into `.deps/`. Pins are in `scripts/windows-dependencies.json`. The FFmpeg monthly archive is retained by its publisher for two years; update that pin deliberately when upgrading dependencies. `LIBCLANG_PATH` defaults to `C:\Program Files\LLVM\bin`.
 
-You can instead set `FFMPEG_DIR` to an existing shared development build with `bin/`, `lib/`, and `include/`. `GPU_RUNTIME_DIR` can point to already-extracted NVIDIA runtime DLLs. Local packaging can fall back to an installed CUDA toolkit; automated releases require the runtime files explicitly. `-SkipGpuDlls` produces a software-only runtime bundle.
+You can instead set `FFMPEG_DIR` to an existing shared development build with `bin/`, `lib/`, and `include/`. The Windows environment helper preserves explicit settings, then searches `.deps/ffmpeg` and `C:\ffmpeg`; changes apply only to the current PowerShell session. `scripts/build_windows.ps1 -Command test` also loads this helper. These defaults do not inject Windows paths into Linux builds.
+
+`GPU_RUNTIME_DIR` can point to already-extracted NVIDIA runtime DLLs. Packaging's `-CudaDllDir` takes priority, followed by `GPU_RUNTIME_DIR` and installed CUDA toolkits. Both nvJPEG and cudart must come from one directory with compatible runtime versions (11, 12, or 13). Packaging does not search old distribution folders. Automated releases use pinned runtime files. `-SkipGpuDlls` produces a software-only runtime bundle. FFmpeg's unused `postproc` library is not required.
 
 GPU decoding requires a compatible NVIDIA GPU and driver. The package includes nvJPEG and cudart, but never the NVIDIA driver DLL `nvcuda.dll`. Machines without compatible hardware automatically use software decoding.
 
@@ -73,6 +76,14 @@ cargo test --locked hardware_nvjpeg -- --ignored --test-threads=1
 ```
 
 Synthetic tests validate the renderer and conversion code. They do not prove real capture-card negotiation, PS4 HDMI behavior, or sustained capture performance.
+
+Use `--list-capture-modes` to print connected devices and their reported resolution/format/rate combinations. Windows probes standard intermediate rates and both interval limits through DirectShow `SetFormat`/`GetFormat`; Linux uses V4L2 discrete modes or the driver's declared step/continuous constraints. Rates remain rational (for example `60000/1001`), independently of measured FPS. No calibration wizard is included. Mode discovery cannot prove that a card or HDMI source will sustain its advertised throughput; verify actual frame delivery on hardware.
+
+The ignored `gpu_shader_color_and_picture_reference` test renders production shader output and checks readback pixels for color/range and picture adjustments. It requires a working graphics adapter:
+
+```sh
+cargo test --locked gpu_shader_color_and_picture_reference -- --ignored
+```
 
 ## CI and automated releases
 

@@ -3,6 +3,9 @@ name = "tacklecast"
 version = "2.2.0"
 edition = "2021"
 
+[build-dependencies]
+cc = "1"
+
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1.31"
 
@@ -34,6 +37,7 @@ windows = { version = "0.58", features = [
   "Win32_Media_MediaFoundation",
   "Win32_System_Com",
   "Win32_System_Com_StructuredStorage",
+  "Win32_System_Diagnostics_Debug",
   "Win32_System_LibraryLoader",
   "Win32_System_Power",
   "Win32_System_Variant",
@@ -43,6 +47,7 @@ windows = { version = "0.58", features = [
   "Win32_UI_WindowsAndMessaging",
   "Win32_Graphics_Direct3D12",
   "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Gdi",
   "Win32_Security",
 ] }
 

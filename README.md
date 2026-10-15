@@ -17,11 +17,13 @@ Built for capture cards like the Genki ShadowCast, Elgato, AVerMedia, and other 
 - **Robust audio resampling & channel conversion** - handles mono, stereo, and variable sample rates (e.g. PS4/PS5/Switch audio over USB capture cards)
 - **Audio mute toggle & UI status** - mute control with real-time audio connection status
 - **Cross-platform video capture** - DirectShow on Windows, V4L2 on Linux
-- **Resolution options** - 720p, 1080p, 1440p, 4K
-- **FPS modes** - 30, 60, 120, or Custom (30-240)
-- **Live FPS counter** with real measured framerate
+- **Device-supported modes** - resolutions, pixel formats, and frame rates reported by the selected card, including fractional rates
+- **Visible format negotiation** - Auto prefers NV12, then MJPEG at the selected resolution and FPS, and shows the format actually opened
+- **Color controls** - metadata-aware color space and range, with explicitly labeled defaults and manual overrides
+- **Live picture controls** - brightness, contrast, saturation, gamma, and reset
+- **Live FPS counter** with separate nominal and delivered frame rates
 - **Auto-detect capture cards** via DirectShow and V4L2
-- **Dark theme UI** with pause-style settings menu (egui)
+- **Four-tab settings** - Video, Picture, Audio, and Display, retaining the coral/navy theme
 - **Fullscreen support** (F11 or toggle in settings)
 - **Zero recording overhead** - purely a viewer
 - **Settings persistence** - remembers your device selections
@@ -68,14 +70,19 @@ TackleCast has a three-tier decode pipeline that automatically selects the best 
 | GPU decode + readback | nvJPEG decode to host memory to wgpu | CUDA available, DX12 interop unavailable |
 | Software decode | ffmpeg CPU decode to wgpu | Linux or no CUDA/nvJPEG available |
 
-At 60 FPS and below, most capture cards output raw NV12 with zero decode overhead. Above 60 FPS, MJPEG is used and benefits from GPU decode.
+Auto selects a format from the card's supported modes at the requested resolution and frame rate. It tries NV12 first, then MJPEG, then other supported formats. Manual format selections are strict; capture does not silently reduce resolution or frame rate. The menu shows the actual format after negotiation. The overlay distinguishes the nominal mode from measured frame delivery.
+
+Color Auto follows stream/frame metadata. When metadata is missing, the UI labels the fallback as a default rather than presenting it as detected information. BT.2020 selects a conversion matrix; it does not implement HDR tone mapping.
 
 ## Architecture
 
 ```
 src/
   main.rs          - winit event loop, app state, settings
-  capture.rs       - DirectShow / V4L2 capture via ffmpeg-next, format/resolution fallback
+  capture.rs       - DirectShow / V4L2 capture via ffmpeg-next, strict mode negotiation
+  capabilities/    - Native DirectShow / V4L2 mode discovery
+  frame_rate.rs    - Rational nominal frame rates
+  color.rs         - Color metadata and explicit defaults
   gpu_decode.rs    - NVIDIA nvJPEG GPU MJPEG decode (feature-gated: gpu-decode)
   dx12_interop.rs  - DX12 shared buffers for CUDA/wgpu zero-copy (feature-gated: gpu-decode)
   render.rs        - wgpu DX12/Vulkan renderer, YUV->RGB WGSL shader

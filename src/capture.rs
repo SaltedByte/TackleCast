@@ -1,3 +1,6 @@
+use crate::color::ColorInfo;
+use crate::frame_rate::FrameRate;
+use crate::settings::{ColorRange, ColorSpace, VideoFormat};
 use std::f32::consts::PI;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -38,6 +41,7 @@ pub enum CaptureFrame {
         width: u32,
         height: u32,
         format: PixelFormat,
+        color_info: ColorInfo,
         y_data: Vec<u8>,
         u_data: Vec<u8>,
         v_data: Vec<u8>,
@@ -50,16 +54,32 @@ pub enum CaptureFrame {
         width: u32,
         height: u32,
         buffer_index: usize,
+        color_info: ColorInfo,
     },
 }
 
 impl CaptureFrame {
+    pub fn color_info(&self) -> ColorInfo {
+        match self {
+            Self::Cpu { color_info, .. } => *color_info,
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+            Self::Gpu { color_info, .. } => *color_info,
+        }
+    }
+    pub fn set_color_info(&mut self, info: ColorInfo) {
+        match self {
+            Self::Cpu { color_info, .. } => *color_info = info,
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+            Self::Gpu { color_info, .. } => *color_info = info,
+        }
+    }
     /// Create an empty frame for triple buffer slot initialization.
     pub fn empty() -> Self {
         Self::Cpu {
             width: 0,
             height: 0,
             format: PixelFormat::Nv12,
+            color_info: ColorInfo::default(),
             y_data: Vec::new(),
             u_data: Vec::new(),
             v_data: Vec::new(),
@@ -93,6 +113,7 @@ impl CaptureFrame {
                 y_data,
                 u_data,
                 v_data,
+                ..
             } => {
                 *width = new_width;
                 *height = new_height;
@@ -135,8 +156,10 @@ impl CaptureFrame {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CaptureStats {
+    pub format_label: String,
+    pub nominal_rate: Option<FrameRate>,
     pub fps: f32,
     pub width: u32,
     pub height: u32,
@@ -148,13 +171,13 @@ pub struct CaptureStats {
 pub struct NegotiatedConfig {
     pub width: u32,
     pub height: u32,
-    pub fps: u32,
+    pub fps: FrameRate,
 }
 
 pub struct CaptureConfig {
     pub width: u32,
     pub height: u32,
-    pub fps: u32,
+    pub fps: FrameRate,
     pub source: CaptureSource,
 }
 
@@ -213,7 +236,7 @@ impl CaptureThread {
             } => run_test_pattern(
                 config.width,
                 config.height,
-                config.fps.max(1),
+                config.fps,
                 alternate_formats,
                 force_format,
                 thread_stop_flag,
@@ -231,7 +254,7 @@ impl CaptureThread {
                 device_name,
                 config.width,
                 config.height,
-                config.fps.max(1),
+                config.fps,
                 pixel_format,
                 decode_threads,
                 thread_stop_flag,
@@ -254,7 +277,7 @@ impl CaptureThread {
                 device_name,
                 config.width,
                 config.height,
-                config.fps.max(1),
+                config.fps,
                 pixel_format,
                 decode_threads,
                 thread_stop_flag,
@@ -275,7 +298,7 @@ impl CaptureThread {
                 device_name,
                 config.width,
                 config.height,
-                config.fps.max(1),
+                config.fps,
                 pixel_format,
                 decode_threads,
                 thread_stop_flag,
@@ -336,7 +359,7 @@ impl Drop for CaptureThread {
 fn run_test_pattern(
     width: u32,
     height: u32,
-    fps: u32,
+    fps: FrameRate,
     alternate_formats: bool,
     force_format: Option<PixelFormat>,
     stop_flag: Arc<AtomicBool>,
@@ -344,7 +367,7 @@ fn run_test_pattern(
     stats_tx: Sender<CaptureStats>,
     event_proxy: &EventLoopProxy<AppEvent>,
 ) {
-    let frame_interval = Duration::from_secs_f64(1.0 / fps as f64);
+    let frame_interval = Duration::from_secs_f64(1.0 / fps.as_f64());
     let mut frame_index = 0_u64;
     let mut last_stats_at = Instant::now();
     let mut stats_frame_counter = 0_u32;
@@ -352,7 +375,7 @@ fn run_test_pattern(
     while !stop_flag.load(Ordering::Relaxed) {
         let loop_started = Instant::now();
         let format = force_format.unwrap_or_else(|| {
-            if alternate_formats && ((frame_index / fps as u64) % 6) >= 3 {
+            if alternate_formats && ((frame_index / (fps.as_f64() as u64).max(1)) % 6) >= 3 {
                 PixelFormat::Yuvj422p
             } else {
                 PixelFormat::Nv12
@@ -368,8 +391,19 @@ fn run_test_pattern(
 
         let elapsed = last_stats_at.elapsed();
         if elapsed >= Duration::from_millis(300) {
-            let fps = stats_frame_counter as f32 / elapsed.as_secs_f32();
-            let _ = stats_tx.send(CaptureStats { fps, width, height });
+            let measured_fps = stats_frame_counter as f32 / elapsed.as_secs_f32();
+            let format_label = match format {
+                PixelFormat::Nv12 => "Test NV12",
+                PixelFormat::Yuvj422p => "Test YUV422",
+            }
+            .to_string();
+            let _ = stats_tx.send(CaptureStats {
+                fps: measured_fps,
+                width,
+                height,
+                format_label,
+                nominal_rate: Some(fps),
+            });
             last_stats_at = Instant::now();
             stats_frame_counter = 0;
         }
@@ -386,7 +420,7 @@ fn run_device_capture(
     device_name: String,
     requested_width: u32,
     requested_height: u32,
-    requested_fps: u32,
+    requested_fps: FrameRate,
     requested_pixel_format: String,
     decode_threads: usize,
     stop_flag: Arc<AtomicBool>,
@@ -405,74 +439,69 @@ fn run_device_capture(
     }
     ffmpeg::log::set_level(ffmpeg::log::Level::Error);
 
-    // Build list of (width, height, fps) tiers to try. Start with the
-    // requested settings, then fall back to common resolutions/framerates
-    // that most USB capture devices and webcams support.
-    let resolution_tiers =
-        resolution_fallback_tiers(requested_width, requested_height, requested_fps);
-
-    let mut last_error: Option<String> = None;
-
-    for &(try_w, try_h, try_fps) in &resolution_tiers {
-        let attempt_formats = pixel_format_attempts(&requested_pixel_format);
-
-        for format_attempt in attempt_formats {
-            if stop_flag.load(Ordering::Relaxed) {
-                return;
-            }
-
-            let format_label = format_attempt.as_deref().unwrap_or("auto");
-            info!(
-                "capture attempt: device='{}' format='{}' {}x{} @ {}fps",
-                device_name, format_label, try_w, try_h, try_fps
-            );
-
-            match run_device_capture_inner(
-                &device_name,
-                try_w,
-                try_h,
-                try_fps,
-                format_attempt.as_deref(),
-                decode_threads,
-                stop_flag.clone(),
-                &mut frame_producer,
-                stats_tx.clone(),
-                event_proxy,
-                #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
-                shared_gpu_handles.take(),
-            ) {
-                Ok(()) => {
-                    // Notify if we fell back to different settings
-                    if try_w != requested_width
-                        || try_h != requested_height
-                        || try_fps != requested_fps
-                    {
-                        info!(
-                            "capture negotiated fallback: {}x{} @ {}fps (requested {}x{} @ {}fps)",
-                            try_w, try_h, try_fps, requested_width, requested_height, requested_fps
-                        );
-                        let _ = negotiated_tx.send(NegotiatedConfig {
-                            width: try_w,
-                            height: try_h,
-                            fps: try_fps,
-                        });
-                    }
-                    return;
-                }
-                Err(error) => {
-                    warn!(
-                        "capture attempt failed: device='{}' format='{}' {}x{} @ {}fps error={}",
-                        device_name, format_label, try_w, try_h, try_fps, error
-                    );
-                    last_error = Some(error);
-                }
+    let caps = crate::capabilities::get_device_capabilities(&device_name);
+    let resolution = crate::capabilities::resolution_label(requested_width, requested_height);
+    let requested = VideoFormat::ALL
+        .into_iter()
+        .find(|value| value.ffmpeg_name() == requested_pixel_format)
+        .unwrap_or(VideoFormat::Auto);
+    let attempts = if requested == VideoFormat::Auto {
+        let formats =
+            crate::capabilities::supported_video_formats(&caps, &resolution, requested_fps);
+        if formats.len() > 1 {
+            formats
+                .into_iter()
+                .filter(|f| *f != VideoFormat::Auto)
+                .collect::<Vec<_>>()
+        } else {
+            vec![VideoFormat::Auto]
+        }
+    } else {
+        vec![requested]
+    };
+    let mut last_error = None;
+    for attempt in attempts {
+        if stop_flag.load(Ordering::Relaxed) {
+            return;
+        }
+        let pixel = if attempt == VideoFormat::Auto {
+            None
+        } else {
+            Some(attempt.ffmpeg_name())
+        };
+        info!(
+            "capture attempt: device='{}' format='{}' {}x{} @ {} FPS",
+            device_name, attempt, requested_width, requested_height, requested_fps
+        );
+        let result = run_device_capture_inner(
+            &device_name,
+            requested_width,
+            requested_height,
+            requested_fps,
+            pixel,
+            decode_threads,
+            stop_flag.clone(),
+            &mut frame_producer,
+            stats_tx.clone(),
+            &negotiated_tx,
+            event_proxy,
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+            if attempt == VideoFormat::Mjpeg {
+                shared_gpu_handles.take()
+            } else {
+                None
+            },
+        );
+        match result {
+            Ok(()) => return,
+            Err(error) => {
+                warn!("capture attempt failed: {error}");
+                last_error = Some(error);
             }
         }
     }
-
-    let _ = error_tx.send(
-        last_error.unwrap_or_else(|| format!("all capture attempts failed for '{device_name}'")),
-    );
+    let _ =
+        error_tx.send(last_error.unwrap_or_else(|| "No supported capture mode was found".into()));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -480,12 +509,13 @@ fn run_device_capture_inner(
     device_name: &str,
     requested_width: u32,
     requested_height: u32,
-    requested_fps: u32,
+    requested_fps: FrameRate,
     requested_pixel_format: Option<&str>,
     decode_threads: usize,
     stop_flag: Arc<AtomicBool>,
     frame_producer: &mut Producer<CaptureFrame>,
     stats_tx: Sender<CaptureStats>,
+    negotiated_tx: &Sender<NegotiatedConfig>,
     event_proxy: &EventLoopProxy<AppEvent>,
     #[cfg(all(target_os = "windows", feature = "gpu-decode"))] shared_gpu_handles: Option<
         crate::dx12_interop::ImportHandles,
@@ -497,7 +527,7 @@ fn run_device_capture_inner(
         "video_size",
         &format!("{requested_width}x{requested_height}"),
     );
-    options.set("framerate", &requested_fps.to_string());
+    options.set("framerate", &requested_fps.key());
     options.set("rtbufsize", "16M");
     options.set("probesize", "5000000");
     options.set("analyzeduration", "1000000");
@@ -545,7 +575,11 @@ fn run_device_capture_inner(
         .map_err(|error| format!("failed to create decoder context: {error}"))?;
     decoder_context.set_threading(threading::Config {
         kind: threading::Type::Frame,
-        count: decode_threads.max(1),
+        count: if decoder_context.id() == codec::Id::MJPEG {
+            decode_threads.max(4)
+        } else {
+            1
+        },
     });
 
     let mut decoder = decoder_context
@@ -553,33 +587,67 @@ fn run_device_capture_inner(
         .video()
         .map_err(|error| format!("failed to open video decoder: {error}"))?;
 
-    // Log actual stream parameters vs requested
     let actual_rate = input_stream.rate();
-    let actual_fps_f64 = if actual_rate.1 > 0 {
-        actual_rate.0 as f64 / actual_rate.1 as f64
+    let nominal_rate = if actual_rate.0 > 0 && actual_rate.1 > 0 {
+        Some(FrameRate::new(actual_rate.0 as u32, actual_rate.1 as u32).normalized())
     } else {
-        0.0
+        None
     };
-    let actual_width = decoder.width();
-    let actual_height = decoder.height();
-    info!(
-        "stream negotiated: {}x{} @ {:.2}fps (time_base={}/{}), requested: {}x{} @ {}fps",
-        actual_width,
-        actual_height,
-        actual_fps_f64,
-        actual_rate.0,
-        actual_rate.1,
-        requested_width,
-        requested_height,
-        requested_fps,
-    );
-    if (actual_fps_f64 - requested_fps as f64).abs() > 1.0 && actual_fps_f64 > 0.0 {
-        warn!(
-            "stream framerate mismatch: requested {}fps but device negotiated {:.1}fps",
-            requested_fps, actual_fps_f64
-        );
+    if decoder.width() != requested_width || decoder.height() != requested_height {
+        return Err(format!(
+            "Requested {}x{}, but the device negotiated {}x{}; capture was not silently resized",
+            requested_width,
+            requested_height,
+            decoder.width(),
+            decoder.height()
+        ));
     }
-
+    if let Some(rate) = nominal_rate {
+        if !rate.equivalent(requested_fps) {
+            return Err(format!(
+                "Requested {requested_fps} FPS, but the device negotiated {rate} FPS"
+            ));
+        }
+        let _ = negotiated_tx.send(NegotiatedConfig {
+            width: decoder.width(),
+            height: decoder.height(),
+            fps: rate,
+        });
+    }
+    let capture_format = actual_capture_format(decoder.id(), decoder.format());
+    let capture_name = if decoder.id() == codec::Id::MJPEG {
+        "MJPEG".to_string()
+    } else if decoder.id() == codec::Id::RAWVIDEO {
+        decoder
+            .format()
+            .descriptor()
+            .map(|description| description.name().to_ascii_uppercase())
+            .unwrap_or_else(|| "Unknown".into())
+    } else {
+        format!("{:?}", decoder.id())
+    };
+    if let Some(requested) = requested_pixel_format {
+        if capture_format.ffmpeg_name() != requested {
+            return Err(format!(
+                "Requested format {requested}, but the device negotiated {capture_format}"
+            ));
+        }
+    }
+    info!(
+        "stream negotiated: {}x{} | {} | nominal rate {}",
+        decoder.width(),
+        decoder.height(),
+        capture_name,
+        nominal_rate
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| "Unknown".into())
+    );
+    #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+    let source_color = ColorInfo::from_ffmpeg(
+        decoder.color_space(),
+        decoder.color_range(),
+        decoder.format(),
+    );
     let mut decoded = Video::empty();
     let mut last_stats_at = Instant::now();
     let mut last_summary_at = Instant::now();
@@ -600,8 +668,7 @@ fn run_device_capture_inner(
 
     // Try to initialize GPU-accelerated MJPEG decode (NVIDIA nvJPEG)
     #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
-    let mut gpu_decoder = if requested_pixel_format.is_some_and(|f| f.eq_ignore_ascii_case("mjpeg"))
-    {
+    let mut gpu_decoder = if decoder.id() == codec::Id::MJPEG {
         // Try zero-copy shared buffer mode first, then fall back to owned mode
         if let Some(handles) = shared_gpu_handles {
             info!("attempting zero-copy GPU decode with shared DX12 buffers");
@@ -686,6 +753,9 @@ fn run_device_capture_inner(
                             );
                         }
 
+                        let mut color = source_color;
+                        color.default_range = ColorRange::Full;
+                        frame_producer.back_slot().set_color_info(color);
                         frame_producer.publish();
                         let _ = event_proxy.send_event(AppEvent::FrameReady);
 
@@ -694,7 +764,18 @@ fn run_device_capture_inner(
                         let elapsed = last_stats_at.elapsed();
                         if elapsed >= Duration::from_millis(300) {
                             let fps = stats_frame_counter as f32 / elapsed.as_secs_f32();
-                            let _ = stats_tx.send(CaptureStats { fps, width, height });
+                            let backend = if gpu.is_zero_copy() {
+                                "Zero-Copy"
+                            } else {
+                                "GPU"
+                            };
+                            let _ = stats_tx.send(CaptureStats {
+                                fps,
+                                width,
+                                height,
+                                format_label: format!("{capture_name} ({backend})"),
+                                nominal_rate,
+                            });
                             last_stats_at = Instant::now();
                             stats_frame_counter = 0;
                         }
@@ -766,7 +847,13 @@ fn run_device_capture_inner(
                 &decoded,
                 &mut scaler,
                 &mut scaled_frame,
-                requested_fps > 60,
+                matches!(
+                    decoded.format(),
+                    format::Pixel::YUVJ422P
+                        | format::Pixel::YUV422P
+                        | format::Pixel::YUYV422
+                        | format::Pixel::UYVY422
+                ),
             )
             .map_err(|error| format!("failed to convert decoded frame: {error}"))?;
             let width = frame.width();
@@ -792,7 +879,18 @@ fn run_device_capture_inner(
             let elapsed = last_stats_at.elapsed();
             if elapsed >= Duration::from_millis(300) {
                 let fps = stats_frame_counter as f32 / elapsed.as_secs_f32();
-                let _ = stats_tx.send(CaptureStats { fps, width, height });
+                let label = if decoder.id() == codec::Id::MJPEG {
+                    format!("{capture_name} (SW)")
+                } else {
+                    capture_name.clone()
+                };
+                let _ = stats_tx.send(CaptureStats {
+                    fps,
+                    width,
+                    height,
+                    format_label: label,
+                    nominal_rate,
+                });
                 last_stats_at = Instant::now();
                 stats_frame_counter = 0;
             }
@@ -838,10 +936,10 @@ fn capture_frame_from_video(
 
     let format = match frame.format() {
         format::Pixel::NV12 => PixelFormat::Nv12,
-        format::Pixel::YUVJ422P => PixelFormat::Yuvj422p,
+        format::Pixel::YUVJ422P | format::Pixel::YUV422P => PixelFormat::Yuvj422p,
         other => {
             let target = if prefer_yuvj422p {
-                format::Pixel::YUVJ422P
+                format::Pixel::YUV422P
             } else {
                 format::Pixel::NV12
             };
@@ -874,10 +972,39 @@ fn capture_frame_from_video(
                 return Err("scaler context unavailable".to_string());
             };
 
+            let info =
+                ColorInfo::from_ffmpeg(frame.color_space(), frame.color_range(), frame.format());
+            let range = i32::from(info.resolve_range(ColorRange::Auto) == ColorRange::Full);
+            let space = info.resolve_space(ColorSpace::Auto, height);
+            let matrix = match space {
+                ColorSpace::Bt601 => ffmpeg::ffi::SWS_CS_ITU601,
+                ColorSpace::Bt2020 => ffmpeg::ffi::SWS_CS_BT2020,
+                _ => ffmpeg::ffi::SWS_CS_ITU709,
+            };
+            // Preserve sample range through layout conversion. The shader owns
+            // range expansion, including live manual overrides.
+            let result = unsafe {
+                let coefficients = ffmpeg::ffi::sws_getCoefficients(matrix);
+                ffmpeg::ffi::sws_setColorspaceDetails(
+                    scale_ctx.as_mut_ptr(),
+                    coefficients,
+                    range,
+                    coefficients,
+                    range,
+                    0,
+                    1 << 16,
+                    1 << 16,
+                )
+            };
+            if result < 0 {
+                return Err("Failed to preserve colors during pixel conversion".into());
+            }
             scale_ctx
                 .run(frame, scaled_frame)
                 .map_err(|error| format!("failed to convert frame via swscale: {error}"))?;
-            return extract_supported_frame(scaled_frame);
+            let mut result = extract_supported_frame(scaled_frame)?;
+            result.set_color_info(info);
+            return Ok(result);
         }
     };
 
@@ -889,7 +1016,7 @@ fn extract_supported_frame(frame: &Video) -> Result<CaptureFrame, String> {
     let height = frame.height();
     let format = match frame.format() {
         format::Pixel::NV12 => PixelFormat::Nv12,
-        format::Pixel::YUVJ422P => PixelFormat::Yuvj422p,
+        format::Pixel::YUVJ422P | format::Pixel::YUV422P => PixelFormat::Yuvj422p,
         other => return Err(format!("unsupported converted pixel format: {other:?}")),
     };
     extract_supported_frame_with_format(frame, format, width, height)
@@ -915,69 +1042,28 @@ fn extract_supported_frame_with_format(
         width,
         height,
         format,
+        color_info: ColorInfo::from_ffmpeg(
+            frame.color_space(),
+            frame.color_range(),
+            frame.format(),
+        ),
         y_data,
         u_data,
         v_data,
     })
 }
 
-/// Build an ordered list of (width, height, fps) to try. Starts with the
-/// requested settings, then appends common fallback tiers — halved fps at
-/// the same resolution, then standard lower resolutions at 60/30 fps.
-/// Duplicates of the original request are excluded.
-fn resolution_fallback_tiers(width: u32, height: u32, fps: u32) -> Vec<(u32, u32, u32)> {
-    let mut tiers: Vec<(u32, u32, u32)> = Vec::new();
-    let mut push = |w, h, f| {
-        if !tiers.contains(&(w, h, f)) {
-            tiers.push((w, h, f));
-        }
-    };
-
-    // Tier 0: exactly what the user asked for
-    push(width, height, fps);
-
-    // Tier 1: same resolution at half fps (e.g. 1080p120 -> 1080p60, 1080p60 -> 1080p30)
-    if fps > 30 {
-        push(width, height, fps / 2);
+fn actual_capture_format(codec: codec::Id, pixel: format::Pixel) -> VideoFormat {
+    if codec == codec::Id::MJPEG {
+        return VideoFormat::Mjpeg;
     }
-    // Tier 2: same resolution at 30fps
-    if fps != 30 {
-        push(width, height, 30);
+    match pixel {
+        format::Pixel::NV12 => VideoFormat::Nv12,
+        format::Pixel::YUYV422 => VideoFormat::Yuy2,
+        format::Pixel::UYVY422 => VideoFormat::Uyvy,
+        format::Pixel::YUV420P => VideoFormat::Yuv420p,
+        _ => VideoFormat::Auto,
     }
-
-    // Tier 3: standard fallback resolutions
-    let fallbacks: &[(u32, u32)] = &[(1920, 1080), (1280, 720), (640, 480)];
-    for &(fw, fh) in fallbacks {
-        if fw >= width && fh >= height {
-            continue; // skip resolutions >= what we already tried
-        }
-        push(fw, fh, 60);
-        push(fw, fh, 30);
-    }
-
-    tiers
-}
-
-fn pixel_format_attempts(requested_pixel_format: &str) -> Vec<Option<String>> {
-    let mut attempts = Vec::new();
-    let mut push_unique = |value: Option<&str>| {
-        if attempts
-            .iter()
-            .any(|existing: &Option<String>| existing.as_deref() == value)
-        {
-            return;
-        }
-        attempts.push(value.map(str::to_string));
-    };
-
-    push_unique(Some(requested_pixel_format));
-    push_unique(Some("mjpeg"));
-    push_unique(Some("nv12"));
-    push_unique(Some("yuyv422"));
-    push_unique(Some("uyvy422"));
-    push_unique(Some("yuv420p"));
-    push_unique(None);
-    attempts
 }
 
 fn copy_plane(frame: &Video, plane: usize, row_bytes: usize, rows: usize) -> Vec<u8> {
@@ -1035,7 +1121,7 @@ fn find_input_format() -> Result<(ffmpeg::Format, String), String> {
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_v4l2_node(device_name: &str) -> String {
+pub fn resolve_v4l2_node(device_name: &str) -> String {
     if device_name.starts_with("/dev/") {
         return device_name.to_string();
     }
@@ -1047,15 +1133,7 @@ fn resolve_v4l2_node(device_name: &str) -> String {
             }
         }
     }
-    if let Ok(entries) = std::fs::read_dir("/dev") {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if name.to_string_lossy().starts_with("video") {
-                return format!("/dev/{}", name.to_string_lossy());
-            }
-        }
-    }
-    "/dev/video0".to_string()
+    device_name.to_string()
 }
 
 fn generate_test_frame(
@@ -1106,6 +1184,11 @@ fn generate_test_frame(
                 width,
                 height,
                 format,
+                color_info: ColorInfo {
+                    space: Some(ColorSpace::Rec709),
+                    range: Some(ColorRange::Full),
+                    ..ColorInfo::default()
+                },
                 y_data,
                 u_data: uv_data,
                 v_data: Vec::new(),
@@ -1133,6 +1216,11 @@ fn generate_test_frame(
                 width,
                 height,
                 format,
+                color_info: ColorInfo {
+                    space: Some(ColorSpace::Rec709),
+                    range: Some(ColorRange::Full),
+                    ..ColorInfo::default()
+                },
                 y_data,
                 u_data,
                 v_data,
@@ -1144,6 +1232,51 @@ fn generate_test_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(irrefutable_let_patterns)]
+    fn packed_conversion_preserves_limited_range_samples() {
+        let mut input = Video::new(format::Pixel::YUYV422, 2, 2);
+        input.set_color_range(ffmpeg::color::Range::MPEG);
+        input.set_color_space(ffmpeg::color::Space::BT709);
+        let stride = input.stride(0);
+        for row in 0..2 {
+            input.data_mut(0)[row * stride..row * stride + 4].copy_from_slice(&[16, 128, 235, 128]);
+        }
+        let frame = capture_frame_from_video(&input, &mut None, &mut Video::empty(), true).unwrap();
+        let CaptureFrame::Cpu {
+            y_data, color_info, ..
+        } = frame
+        else {
+            panic!("Expected CPU frame")
+        };
+        assert_eq!(y_data, [16, 235, 16, 235]);
+        assert_eq!(color_info.range, Some(ColorRange::Limited));
+        assert_eq!(color_info.space, Some(ColorSpace::Rec709));
+    }
+
+    #[test]
+    #[allow(irrefutable_let_patterns)]
+    fn planar_conversion_preserves_full_range_metadata_and_samples() {
+        let mut input = Video::new(format::Pixel::YUVJ420P, 2, 2);
+        input.set_color_range(ffmpeg::color::Range::JPEG);
+        let stride = input.stride(0);
+        for row in 0..2 {
+            input.data_mut(0)[row * stride..row * stride + 2].copy_from_slice(&[0, 255]);
+        }
+        input.data_mut(1)[0] = 128;
+        input.data_mut(2)[0] = 128;
+        let frame =
+            capture_frame_from_video(&input, &mut None, &mut Video::empty(), false).unwrap();
+        let CaptureFrame::Cpu {
+            y_data, color_info, ..
+        } = frame
+        else {
+            panic!("Expected CPU frame")
+        };
+        assert_eq!(y_data, [0, 255, 0, 255]);
+        assert_eq!(color_info.range, Some(ColorRange::Full));
+    }
 
     #[test]
     fn software_decoder_handles_capture_mjpeg() {
@@ -1205,19 +1338,5 @@ mod tests {
         assert_eq!(y_data.len(), 1280 * 720);
         assert_eq!(u_data.len(), 640 * 720);
         assert_eq!(v_data.len(), 640 * 720);
-    }
-
-    #[test]
-    fn pixel_format_attempts_include_fallbacks_without_duplicates() {
-        let attempts = pixel_format_attempts("nv12");
-        let labels: Vec<_> = attempts
-            .iter()
-            .map(|s| s.as_deref().unwrap_or("auto"))
-            .collect();
-        assert!(labels.contains(&"nv12"));
-        assert!(labels.contains(&"mjpeg"));
-        assert!(labels.contains(&"auto"));
-        let nv12_count = labels.iter().filter(|v| **v == "nv12").count();
-        assert_eq!(nv12_count, 1);
     }
 }

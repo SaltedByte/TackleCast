@@ -3028,6 +3028,7 @@ name = "tacklecast"
 version = "2.2.0"
 dependencies = [
  "bytemuck",
+ "cc",
  "cpal",
  "crossbeam-channel",
  "egui",

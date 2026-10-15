@@ -967,6 +967,7 @@ impl NvjpegDecoder {
                 let buffer_index = *current_index;
                 *current_index = (*current_index + 1) % sets.len();
                 *out = CaptureFrame::Gpu {
+                    color_info: crate::color::ColorInfo::default(),
                     width,
                     height,
                     buffer_index,
