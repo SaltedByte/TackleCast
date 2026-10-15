@@ -11,8 +11,8 @@ Built for capture cards like the Genki ShadowCast, Elgato, AVerMedia, and other 
 ## Features
 
 - **GPU-accelerated rendering** via wgpu with a custom YUV-to-RGB shader
-- **NVIDIA GPU MJPEG decode** via nvJPEG/CUDA (automatic fallback to software decode)
-- **Zero-copy GPU pipeline** - decoded frames never leave the GPU (CUDA to DX12 to wgpu)
+- **NVIDIA GPU MJPEG decode on Windows** via nvJPEG/CUDA (automatic fallback to software decode)
+- **Zero-copy MJPEG pipeline on supported NVIDIA/Windows systems** - decoded frames stay on the GPU (CUDA to DX12 to wgpu)
 - **Low-latency audio passthrough** via WASAPI (Windows) and ALSA, including PipeWire/PulseAudio compatibility plugins (Linux)
 - **Robust audio resampling & channel conversion** - handles mono, stereo, and variable sample rates (e.g. PS4/PS5/Switch audio over USB capture cards)
 - **Audio mute toggle & UI status** - mute control with real-time audio connection status
@@ -31,9 +31,11 @@ Built for capture cards like the Genki ShadowCast, Elgato, AVerMedia, and other 
 
 ## Quick Start
 
-1. Download the latest release from [Releases](../../releases)
+1. Download the latest release from [Releases](../../releases/latest).
    - **Windows**: Download `TackleCast-Windows-x86_64.zip`, extract anywhere, and double-click `TackleCast.exe`.
    - **Linux**: Download `TackleCast-Linux-x86_64.tar.gz`, extract (`tar -xzvf TackleCast-Linux-x86_64.tar.gz`), and run `./run.sh`.
+2. Press **Escape** and choose your capture card under **Video**. Select a supported resolution and frame rate; leave Pixel Format on Auto or choose a supported format manually.
+3. Close the menu with **Escape** to apply capture changes. Auto then shows the opened format, such as `Auto (NV12)`. Press **F11** for fullscreen.
 
 FFmpeg is bundled on both platforms. Windows packages also include the CUDA/nvJPEG runtime; GPU decoding needs a compatible NVIDIA GPU and driver. Official Linux archives target x86_64 Ubuntu 24.04 or newer and use your desktop's ALSA and Vulkan/OpenGL drivers.
 
@@ -47,7 +49,7 @@ If sound is missing, check the selected input is the capture card rather than yo
 
 ## Building from Source
 
-See [BUILD.md](BUILD.md) for full build instructions.
+See [BUILD.md](BUILD.md) for platform dependencies, environment setup, tests, and packaging. After setting up the dependencies:
 
 ```bash
 cargo build --release
@@ -59,6 +61,21 @@ cargo build --release
 |---|---|
 | Open/close settings | Escape |
 | Fullscreen | F11 |
+
+## Settings
+
+Press **Escape** to open the four-tab menu. Shorter tabs keep the same menu size and position; small windows can scroll.
+
+| Tab | Controls |
+|---|---|
+| Video | Capture device, supported resolution/FPS/format combinations, scaling filter, color space, and color range |
+| Picture | Live brightness, contrast, saturation, and gamma adjustments, plus Reset Picture to Defaults |
+| Audio | Input/output devices, mute, volume, and connection status |
+| Display | Fullscreen, performance overlay, detailed scaling/color information, and Exit |
+
+Picture, scaling, and color adjustments preview immediately. The backdrop clears while editing sliders or their numeric values so you can judge the live picture. Closing the menu saves the settings and applies capture/audio device changes.
+
+The overlay separates the selected **nominal FPS** from **delivered FPS**. For example, a `59.94` nominal mode stays distinct from `60`, even when the short-term delivery counter is close to 60. Auto color labels include `default` when metadata is missing; manual overrides are available when the source's reported color information needs correcting.
 
 ## How It Works
 
@@ -95,14 +112,17 @@ src/
 
 ## Known Limitations
 
-- **GPU decode is NVIDIA-only** (AMD AMF and Intel Quick Sync planned for a future release). Non-NVIDIA GPUs fall back to software decode automatically.
-- **Some capture cards may throttle at high framerates.** Smaller USB passthrough dongles (e.g. Genki ShadowCast 2 Pro) can thermally throttle their internal MJPEG encoder at sustained 1440p@120fps, causing frame delivery to drop to ~60fps. This is a hardware limitation, not a software issue. Devices with better thermal design (e.g. ShadowCast 3) are unaffected.
-- Laptop GPUs may thermal throttle at sustained 4K@60fps or 1440p@120fps (a cooling pad helps).
+- **MJPEG GPU decoding requires Windows and a compatible NVIDIA GPU/runtime.** Linux and other GPUs use software decoding with the same wgpu rendering path.
+- **Reported modes do not guarantee sustained throughput.** The HDMI source, USB connection, capture-card encoder, and PC can limit delivery. Capture cards and laptops may also throttle under sustained load; compare delivered FPS with nominal FPS in the overlay.
+- **Linux physical capture needs broader hardware validation.** Native V4L2 discovery is implemented, and Linux tests, shader checks, and packaged synthetic rendering have passed. The latest ShadowCast hardware checks were performed on Windows.
+- **FSR and HDR tone mapping are not included.** Scaling options are Bilinear, Bicubic, and Lanczos; BT.2020 is a color conversion matrix. Saved `fsr1` selections load as Bilinear while preserving other settings.
 - Webcams may partially work but are not officially supported.
 
 ## Acknowledgments
 
 - **[@NeverForgetful](https://www.youtube.com/@NeverForgetful)** - Testing and QA
+- **[@ajmine03](https://github.com/ajmine03)** - Linux support and audio contributions
+- **[@Vinny-TS](https://github.com/Vinny-TS)** - Capture settings, color controls, and settings UI contributions
 
 ## License
 
