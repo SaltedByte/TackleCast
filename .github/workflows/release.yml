@@ -89,7 +89,7 @@ jobs:
           key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/setup_*_dependencies.*', 'scripts/windows-dependencies.json') }}
       - name: Linux system dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y build-essential nasm libasound2-dev libclang-dev pkg-config xvfb libgl1-mesa-dri mesa-vulkan-drivers
+        run: sudo apt-get update && sudo apt-get install -y build-essential nasm libasound2-dev libclang-dev pkg-config xvfb libxkbcommon-x11-0 libgl1-mesa-dri mesa-vulkan-drivers
       - name: Windows runtime dependencies
         if: runner.os == 'Windows'
         shell: powershell
@@ -111,7 +111,14 @@ jobs:
           mkdir -p dist/extracted-linux
           tar -xzf dist/TackleCast-Linux-x86_64.tar.gz -C dist/extracted-linux
           python3 scripts/verify_package.py --package dist/extracted-linux/TackleCast-Linux-x86_64 --commit '${{ needs.resolve.outputs.commit }}'
-          xvfb-run -a python3 scripts/smoke_test.py --binary dist/extracted-linux/TackleCast-Linux-x86_64/tacklecast
+          if ! xvfb-run -a python3 scripts/smoke_test.py --binary dist/extracted-linux/TackleCast-Linux-x86_64/tacklecast; then
+            # The harness removes its temporary stdout file on exit. Surface a
+            # startup failure directly while preserving the failed check.
+            echo 'Linux smoke test failed; collecting startup diagnostics.'
+            LD_LIBRARY_PATH="$PWD/dist/extracted-linux/TackleCast-Linux-x86_64/lib" \
+              timeout 10s xvfb-run -a dist/extracted-linux/TackleCast-Linux-x86_64/tacklecast --test-nv12 || true
+            exit 1
+          fi
       - name: Archive checksums
         shell: bash
         run: |
