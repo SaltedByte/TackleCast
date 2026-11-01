@@ -17,7 +17,7 @@ claim that every menu control has been physically exercised on every device.
 | Saturation | Updates shader uniform live and on apply. |
 | Gamma | Updates shader uniform live and on apply. |
 | Reset picture | Restores neutral values for the four shader adjustments. |
-| Audio input | Restarts independent audio routing; unchanged by GPU capture. |
+| Audio input | Auto follows only a unique name match for the selected video device; no unrelated capture-card or system-input fallback. Explicit selection remains independent. Missing explicit inputs stay disconnected. |
 | Audio output | Restarts independent audio routing; unchanged by GPU capture. |
 | Volume | Updates the audio pipeline on settings apply without restarting video. |
 | Mute | Updates the audio pipeline on settings apply without restarting video. |

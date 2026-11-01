@@ -47,7 +47,7 @@ Connect the PS4's HDMI output to your capture card and the card to your PC over 
 
 In TackleCast, press Escape and select the capture card's audio input and your speakers/headphones as output. Check that audio is Connected and unmuted. Mono input is duplicated to stereo, and different input/output sample rates are converted. For the widest capture-card compatibility, use stereo PCM; surround conversion assumes the conventional speaker order described in [BUILD.md](BUILD.md).
 
-If sound is missing, check the selected input is the capture card rather than your microphone or desktop's default source, and inspect the input/output formats in `logs/`. Unit tests cover channel conversion and resampling; console-specific behavior still depends on the card and needs hardware validation.
+Audio input **Auto (follow video)** uses a unique name match for the selected video device. Without a unique match, audio stays disconnected; it never substitutes another capture card or your system microphone. Select an explicit input to use audio independently of video. If sound is missing, select the capture card's input and inspect the input/output formats in `logs/`. Unit tests cover routing, channel conversion and resampling; console-specific behavior still depends on the card and needs hardware validation.
 
 ## Building from Source
 

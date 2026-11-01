@@ -472,13 +472,16 @@ fn draw_menu(
                                                 "Input Device",
                                                 &mut draft.audio_input,
                                                 frame.audio_inputs,
+                                                "Auto (follow video)",
                                             );
                                             labeled_audio_combo(
                                                 ui,
                                                 "Output Device",
                                                 &mut draft.audio_output,
                                                 frame.audio_outputs,
+                                                "Default system output",
                                             );
+                                            ui.label("Auto uses matching video-device audio; otherwise audio stays disconnected.");
                                         });
                                         card_section(ui, "PLAYBACK VOLUME", text_scale, |ui| {
                                             ui.checkbox(&mut draft.audio_muted, "Mute audio");
@@ -770,13 +773,14 @@ fn labeled_audio_combo(
     label: &str,
     selected: &mut i32,
     devices: &[AudioDevice],
+    default_label: &str,
 ) {
     ui.label(RichText::new(label).color(COLOR_TEXT_SECONDARY));
     ComboBox::from_id_salt(label)
         .width(ui.available_width())
-        .selected_text(audio_device_name(*selected, devices))
+        .selected_text(audio_device_name(*selected, devices, default_label))
         .show_ui(ui, |ui| {
-            ui.selectable_value(selected, -1, "Default");
+            ui.selectable_value(selected, -1, default_label);
             for device in devices {
                 ui.selectable_value(selected, device.index, device.name.clone());
             }
@@ -902,9 +906,9 @@ fn display_or_default(value: &str) -> String {
     }
 }
 
-fn audio_device_name(index: i32, devices: &[AudioDevice]) -> String {
+fn audio_device_name(index: i32, devices: &[AudioDevice], default_label: &str) -> String {
     if index < 0 {
-        return "Default".to_string();
+        return default_label.to_string();
     }
 
     devices

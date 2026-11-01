@@ -71,7 +71,7 @@ The setup verifies and builds FFmpeg 8.1.3 from source, enabling V4L2 input, MJP
 
 The Linux archive includes all seven FFmpeg shared libraries in `lib/`, with their symlinks, license, source URL, and build configuration. Launch with `./run.sh`; it searches the bundled directory before system libraries. FFmpeg need not be installed on the user's PC. Official archives are built for x86_64 Ubuntu 24.04 or newer. The desktop still supplies glibc, ALSA, its X11/Wayland libraries, and Vulkan/OpenGL graphics drivers. X11 sessions require the `libxkbcommon-x11` runtime (`libxkbcommon-x11-0` on Ubuntu/Debian). Other distributions can build from source.
 
-CPAL 0.15 uses ALSA on Linux. PipeWire and PulseAudio work through their ALSA compatibility plugins, rather than native CPAL backends. If automatic audio selection chooses a default source, explicitly select your capture card's audio input. Ensure the logged-in user has access to `/dev/video*`; synthetic tests do not require a capture device.
+CPAL 0.15 uses ALSA on Linux. PipeWire and PulseAudio work through their ALSA compatibility plugins, rather than native CPAL backends. Audio input Auto follows a unique name match for the selected video device. If no unique match exists, audio stays disconnected until an input is explicitly selected. Auto never substitutes another capture card or the system microphone. Ensure the logged-in user has access to `/dev/video*`; synthetic tests do not require a capture device.
 
 ## Audio conversion
 

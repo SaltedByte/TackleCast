@@ -260,6 +260,9 @@ The display is kept awake while frames are arriving and the window is visible.
 
 Settings are saved to tacklecast_settings.json next to the exe when you exit.
 Deleting that file resets everything to defaults.
+Audio input Auto (follow video) uses only a unique match for the selected video
+device. Without a match, audio stays disconnected. Select an explicit input to
+use audio independently of video. Output Default uses the system output.
 $gpuNote
 
 Scaling filters
