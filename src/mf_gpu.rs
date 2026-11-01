@@ -1,4 +1,4 @@
-//! Opt-in native Media Foundation GPU capture. Pixel data stays GPU-resident.
+//! Native Media Foundation GPU capture. Pixel data stays GPU-resident.
 use crate::{
     capture::{CaptureFrame, CaptureStats},
     color::ColorInfo,
@@ -64,6 +64,33 @@ type Next = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut Output) -> i32;
 type Close = unsafe extern "C" fn(*mut c_void);
 type Metadata = unsafe extern "C" fn(*mut c_void, *mut u32, *mut u32, *mut u32, *mut u32) -> i32;
 
+fn resolve_bridge_path(
+    executable: &std::path::Path,
+    override_path: Option<std::ffi::OsString>,
+) -> Result<std::path::PathBuf, String> {
+    let path = match override_path {
+        Some(path) => std::path::PathBuf::from(path),
+        None => executable
+            .parent()
+            .ok_or("Cannot locate executable directory")?
+            .join("tacklecast_mf_gpu.dll"),
+    };
+    if !path.is_absolute() {
+        return Err("Native bridge DLL path must be absolute".into());
+    }
+    Ok(path)
+}
+
+fn bridge_path() -> Result<std::path::PathBuf, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    resolve_bridge_path(&executable, std::env::var_os("TACKLECAST_MF_GPU_DLL"))
+}
+
+pub fn available() -> bool {
+    std::env::var_os("TACKLECAST_MF_GPU").as_deref() != Some(std::ffi::OsStr::new("0"))
+        && bridge_path().is_ok_and(|path| path.is_file())
+}
+
 pub fn eligible(format: crate::settings::VideoFormat, nv12_advertised: bool) -> bool {
     use crate::settings::VideoFormat;
     match format {
@@ -105,12 +132,9 @@ pub fn run(
     events: winit::event_loop::EventLoopProxy<AppEvent>,
 ) {
     let result = (|| -> Result<(), String> {
-        let path =
-            std::env::var_os("TACKLECAST_MF_GPU_DLL").ok_or("TACKLECAST_MF_GPU_DLL is required")?;
-        if !std::path::Path::new(&path).is_absolute() {
-            return Err("Native bridge DLL path must be absolute".into());
-        }
-        // SAFETY: explicit opt-in to the locally built bridge with this C ABI.
+        let path = bridge_path()?;
+        // SAFETY: load the matching native bridge beside the executable, or an
+        // explicit absolute development override, and validate its ABI below.
         let lib = unsafe { libloading::Library::new(path) }.map_err(|e| e.to_string())?;
         let version: unsafe extern "C" fn() -> u32 = unsafe {
             *lib.get(b"tc_mf_abi_version\0")
@@ -280,6 +304,19 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bridge_lookup_is_relative_to_executable_not_working_directory() {
+        let executable = std::path::Path::new(r"C:\portable\TackleCast.exe");
+        assert_eq!(
+            resolve_bridge_path(executable, None).unwrap(),
+            std::path::PathBuf::from(r"C:\portable\tacklecast_mf_gpu.dll")
+        );
+        assert_eq!(
+            resolve_bridge_path(executable, Some(r"D:\dev\bridge.dll".into())).unwrap(),
+            std::path::PathBuf::from(r"D:\dev\bridge.dll")
+        );
+        assert!(resolve_bridge_path(executable, Some("bridge.dll".into())).is_err());
+    }
     #[test]
     fn backend_selection_respects_explicit_pixel_formats() {
         use crate::settings::VideoFormat;

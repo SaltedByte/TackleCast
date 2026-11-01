@@ -97,12 +97,14 @@ This avoids an application pixel copy, chroma splitting, and row repacking.
 It still uses CPU-backed capture memory and wgpu upload staging; it is not
 end-to-end zero-copy capture or a GPU-surface capture backend.
 
-The experimental opt-in MF GPU backend receives GPU-backed NV12 surfaces and
+The experimental MF GPU backend receives GPU-backed NV12 surfaces and
 uses a bounded GPU-buffer pool. Auto color follows the negotiated native YUV
 matrix and full/limited range when provided; missing metadata remains labeled
 as a default, and manual color controls override it. Explicit non-NV12 format
-selections use the existing capture path. This backend remains a local testing
-option; see `scripts/MF_GPU_SETTINGS_AUDIT.md` for its controls and limitations.
+selections use the existing capture path. When the native bridge DLL is bundled
+beside TackleCast.exe, this backend is selected automatically for eligible modes.
+If it fails, capture retries through DirectShow. No wrapper script is required;
+see `scripts/MF_GPU_SETTINGS_AUDIT.md` for its controls and limitations.
 
 Color Auto follows stream/frame metadata. When metadata is missing, the UI labels the fallback as a default rather than presenting it as detected information. BT.2020 selects a conversion matrix; it does not implement HDR tone mapping.
 

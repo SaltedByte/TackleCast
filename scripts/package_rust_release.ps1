@@ -68,14 +68,9 @@ try {
     }
 
     New-Item -ItemType Directory -Path $outDir | Out-Null
-    New-Item -ItemType Directory -Path (Join-Path $outDir "assets") | Out-Null
-    New-Item -ItemType Directory -Path (Join-Path $outDir "logs") | Out-Null
 
     Copy-Item -LiteralPath $releaseExe -Destination (Join-Path $outDir "TackleCast.exe")
     if ($Gnu) {
-        foreach ($runtime in @('libgcc_s_seh-1.dll', 'libstdc++-6.dll', 'libwinpthread-1.dll')) {
-            Copy-Item -LiteralPath (Join-Path 'C:\msys64\mingw64\bin' $runtime) -Destination $outDir
-        }
         $mingwLicenses = Join-Path $root '.deps\mingw-release-licenses'
         New-Item -ItemType Directory -Force -Path $mingwLicenses | Out-Null
         foreach ($component in @('gcc-libs', 'winpthreads')) {
@@ -93,16 +88,7 @@ try {
             & cl /nologo /std:c++17 /EHsc /W4 /LD /MT src/mf_gpu_native.cpp "/Fo$bridgeObj" /link "/OUT:$bridge" mfplat.lib mf.lib mfreadwrite.lib mfuuid.lib ole32.lib d3d11.lib d3d12.lib dxgi.lib
         }
         if ($LASTEXITCODE -ne 0) { throw "MF GPU bridge build failed ($LASTEXITCODE)" }
-        @'
-@echo off
-setlocal
-set "TACKLECAST_MF_GPU=1"
-set "TACKLECAST_MF_GPU_DLL=%~dp0tacklecast_mf_gpu.dll"
-start "" /D "%~dp0" "%~dp0TackleCast.exe" %*
-'@ | Set-Content -LiteralPath (Join-Path $outDir 'Run-MF-GPU.cmd') -Encoding ascii
-        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'MF_GPU_SETTINGS_AUDIT.md') -Destination $outDir
     }
-    Copy-Item -LiteralPath $iconSrc -Destination (Join-Path $outDir "assets\icon.ico")
     Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $outDir
     $licensesDir = Join-Path $outDir 'licenses'
     New-Item -ItemType Directory -Force -Path $licensesDir | Out-Null
@@ -229,8 +215,8 @@ GPU decode
 ----------
 No CUDA DLLs were bundled. NVIDIA MJPEG decoding requires a compatible nvJPEG /
 CUDA runtime on the target machine; otherwise MJPEG uses software decoding.
-The experimental native MF GPU NV12 path is independent of CUDA and remains
-available through Run-MF-GPU.cmd when included.
+The native MF GPU NV12 path is independent of CUDA and is selected automatically
+when its bridge DLL is included and the capture mode supports native NV12.
 "@
     }
 
@@ -248,10 +234,10 @@ Running it
 2. Press Escape to open settings; pick your capture device, resolution, and FPS.
 3. Press F11 for fullscreen. Escape closes the menu.
 
-Experimental native NV12 GPU capture (when Run-MF-GPU.cmd is included):
-Run Run-MF-GPU.cmd to enable the MF GPU path. Normal TackleCast.exe launch uses
-the existing capture path. The GPU path needs DX12 and native NV12 support at
-the selected mode; it honors explicit MJPEG/other format selections. Check for
+Native NV12 GPU capture (when tacklecast_mf_gpu.dll is included):
+TackleCast.exe automatically uses the GPU path for supported native NV12 modes.
+It locates the bridge beside the EXE and falls back to the existing capture
+path if unavailable. It honors explicit MJPEG/other format selections. Check for
 "NV12 (MF GPU)" in the overlay. It performs GPU copies and CPU coordination;
 this does not establish zero-copy USB transport or improved measured latency.
 

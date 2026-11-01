@@ -227,6 +227,10 @@ struct App {
     renderer: Option<Renderer>,
     ui: Option<UiState>,
     capture: Option<CaptureThread>,
+    #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+    mf_gpu_active: bool,
+    #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+    mf_gpu_failed: bool,
     audio: AudioPassthrough,
     latest_stats: Option<CaptureStats>,
     latest_error: Option<String>,
@@ -266,6 +270,10 @@ impl App {
             renderer: None,
             ui: None,
             capture: None,
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+            mf_gpu_active: false,
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+            mf_gpu_failed: false,
             audio: AudioPassthrough::new(),
             latest_stats: None,
             latest_error: None,
@@ -652,6 +660,16 @@ impl ApplicationHandler<AppEvent> for App {
             }
         }
 
+        #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+        if self.mf_gpu_active && self.latest_error.is_some() {
+            warn!("MF GPU unavailable; retrying this capture mode through DirectShow");
+            self.mf_gpu_failed = true;
+            if let Some(mut capture) = self.capture.take() {
+                capture.stop();
+            }
+            self.start_capture();
+        }
+
         // Periodic render summary (every 30s)
         let render_elapsed = self.last_render_summary.elapsed();
         if render_elapsed >= std::time::Duration::from_secs(30) {
@@ -718,6 +736,10 @@ impl App {
         let mute_changed = old_settings.audio_muted != self.settings.audio_muted;
 
         if video_changed {
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+            {
+                self.mf_gpu_failed = false;
+            }
             if let Some(capture) = &mut self.capture {
                 capture.stop();
             }
@@ -803,6 +825,10 @@ impl App {
     }
 
     fn start_capture(&mut self) {
+        #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+        {
+            self.mf_gpu_active = false;
+        }
         self.latest_stats = None;
         self.latest_error = None;
         let capture_config = get_capture_config(
@@ -838,7 +864,7 @@ impl App {
         }
 
         #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
-        if std::env::var_os("TACKLECAST_MF_GPU").is_some() && {
+        if !self.mf_gpu_failed && crate::mf_gpu::available() && {
             let caps = capabilities::get_device_capabilities(&video_device);
             let formats = capabilities::supported_video_formats(
                 &caps,
@@ -851,6 +877,7 @@ impl App {
             )
         } {
             if let Some(renderer) = &self.renderer {
+                self.mf_gpu_active = true;
                 self.capture = Some(CaptureThread::start_mf_gpu(
                     renderer.capture_device(),
                     crate::devices::video_device_label(&video_device),

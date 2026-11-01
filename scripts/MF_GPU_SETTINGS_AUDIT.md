@@ -74,9 +74,16 @@ Existing native
 capture constraints (non-array, exact-size NV12 surfaces), HDR tone mapping,
 driver loss recovery, and native chroma-siting interpretation remain limitations.
 
-Launch the tested build with `scripts/run_mf_gpu_viewer.ps1 -ColorMetadata`;
+For the older development build, use `scripts/run_mf_gpu_viewer.ps1 -ColorMetadata`;
 add `-Build` to compile both the matching bridge and viewer while it is closed.
 This launcher sets the FFmpeg/MinGW DLL search paths. Launching the bare EXE
 without those paths can show missing `avdevice-62.dll` / `avcodec-62.dll`
 dialogs; the audit relaunch encountered this and was corrected. The final
 viewer was verified at 120 delivered FPS with the original settings restored.
+
+As of 2.2.2, packaged TackleCast.exe locates its native bridge in its own directory
+and automatically attempts eligible NV12 modes. Missing bridges use DirectShow;
+MF GPU errors trigger one DirectShow retry for that configuration. Changing a
+video setting permits a fresh GPU attempt. `TACKLECAST_MF_GPU=0` disables native
+GPU capture for diagnostics; the absolute DLL override remains for developers.
+The package contains no batch launcher, duplicate icon file, or probe documents.

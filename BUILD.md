@@ -44,9 +44,9 @@ To package the experimental native NV12 GPU backend on this GNU setup:
 .\scripts\package_rust_release.ps1 -PackageName TackleCast-Windows-x86_64-MF-GPU -Gnu -MfGpu -Zip
 ```
 
-The archive includes the freshly compiled native bridge, FFmpeg and MinGW
-runtime DLLs, runtime licenses, and `Run-MF-GPU.cmd`. Use that launcher to opt
-in; direct `TackleCast.exe` launch retains the existing capture backend. No
+The archive includes the freshly compiled native bridge, required FFmpeg
+runtime DLLs, and runtime licenses. Launch `TackleCast.exe` directly; it finds
+the bundled bridge and automatically selects eligible GPU capture modes. No
 development PATH is needed. MF GPU applies to native NV12 modes, with GPU
 copies and CPU coordination; this is an experimental release, not a claim of
 zero-copy USB transport or measured latency improvement. MSVC packaging can
