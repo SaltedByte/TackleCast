@@ -141,7 +141,7 @@ jobs:
   publish:
     name: Publish validated release
     needs: [resolve, build]
-    if: github.repository == 'SaltedByte/TackleCast' && (github.event_name == 'push' || inputs.publish)
+    if: github.repository == 'btawa/TackleCast' && (github.event_name == 'push' || inputs.publish)
     runs-on: ubuntu-24.04
     permissions:
       contents: write
