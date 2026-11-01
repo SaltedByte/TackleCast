@@ -2,6 +2,9 @@
 #define NOMINMAX
 #define _WIN32_WINNT 0x0A00
 #define WINVER 0x0A00
+// The Media Foundation and D3D headers pull in d3d10.h and d3d10_1.h in an
+// order that the MSVC SDK otherwise rejects. Only ID3D10Multithread is used.
+#define D3D10_ARBITRARY_HEADER_ORDERING
 #include <windows.h>
 #include <mfapi.h>
 #include <mfidl.h>
