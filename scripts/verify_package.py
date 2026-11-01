@@ -7,11 +7,13 @@ from pathlib import Path
 import subprocess
 
 
-def verify(package, require_gpu=False, commit=None):
+def verify(package, require_gpu=False, commit=None, require_mf_gpu=False):
     package = package.resolve()
     info = json.loads((package / 'build-info.json').read_text(encoding='utf-8-sig'))
     if commit and info['commit'] != commit:
         raise RuntimeError('Packaged source commit does not match the requested release')
+    if require_mf_gpu and not info.get('mf_gpu_bundled'):
+        raise RuntimeError('Package does not include the MF GPU bridge')
     components = ['avcodec', 'avformat', 'avdevice', 'avutil', 'avfilter', 'swresample', 'swscale']
     if os.name == 'nt':
         with os.add_dll_directory(str(package)):
@@ -20,6 +22,14 @@ def verify(package, require_gpu=False, commit=None):
                 if len(libraries) != 1:
                     raise RuntimeError(f'Expected one {component} runtime DLL, found {libraries}')
                 ctypes.WinDLL(str(libraries[0]), winmode=0x1100)
+            if info.get('mf_gpu_bundled'):
+                bridge = ctypes.WinDLL(str(package / 'tacklecast_mf_gpu.dll'), winmode=0x1100)
+                bridge.tc_mf_abi_version.restype = ctypes.c_uint
+                if bridge.tc_mf_abi_version() != 2:
+                    raise RuntimeError('Unsupported packaged MF GPU bridge ABI')
+                for symbol in ('tc_mf_open', 'tc_mf_close', 'tc_mf_metadata',
+                               'tc_mf_allocate', 'tc_mf_next_reuse'):
+                    getattr(bridge, symbol)
             if require_gpu:
                 pairs = [(f'nvjpeg64_{major}.dll', f'cudart64_{major}.dll' if major != 11 else 'cudart64_110.dll') for major in (13, 12, 11)]
                 found = [pair for pair in pairs if all((package / name).is_file() for name in pair)]
@@ -55,6 +65,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--package', type=Path, required=True)
     parser.add_argument('--require-gpu', action='store_true')
+    parser.add_argument('--require-mf-gpu', action='store_true')
     parser.add_argument('--commit')
     args = parser.parse_args()
-    verify(args.package, args.require_gpu, args.commit)
+    verify(args.package, args.require_gpu, args.commit, args.require_mf_gpu)

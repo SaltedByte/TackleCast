@@ -50,8 +50,21 @@ pub fn restore_video_device(saved: &str, devices: &[String]) -> String {
     }
 }
 
-#[allow(dead_code)]
-const IGNORED_KEYWORDS: &[&str] = &["pro", "the", "and"];
+const IGNORED_KEYWORDS: &[&str] = &[
+    "the",
+    "and",
+    "audio",
+    "device",
+    "video",
+    "capture",
+    "usb",
+    "digital",
+    "microphone",
+    "input",
+    "interface",
+    "endpoint",
+    "hdmi",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioDevice {
@@ -194,29 +207,37 @@ pub fn enumerate_audio_outputs() -> Vec<AudioDevice> {
     enumerate_audio_devices(Direction::Output)
 }
 
-#[allow(dead_code)]
 pub fn find_audio_input_for_video(video_device_name: &str, inputs: &[AudioDevice]) -> Option<i32> {
     let keywords = keywords_for_device_name(&video_device_label(video_device_name));
     if keywords.is_empty() {
         return None;
     }
 
-    let mut best_index = None;
-    let mut best_score = 0;
-    for device in inputs {
-        let haystack = device.name.to_ascii_lowercase();
-        let score = keywords
-            .iter()
-            .filter(|keyword| haystack.contains(keyword.as_str()))
-            .count();
-        if score > best_score {
-            best_score = score;
-            best_index = Some(device.index);
-        }
-    }
+    let mut matches = inputs.iter().filter(|device| {
+        let tokens = keywords_for_device_name(&device.name);
+        keywords.iter().all(|keyword| tokens.contains(keyword))
+    });
+    let matched = matches.next()?;
+    // A name match cannot distinguish multiple identical cards/endpoints.
+    matches.next().is_none().then_some(matched.index)
+}
 
-    let threshold = if keywords.len() == 1 { 1 } else { 2 };
-    (best_score >= threshold).then_some(best_index?).or(None)
+pub fn resolve_audio_input_index(
+    input_index: i32,
+    video_device_name: &str,
+    inputs: &[AudioDevice],
+) -> Result<i32, String> {
+    if input_index >= 0 {
+        return inputs.iter().any(|device| device.index == input_index)
+            .then_some(input_index)
+            .ok_or_else(|| format!("selected audio input {input_index} is unavailable; select an input in Audio settings"));
+    }
+    find_audio_input_for_video(video_device_name, inputs).ok_or_else(|| {
+        format!(
+            "no unique audio input matches video '{}'; select an input in Audio settings",
+            video_device_label(video_device_name)
+        )
+    })
 }
 
 fn enumerate_audio_devices(direction: Direction) -> Vec<AudioDevice> {
@@ -261,13 +282,15 @@ fn preferred_audio_host() -> cpal::Host {
     cpal::default_host()
 }
 
-#[allow(dead_code)]
 fn keywords_for_device_name(device_name: &str) -> Vec<String> {
+    // Linux display labels append a device node, which is not an audio name.
     device_name
+        .split(" (/dev/")
+        .next()
+        .unwrap_or(device_name)
         .to_ascii_lowercase()
-        .replace('-', " ")
-        .split_whitespace()
-        .filter(|word| word.len() >= 3 && !IGNORED_KEYWORDS.contains(word))
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty() && !IGNORED_KEYWORDS.contains(word))
         .map(ToString::to_string)
         .collect()
 }
@@ -281,6 +304,55 @@ enum Direction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_audio_follows_video_without_unrelated_or_default_fallback() {
+        let inputs = vec![
+            AudioDevice {
+                index: 4,
+                name: "Elgato 4K X (2- Elgato 4K X)".into(),
+            },
+            AudioDevice {
+                index: 5,
+                name: "Microphone (RODECaster Duo Main Multitrack)".into(),
+            },
+        ];
+        assert_eq!(resolve_audio_input_index(-1, "Elgato 4K X", &inputs), Ok(4));
+        assert!(resolve_audio_input_index(-1, "OBSBOT Tiny 2", &inputs).is_err());
+        assert!(resolve_audio_input_index(-1, "USB Video Capture", &inputs).is_err());
+        assert!(resolve_audio_input_index(-1, "", &inputs).is_err());
+        assert!(resolve_audio_input_index(-1, "Elgato Cam Link", &inputs).is_err());
+        // An explicit independent source is allowed, but a missing selection stays disconnected.
+        assert_eq!(
+            resolve_audio_input_index(4, "OBSBOT Tiny 2", &inputs),
+            Ok(4)
+        );
+        assert!(resolve_audio_input_index(99, "Elgato 4K X", &inputs).is_err());
+    }
+
+    #[test]
+    fn auto_audio_rejects_ambiguous_matches_and_preserves_model_tokens() {
+        let mut inputs = vec![
+            AudioDevice {
+                index: 4,
+                name: "Elgato 4K X".into(),
+            },
+            AudioDevice {
+                index: 6,
+                name: "Elgato 4K S".into(),
+            },
+        ];
+        assert_eq!(find_audio_input_for_video("Elgato 4K X", &inputs), Some(4));
+        assert_eq!(
+            find_audio_input_for_video("Elgato 4K X (/dev/video0)", &inputs),
+            Some(4)
+        );
+        inputs.push(AudioDevice {
+            index: 7,
+            name: "Digital Audio (Elgato 4K X)".into(),
+        });
+        assert_eq!(find_audio_input_for_video("Elgato 4K X", &inputs), None);
+    }
 
     #[test]
     fn auto_detect_matches_keyword_overlap() {

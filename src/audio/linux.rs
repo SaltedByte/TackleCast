@@ -4,28 +4,6 @@ use tracing::{info, warn};
 
 use crate::devices::AudioDevice;
 
-const CAPTURE_KEYWORDS: &[&str] = &[
-    "capture",
-    "hdmi",
-    "usb audio",
-    "shadowcast",
-    "cam link",
-    "camlink",
-    "elgato",
-    "avermedia",
-    "mirabox",
-    "video",
-    "game",
-    "ps4",
-    "playstation",
-    "interface",
-    "endpoint",
-    "pipewire",
-    "alsa",
-];
-
-const IGNORED_KEYWORDS: &[&str] = &["pro", "the", "and", "audio", "device"];
-
 pub fn preferred_audio_host() -> Host {
     cpal::default_host()
 }
@@ -36,49 +14,22 @@ pub fn resolve_input_device(
     video_device_name: &str,
     inputs: &[AudioDevice],
 ) -> Result<Device, String> {
-    if input_index >= 0 {
-        if let Some(device) = resolve_device_by_index(host, input_index, Direction::Input) {
-            let name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
-            info!(
-                "resolved audio input by saved index {}: '{}'",
-                input_index, name
-            );
-            return Ok(device);
-        }
-        warn!(
-            "saved audio input index {} is no longer available; searching for capture device",
-            input_index
-        );
-    }
-
-    if let Some(index) = find_audio_input_for_video(video_device_name, inputs) {
-        if let Some(device) = resolve_device_by_index(host, index, Direction::Input) {
-            let name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
-            info!(
-                "auto-detected capture card audio input {} ('{}') matching video '{}'",
-                index, name, video_device_name
-            );
-            return Ok(device);
-        }
-    }
-
-    for device_info in inputs {
-        let name_lower = device_info.name.to_ascii_lowercase();
-        if CAPTURE_KEYWORDS.iter().any(|&kw| name_lower.contains(kw)) {
-            if let Some(device) = resolve_device_by_index(host, device_info.index, Direction::Input)
-            {
-                info!(
-                    "matched generic capture card audio input {} ('{}')",
-                    device_info.index, device_info.name
-                );
-                return Ok(device);
-            }
-        }
-    }
-
-    warn!("no capture-card audio device auto-detected; falling back to default system input");
-    host.default_input_device()
-        .ok_or_else(|| "no default audio input device found on the system".to_string())
+    let index = crate::devices::resolve_audio_input_index(input_index, video_device_name, inputs)?;
+    let device = resolve_device_by_index(host, index, Direction::Input)
+        .ok_or_else(|| format!("selected audio input {index} is no longer available"))?;
+    let name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
+    info!(
+        "resolved audio input {} ('{}'), selection={}, video='{}'",
+        index,
+        name,
+        if input_index < 0 {
+            "Auto (follow video)"
+        } else {
+            "explicit"
+        },
+        video_device_name
+    );
+    Ok(device)
 }
 
 pub fn resolve_output_device(
@@ -175,42 +126,4 @@ pub fn device_supports_direction(device: &Device, direction: Direction) -> bool 
             .and_then(|mut configs| configs.next())
             .is_some(),
     }
-}
-
-pub fn find_audio_input_for_video(video_device_name: &str, inputs: &[AudioDevice]) -> Option<i32> {
-    let keywords = keywords_for_device_name(video_device_name);
-    if keywords.is_empty() {
-        return None;
-    }
-
-    let mut best_index = None;
-    let mut best_score = 0;
-    for device in inputs {
-        let haystack = device.name.to_ascii_lowercase();
-        let score = keywords
-            .iter()
-            .filter(|keyword| haystack.contains(keyword.as_str()))
-            .count();
-        if score > best_score {
-            best_score = score;
-            best_index = Some(device.index);
-        }
-    }
-
-    let threshold = if keywords.len() == 1 { 1 } else { 2 };
-    if best_score >= threshold {
-        best_index
-    } else {
-        None
-    }
-}
-
-fn keywords_for_device_name(device_name: &str) -> Vec<String> {
-    device_name
-        .to_ascii_lowercase()
-        .replace(['-', '_', '/', '\\', '(', ')'], " ")
-        .split_whitespace()
-        .filter(|word| word.len() >= 3 && !IGNORED_KEYWORDS.contains(word))
-        .map(ToString::to_string)
-        .collect()
 }

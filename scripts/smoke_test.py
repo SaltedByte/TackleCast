@@ -12,6 +12,8 @@ def smoke(binary, seconds):
     binary = binary.resolve()
     package = binary.parent
     env = os.environ.copy()
+    # Verification needs INFO summaries regardless of the caller's log filter.
+    env['RUST_LOG'] = 'tacklecast=info,wgpu=warn,wgpu_hal=warn,naga=warn'
     if os.name == 'nt':
         env['PATH'] = os.path.join(os.environ['SystemRoot'], 'System32')
     else:

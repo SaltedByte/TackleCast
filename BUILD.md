@@ -13,7 +13,7 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --no-default-features
 cargo clippy --locked --all-targets --no-default-features -- -D warnings
-.\scripts\package_rust_release.ps1 -PackageName TackleCast-Windows-x86_64 -RequireGpuDlls -Zip
+.\scripts\package_rust_release.ps1 -PackageName TackleCast-Windows-x86_64 -RequireGpuDlls -MfGpu -Zip
 ```
 
 The setup downloads an exact FFmpeg 8.1.3 LGPL build and NVIDIA redistributables, verifies their SHA256 hashes, and extracts them into `.deps/`. Pins are in `scripts/windows-dependencies.json`. The FFmpeg monthly archive is retained by its publisher for two years; update that pin deliberately when upgrading dependencies. `LIBCLANG_PATH` defaults to `C:\Program Files\LLVM\bin`.
@@ -23,6 +23,35 @@ You can instead set `FFMPEG_DIR` to an existing shared development build with `b
 `GPU_RUNTIME_DIR` can point to already-extracted NVIDIA runtime DLLs. Packaging's `-CudaDllDir` takes priority, followed by `GPU_RUNTIME_DIR` and installed CUDA toolkits. Both nvJPEG and cudart must come from one directory with compatible runtime versions (11, 12, or 13). Packaging does not search old distribution folders. Automated releases use pinned runtime files. `-SkipGpuDlls` produces a software-only runtime bundle. FFmpeg's unused `postproc` library is not required.
 
 GPU decoding requires a compatible NVIDIA GPU and driver. The package includes nvJPEG and cudart, but never the NVIDIA driver DLL `nvcuda.dll`. Machines without compatible hardware automatically use software decoding.
+
+### Windows GNU fallback
+
+If MSVC installation is unavailable, an installed MSYS2 MinGW compiler at
+`C:\msys64\mingw64` can build and test the application with the official GNU
+Rust toolchain. LLVM/libclang and the pinned FFmpeg package are still required.
+This is an alternative local validation path; release CI continues to use MSVC.
+
+```powershell
+rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal --component rustfmt --component clippy
+. .\scripts\windows_gnu_build_environment.ps1
+cargo +stable-x86_64-pc-windows-gnu test --locked
+cargo +stable-x86_64-pc-windows-gnu test --locked gpu_shader_color_and_picture_reference -- --ignored --nocapture
+```
+
+To package the experimental native NV12 GPU backend on this GNU setup:
+
+```powershell
+.\scripts\package_rust_release.ps1 -PackageName TackleCast-Windows-x86_64-MF-GPU -Gnu -MfGpu -Zip
+```
+
+The archive includes the freshly compiled native bridge, required FFmpeg
+runtime DLLs, and runtime licenses. Launch `TackleCast.exe` directly; it finds
+the bundled bridge and automatically selects eligible GPU capture modes. No
+development PATH is needed. MF GPU applies to native NV12 modes, with GPU
+copies and CPU coordination; this is an experimental release, not a claim of
+zero-copy USB transport or measured latency improvement. MSVC packaging also
+uses `-MfGpu` (omit `-Gnu`); `scripts/build_mf_bridge.ps1` enters the Visual
+Studio developer environment when `cl.exe` is not already on PATH.
 
 ## Linux
 
@@ -43,7 +72,7 @@ The setup verifies and builds FFmpeg 8.1.3 from source, enabling V4L2 input, MJP
 
 The Linux archive includes all seven FFmpeg shared libraries in `lib/`, with their symlinks, license, source URL, and build configuration. Launch with `./run.sh`; it searches the bundled directory before system libraries. FFmpeg need not be installed on the user's PC. Official archives are built for x86_64 Ubuntu 24.04 or newer. The desktop still supplies glibc, ALSA, its X11/Wayland libraries, and Vulkan/OpenGL graphics drivers. X11 sessions require the `libxkbcommon-x11` runtime (`libxkbcommon-x11-0` on Ubuntu/Debian). Other distributions can build from source.
 
-CPAL 0.15 uses ALSA on Linux. PipeWire and PulseAudio work through their ALSA compatibility plugins, rather than native CPAL backends. If automatic audio selection chooses a default source, explicitly select your capture card's audio input. Ensure the logged-in user has access to `/dev/video*`; synthetic tests do not require a capture device.
+CPAL 0.15 uses ALSA on Linux. PipeWire and PulseAudio work through their ALSA compatibility plugins, rather than native CPAL backends. Audio input Auto follows a unique name match for the selected video device. If no unique match exists, audio stays disconnected until an input is explicitly selected. Auto never substitutes another capture card or the system microphone. Ensure the logged-in user has access to `/dev/video*`; synthetic tests do not require a capture device.
 
 ## Audio conversion
 
@@ -87,7 +116,7 @@ cargo test --locked gpu_shader_color_and_picture_reference -- --ignored
 
 ## CI and automated releases
 
-PRs and pushes to `main` run formatting, tests, Clippy, and release builds on Windows and Linux, with default and software-only feature configurations. Clippy failures are fatal. Cargo uses the checked-in lockfile; dependency downloads and Rust builds are cached.
+PRs and pushes to `main` run formatting, tests, Clippy, and release builds on Windows and Linux, with default and software-only feature configurations. Default Windows builds also compile the native MF GPU bridge with MSVC, and release packages must include it. Clippy failures are fatal. Cargo uses the checked-in lockfile; dependency downloads and Rust builds are cached.
 
 Create a version tag matching `Cargo.toml` (for example, `v2.2.0`) to release. The workflow resolves that existing tag to an exact commit, validates that commit through the reusable CI workflow, builds packages, extracts and verifies them, runs synthetic renderer tests, and uploads archives plus SHA256 files. Publication occurs only after both platforms pass, and only in `SaltedByte/TackleCast`.
 

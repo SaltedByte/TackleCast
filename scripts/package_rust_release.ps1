@@ -3,7 +3,9 @@ param(
     [switch]$Zip,
     [switch]$SkipGpuDlls,
     [switch]$RequireGpuDlls,
-    [string]$CudaDllDir
+    [string]$CudaDllDir,
+    [switch]$MfGpu,
+    [switch]$Gnu
 )
 
 Set-StrictMode -Version Latest
@@ -26,6 +28,7 @@ function Ensure-Exists {
 
 $root = Resolve-Root
 . (Join-Path $PSScriptRoot 'windows_build_environment.ps1')
+if ($Gnu) { . (Join-Path $PSScriptRoot 'windows_gnu_build_environment.ps1') }
 $distRoot = Join-Path $root "dist"
 $outDir = Join-Path $distRoot $PackageName
 $targetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root 'target' }
@@ -48,7 +51,8 @@ Ensure-Exists -Path $ffmpegBin -Message "FFMPEG_DIR\bin not found: $ffmpegBin"
 Push-Location $root
 try {
     Write-Host "Building current release binary..."
-    cargo build --release --locked
+    if ($Gnu) { cargo +stable-x86_64-pc-windows-gnu build --release --locked }
+    else { cargo build --release --locked }
     if ($LASTEXITCODE -ne 0) { throw "Release build failed ($LASTEXITCODE)" }
 
     Ensure-Exists -Path $releaseExe -Message "Release executable missing: $releaseExe"
@@ -64,14 +68,24 @@ try {
     }
 
     New-Item -ItemType Directory -Path $outDir | Out-Null
-    New-Item -ItemType Directory -Path (Join-Path $outDir "assets") | Out-Null
-    New-Item -ItemType Directory -Path (Join-Path $outDir "logs") | Out-Null
 
     Copy-Item -LiteralPath $releaseExe -Destination (Join-Path $outDir "TackleCast.exe")
-    Copy-Item -LiteralPath $iconSrc -Destination (Join-Path $outDir "assets\icon.ico")
+    if ($Gnu) {
+        $mingwLicenses = Join-Path $root '.deps\mingw-release-licenses'
+        New-Item -ItemType Directory -Force -Path $mingwLicenses | Out-Null
+        foreach ($component in @('gcc-libs', 'winpthreads')) {
+            $componentLicenses = Join-Path 'C:\msys64\mingw64\share\licenses' $component
+            Ensure-Exists -Path $componentLicenses -Message "MinGW runtime licenses missing: $componentLicenses"
+            Copy-Item -LiteralPath $componentLicenses -Destination $mingwLicenses -Recurse -Force
+        }
+    }
+    if ($MfGpu) {
+        & (Join-Path $PSScriptRoot 'build_mf_bridge.ps1') -Output (Join-Path $outDir 'tacklecast_mf_gpu.dll') -Gnu:$Gnu
+    }
     Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $outDir
     $licensesDir = Join-Path $outDir 'licenses'
     New-Item -ItemType Directory -Force -Path $licensesDir | Out-Null
+    if ($Gnu) { Copy-Item -LiteralPath $mingwLicenses -Destination (Join-Path $licensesDir 'MinGW') -Recurse }
     if (Test-Path (Join-Path $ffmpegDir 'LICENSE.txt')) {
         Copy-Item (Join-Path $ffmpegDir 'LICENSE.txt') (Join-Path $licensesDir 'FFmpeg-LICENSE.txt')
     }
@@ -153,7 +167,7 @@ try {
         }
         if (-not $selectedGpuDir) {
             if ($RequireGpuDlls) { throw 'A complete compatible nvJPEG/CUDA runtime pair is required.' }
-            Write-Warning 'No complete compatible nvJPEG/CUDA pair was found; this bundle uses software decoding.'
+            Write-Warning 'No complete compatible nvJPEG/CUDA pair was found; NVIDIA MJPEG decoding will use software. Native MF GPU NV12 is independent of CUDA.'
         } elseif (Test-Path -LiteralPath (Join-Path $selectedGpuDir 'licenses')) {
             Copy-Item (Join-Path $selectedGpuDir 'licenses\*') $licensesDir -Force
         }
@@ -166,6 +180,8 @@ try {
         platform = 'windows-x86_64'
         working_tree_changes = [bool](git -C $root status --porcelain)
         gpu_runtime_bundled = ($gpuDllsCopied.Count -eq 2)
+        mf_gpu_bundled = [bool]$MfGpu
+        toolchain = $(if ($Gnu) { 'windows-gnu' } else { 'windows-msvc' })
     } | ConvertTo-Json | Set-Content (Join-Path $outDir 'build-info.json')
 
     if ($gpuDllsCopied.Count -gt 0) {
@@ -190,8 +206,10 @@ To confirm which path is active, open logs\ and look for:
 
 GPU decode
 ----------
-No CUDA DLLs were bundled, so GPU decode only works if the target machine has
-the CUDA Toolkit installed. Otherwise the app falls back to software decode.
+No CUDA DLLs were bundled. NVIDIA MJPEG decoding requires a compatible nvJPEG /
+CUDA runtime on the target machine; otherwise MJPEG uses software decoding.
+The native MF GPU NV12 path is independent of CUDA and is selected automatically
+when its bridge DLL is included and the capture mode supports native NV12.
 "@
     }
 
@@ -209,11 +227,21 @@ Running it
 2. Press Escape to open settings; pick your capture device, resolution, and FPS.
 3. Press F11 for fullscreen. Escape closes the menu.
 
+Native NV12 GPU capture (when tacklecast_mf_gpu.dll is included):
+TackleCast.exe automatically uses the GPU path for supported native NV12 modes.
+It locates the bridge beside the EXE and falls back to the existing capture
+path if unavailable. It honors explicit MJPEG/other format selections. Check for
+"NV12 (MF GPU)" in the overlay. It performs GPU copies and CPU coordination;
+this does not establish zero-copy USB transport or improved measured latency.
+
 The mouse cursor hides after 3 seconds of stillness while the menu is closed.
 The display is kept awake while frames are arriving and the window is visible.
 
 Settings are saved to tacklecast_settings.json next to the exe when you exit.
 Deleting that file resets everything to defaults.
+Audio input Auto (follow video) uses only a unique match for the selected video
+device. Without a match, audio stays disconnected. Select an explicit input to
+use audio independently of video. Output Default uses the system output.
 $gpuNote
 
 Scaling filters

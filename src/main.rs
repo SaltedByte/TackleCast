@@ -13,6 +13,8 @@ mod gpu_decode;
 #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
 mod gpu_monitor;
 mod logger;
+#[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+mod mf_gpu;
 mod render;
 mod settings;
 mod triple_buffer;
@@ -61,6 +63,14 @@ const CAPTURE_LIVE_TIMEOUT: Duration = Duration::from_secs(2);
 pub enum AppEvent {
     /// The capture thread has published a new frame to the triple buffer.
     FrameReady,
+}
+
+/// Whether a UI repaint request should schedule its own redraw. While video is
+/// arriving with the menu closed, every frame already redraws the window, and
+/// extra presents from mouse movement only make the output rate swing, which
+/// variable-refresh displays can show as flicker.
+fn ui_redraw_needed(menu_open: bool, capture_live: bool) -> bool {
+    menu_open || !capture_live
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -225,6 +235,10 @@ struct App {
     renderer: Option<Renderer>,
     ui: Option<UiState>,
     capture: Option<CaptureThread>,
+    #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+    mf_gpu_active: bool,
+    #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+    mf_gpu_failed: bool,
     audio: AudioPassthrough,
     latest_stats: Option<CaptureStats>,
     latest_error: Option<String>,
@@ -264,6 +278,10 @@ impl App {
             renderer: None,
             ui: None,
             capture: None,
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+            mf_gpu_active: false,
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+            mf_gpu_failed: false,
             audio: AudioPassthrough::new(),
             latest_stats: None,
             latest_error: None,
@@ -552,8 +570,14 @@ impl ApplicationHandler<AppEvent> for App {
                         renderer.set_color_settings(live.color_space, live.color_range);
                         renderer.set_scale_filter(live.scaling_filter);
                     }
-                    self.next_ui_redraw =
-                        Instant::now().checked_add(prepared_ui.output.repaint_after);
+                    let capture_live = self
+                        .last_frame_at
+                        .is_some_and(|at| at.elapsed() < CAPTURE_LIVE_TIMEOUT);
+                    self.next_ui_redraw = if ui_redraw_needed(ui.is_menu_open(), capture_live) {
+                        Instant::now().checked_add(prepared_ui.output.repaint_after)
+                    } else {
+                        None
+                    };
                     if let Err(error) = renderer.render(Some(prepared_ui)) {
                         error!("render error: {error}");
                     }
@@ -650,6 +674,16 @@ impl ApplicationHandler<AppEvent> for App {
             }
         }
 
+        #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+        if self.mf_gpu_active && self.latest_error.is_some() {
+            warn!("MF GPU unavailable; retrying this capture mode through DirectShow");
+            self.mf_gpu_failed = true;
+            if let Some(mut capture) = self.capture.take() {
+                capture.stop();
+            }
+            self.start_capture();
+        }
+
         // Periodic render summary (every 30s)
         let render_elapsed = self.last_render_summary.elapsed();
         if render_elapsed >= std::time::Duration::from_secs(30) {
@@ -710,19 +744,16 @@ impl App {
             error!("failed to save settings: {error}");
         }
 
-        let video_changed = old_settings.video_device != self.settings.video_device
-            || old_settings.video_format != self.settings.video_format
-            || old_settings.resolution != self.settings.resolution
-            || old_settings.fps_mode != self.settings.fps_mode
-            || old_settings.custom_fps != self.settings.custom_fps;
-
-        let audio_device_changed = old_settings.video_device != self.settings.video_device
-            || old_settings.audio_input != self.settings.audio_input
-            || old_settings.audio_output != self.settings.audio_output;
+        let video_changed = old_settings.video_capture_changed(&self.settings);
+        let audio_device_changed = old_settings.audio_routing_changed(&self.settings);
 
         let mute_changed = old_settings.audio_muted != self.settings.audio_muted;
 
         if video_changed {
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+            {
+                self.mf_gpu_failed = false;
+            }
             if let Some(capture) = &mut self.capture {
                 capture.stop();
             }
@@ -808,6 +839,10 @@ impl App {
     }
 
     fn start_capture(&mut self) {
+        #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+        {
+            self.mf_gpu_active = false;
+        }
         self.latest_stats = None;
         self.latest_error = None;
         let capture_config = get_capture_config(
@@ -840,6 +875,33 @@ impl App {
                 "No video device discovered, using test pattern fallback",
             );
             return;
+        }
+
+        #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+        if !self.mf_gpu_failed && crate::mf_gpu::available() && {
+            let caps = capabilities::get_device_capabilities(&video_device);
+            let formats = capabilities::supported_video_formats(
+                &caps,
+                &self.settings.resolution,
+                capture_config.fps,
+            );
+            crate::mf_gpu::eligible(
+                self.settings.video_format,
+                formats.contains(&settings::VideoFormat::Nv12),
+            )
+        } {
+            if let Some(renderer) = &self.renderer {
+                self.mf_gpu_active = true;
+                self.capture = Some(CaptureThread::start_mf_gpu(
+                    renderer.capture_device(),
+                    crate::devices::video_device_label(&video_device),
+                    capture_config.width,
+                    capture_config.height,
+                    capture_config.fps,
+                    self.event_proxy.clone(),
+                ));
+                return;
+            }
         }
 
         // Try to initialize shared DX12 buffers for zero-copy GPU decode
@@ -930,5 +992,18 @@ impl App {
             self.settings.volume,
             self.settings.audio_muted,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ui_redraw_needed;
+
+    #[test]
+    fn ui_redraws_follow_video_only_while_menu_is_closed_and_capture_is_live() {
+        assert!(!ui_redraw_needed(false, true));
+        assert!(ui_redraw_needed(true, true));
+        assert!(ui_redraw_needed(false, false));
+        assert!(ui_redraw_needed(true, false));
     }
 }

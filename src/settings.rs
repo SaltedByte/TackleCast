@@ -249,6 +249,20 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub fn video_capture_changed(&self, other: &Self) -> bool {
+        self.video_device != other.video_device
+            || self.video_format != other.video_format
+            || self.resolution != other.resolution
+            || self.fps_mode != other.fps_mode
+            || self.custom_fps != other.custom_fps
+    }
+
+    pub fn audio_routing_changed(&self, other: &Self) -> bool {
+        self.video_device != other.video_device
+            || self.audio_input != other.audio_input
+            || self.audio_output != other.audio_output
+    }
+
     pub fn load() -> Self {
         let path = settings_path();
         let Ok(raw) = fs::read_to_string(path) else {
@@ -400,6 +414,66 @@ fn default_gamma() -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_saved_control_has_the_expected_restart_scope() {
+        let baseline = Settings::default();
+        let original = serde_json::to_value(&baseline).unwrap();
+        let cases = [
+            (
+                "video_device",
+                serde_json::json!("different-device"),
+                true,
+                true,
+            ),
+            ("video_format", serde_json::json!("mjpeg"), true, false),
+            (
+                "resolution",
+                serde_json::json!("regression-mode"),
+                true,
+                false,
+            ),
+            ("fps_mode", serde_json::json!("119"), true, false),
+            ("custom_fps", serde_json::json!(61), true, false),
+            ("audio_input", serde_json::json!(2), false, true),
+            ("audio_output", serde_json::json!(2), false, true),
+            ("volume", serde_json::json!(0.42), false, false),
+            ("audio_muted", serde_json::json!(true), false, false),
+            ("show_overlay", serde_json::json!(false), false, false),
+            ("detailed_overlay", serde_json::json!(true), false, false),
+            ("brightness", serde_json::json!(0.1), false, false),
+            ("contrast", serde_json::json!(1.2), false, false),
+            ("saturation", serde_json::json!(0.2), false, false),
+            ("gamma", serde_json::json!(1.5), false, false),
+            (
+                "color_space",
+                serde_json::to_value(ColorSpace::Bt601).unwrap(),
+                false,
+                false,
+            ),
+            (
+                "color_range",
+                serde_json::to_value(ColorRange::Full).unwrap(),
+                false,
+                false,
+            ),
+            (
+                "scaling_filter",
+                serde_json::to_value(ScaleFilter::Bicubic).unwrap(),
+                false,
+                false,
+            ),
+        ];
+        assert_eq!(cases.len(), original.as_object().unwrap().len());
+        for (key, value, video, audio) in cases {
+            assert_ne!(original[key], value, "{key} must actually change");
+            let mut changed = original.clone();
+            changed[key] = value;
+            let changed: Settings = serde_json::from_value(changed).unwrap();
+            assert_eq!(baseline.video_capture_changed(&changed), video, "{key}");
+            assert_eq!(baseline.audio_routing_changed(&changed), audio, "{key}");
+        }
+    }
+
     use super::*;
 
     #[test]
