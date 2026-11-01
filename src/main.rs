@@ -65,6 +65,14 @@ pub enum AppEvent {
     FrameReady,
 }
 
+/// Whether a UI repaint request should schedule its own redraw. While video is
+/// arriving with the menu closed, every frame already redraws the window, and
+/// extra presents from mouse movement only make the output rate swing, which
+/// variable-refresh displays can show as flicker.
+fn ui_redraw_needed(menu_open: bool, capture_live: bool) -> bool {
+    menu_open || !capture_live
+}
+
 #[derive(Clone, Copy, Debug)]
 enum TestPatternMode {
     Alternate,
@@ -562,8 +570,14 @@ impl ApplicationHandler<AppEvent> for App {
                         renderer.set_color_settings(live.color_space, live.color_range);
                         renderer.set_scale_filter(live.scaling_filter);
                     }
-                    self.next_ui_redraw =
-                        Instant::now().checked_add(prepared_ui.output.repaint_after);
+                    let capture_live = self
+                        .last_frame_at
+                        .is_some_and(|at| at.elapsed() < CAPTURE_LIVE_TIMEOUT);
+                    self.next_ui_redraw = if ui_redraw_needed(ui.is_menu_open(), capture_live) {
+                        Instant::now().checked_add(prepared_ui.output.repaint_after)
+                    } else {
+                        None
+                    };
                     if let Err(error) = renderer.render(Some(prepared_ui)) {
                         error!("render error: {error}");
                     }
@@ -978,5 +992,18 @@ impl App {
             self.settings.volume,
             self.settings.audio_muted,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ui_redraw_needed;
+
+    #[test]
+    fn ui_redraws_follow_video_only_while_menu_is_closed_and_capture_is_live() {
+        assert!(!ui_redraw_needed(false, true));
+        assert!(ui_redraw_needed(true, true));
+        assert!(ui_redraw_needed(false, false));
+        assert!(ui_redraw_needed(true, false));
     }
 }
