@@ -91,6 +91,19 @@ TackleCast has a three-tier decode pipeline that automatically selects the best 
 
 Auto selects a format from the card's supported modes at the requested resolution and frame rate. It tries NV12 first, then MJPEG, then other supported formats. Manual format selections are strict; capture does not silently reduce resolution or frame rate. The menu shows the actual format after negotiation. The overlay distinguishes the nominal mode from measured frame delivery.
 
+Native NV12 capture retains the FFmpeg frame allocation through the latest-frame
+buffer and stages Y and interleaved UV directly from their original row strides.
+This avoids an application pixel copy, chroma splitting, and row repacking.
+It still uses CPU-backed capture memory and wgpu upload staging; it is not
+end-to-end zero-copy capture or a GPU-surface capture backend.
+
+The experimental opt-in MF GPU backend receives GPU-backed NV12 surfaces and
+uses a bounded GPU-buffer pool. Auto color follows the negotiated native YUV
+matrix and full/limited range when provided; missing metadata remains labeled
+as a default, and manual color controls override it. Explicit non-NV12 format
+selections use the existing capture path. This backend remains a local testing
+option; see `scripts/MF_GPU_SETTINGS_AUDIT.md` for its controls and limitations.
+
 Color Auto follows stream/frame metadata. When metadata is missing, the UI labels the fallback as a default rather than presenting it as detected information. BT.2020 selects a conversion matrix; it does not implement HDR tone mapping.
 
 ## Architecture

@@ -218,7 +218,7 @@ pub fn convert_channels(
         }
         // Stereo to mono: average left and right
         (2, 1) => {
-            for chunk in input.chunks_exact(2).take(frame_count) {
+            for chunk in input.as_chunks::<2>().0.iter().take(frame_count) {
                 output.push(0.5 * (chunk[0] + chunk[1]));
             }
         }

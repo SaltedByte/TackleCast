@@ -48,8 +48,6 @@ pub struct Renderer {
     egui_renderer: EguiRenderer,
     // Reusable scratch buffers to avoid per-frame allocations
     pad_scratch: Vec<u8>,
-    nv12_u_scratch: Vec<u8>,
-    nv12_v_scratch: Vec<u8>,
     // Shared DX12 buffers for zero-copy GPU decode (None = not available)
     #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
     shared_gpu_buffers: Option<crate::dx12_interop::SharedGpuBuffers>,
@@ -270,8 +268,6 @@ impl Renderer {
             video_frame: None,
             egui_renderer,
             pad_scratch: Vec::new(),
-            nv12_u_scratch: Vec::new(),
-            nv12_v_scratch: Vec::new(),
             #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
             shared_gpu_buffers: None,
         })
@@ -326,6 +322,11 @@ impl Renderer {
     pub fn upload_frame(&mut self, frame: &CaptureFrame) {
         self.source_color = frame.color_info();
         match frame {
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+            CaptureFrame::MfGpu(frame) => self.upload_mf_gpu(frame),
+            CaptureFrame::Nv12Frame { frame, .. } => {
+                self.upload_retained_nv12(frame);
+            }
             CaptureFrame::Cpu {
                 width,
                 height,
@@ -343,6 +344,110 @@ impl Renderer {
                 ..
             } => self.upload_gpu_frame(*width, *height, *buffer_index),
         }
+    }
+
+    #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+    pub fn capture_device(&self) -> wgpu::Device {
+        self.device.clone()
+    }
+
+    #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+    fn upload_mf_gpu(&mut self, frame: &Arc<crate::mf_gpu::GpuFrame>) {
+        let (width, height) = (frame.width, frame.height);
+        if self
+            .video_frame
+            .as_ref()
+            .is_none_or(|r| r.width != width || r.height != height || r.format != PixelFormat::Nv12)
+        {
+            self.video_frame = Some(VideoFrameResources::new(
+                &self.device,
+                &self.video_bind_group_layout,
+                &self.video_samplers,
+                &self.uniforms,
+                width,
+                height,
+                PixelFormat::Nv12,
+            ));
+        }
+        let resources = self.video_frame.as_ref().unwrap();
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("mf-gpu-nv12-upload"),
+            });
+        for (texture, w, h, offset, pitch) in [
+            (&resources.y_texture, width, height, 0, frame.y_pitch),
+            (
+                &resources.u_texture,
+                width / 2,
+                height / 2,
+                frame.uv_offset,
+                frame.uv_pitch,
+            ),
+        ] {
+            encoder.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &frame.buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset,
+                        bytes_per_row: Some(pitch),
+                        rows_per_image: Some(h),
+                    },
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        self.queue.submit([encoder.finish()]);
+        let keep_alive = frame.clone();
+        self.queue.on_submitted_work_done(move || drop(keep_alive));
+    }
+
+    fn upload_retained_nv12(&mut self, frame: &ffmpeg_next::util::frame::video::Video) {
+        let (width, height) = (frame.width(), frame.height());
+        if self.video_frame.as_ref().is_none_or(|resources| {
+            resources.width != width
+                || resources.height != height
+                || resources.format != PixelFormat::Nv12
+        }) {
+            self.video_frame = Some(VideoFrameResources::new(
+                &self.device,
+                &self.video_bind_group_layout,
+                &self.video_samplers,
+                &self.uniforms,
+                width,
+                height,
+                PixelFormat::Nv12,
+            ));
+        }
+        let resources = self.video_frame.as_ref().unwrap();
+        // write_texture stages its source before returning. Respect FFmpeg's
+        // actual pitch; Queue uploads do not require 256-byte row alignment.
+        upload_strided_plane(
+            &self.queue,
+            &resources.y_texture,
+            width,
+            height,
+            frame.data(0),
+            frame.stride(0) as u32,
+        );
+        upload_strided_plane(
+            &self.queue,
+            &resources.u_texture,
+            width / 2,
+            height / 2,
+            frame.data(1),
+            frame.stride(1) as u32,
+        );
     }
 
     fn upload_cpu_frame(
@@ -391,27 +496,14 @@ impl Renderer {
 
         match format {
             PixelFormat::Nv12 => {
-                let (u_plane, v_plane) = deinterleave_nv12_into(
-                    width,
-                    height,
-                    u_data,
-                    &mut self.nv12_u_scratch,
-                    &mut self.nv12_v_scratch,
-                );
-                upload_plane_r8(
+                // NV12 already contains interleaved UV pairs. Upload them
+                // directly to RG8 instead of splitting every frame on the CPU.
+                upload_plane_rg8(
                     &self.queue,
                     &video_frame.u_texture,
                     width / 2,
                     height / 2,
-                    u_plane,
-                    &mut self.pad_scratch,
-                );
-                upload_plane_r8(
-                    &self.queue,
-                    &video_frame.v_texture,
-                    width / 2,
-                    height / 2,
-                    v_plane,
+                    u_data,
                     &mut self.pad_scratch,
                 );
             }
@@ -814,8 +906,23 @@ impl VideoFrameResources {
             PixelFormat::Nv12 => (width / 2, height / 2),
             PixelFormat::Yuvj422p => (width / 2, height),
         };
-        let u_texture = create_plane_texture(device, chroma_width, chroma_height, "u");
-        let v_texture = create_plane_texture(device, chroma_width, chroma_height, "v");
+        let u_texture = create_plane_texture_with_format(
+            device,
+            chroma_width,
+            chroma_height,
+            "u",
+            if format == PixelFormat::Nv12 {
+                wgpu::TextureFormat::Rg8Unorm
+            } else {
+                wgpu::TextureFormat::R8Unorm
+            },
+        );
+        // Keep a valid binding for the planar path; NV12 samples V from UV.g.
+        let v_texture = if format == PixelFormat::Nv12 {
+            create_plane_texture(device, 1, 1, "v-unused")
+        } else {
+            create_plane_texture(device, chroma_width, chroma_height, "v")
+        };
 
         let y_view = y_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let u_view = u_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -889,6 +996,16 @@ fn create_plane_texture(
     height: u32,
     label: &str,
 ) -> wgpu::Texture {
+    create_plane_texture_with_format(device, width, height, label, wgpu::TextureFormat::R8Unorm)
+}
+
+fn create_plane_texture_with_format(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    label: &str,
+    format: wgpu::TextureFormat,
+) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some(&format!("tacklecast-{label}-plane")),
         size: wgpu::Extent3d {
@@ -899,10 +1016,39 @@ fn create_plane_texture(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::R8Unorm,
+        format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     })
+}
+
+fn upload_strided_plane(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+    data: &[u8],
+    pitch: u32,
+) {
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(pitch),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 fn upload_plane_r8(
@@ -926,6 +1072,37 @@ fn upload_plane_r8(
         wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(bytes_per_row),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
+// Two bytes per chroma texel, with the same row-alignment handling as luma.
+fn upload_plane_rg8(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+    data: &[u8],
+    scratch: &mut Vec<u8>,
+) {
+    let (data, pitch) = pad_rows_into(data, width as usize * 2, height as usize, scratch);
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(pitch),
             rows_per_image: Some(height),
         },
         wgpu::Extent3d {
@@ -968,44 +1145,9 @@ fn pad_rows_into<'a>(
     (scratch, padded_row_bytes as u32)
 }
 
-fn deinterleave_nv12_into<'a>(
-    width: u32,
-    height: u32,
-    data: &[u8],
-    u_scratch: &'a mut Vec<u8>,
-    v_scratch: &'a mut Vec<u8>,
-) -> (&'a [u8], &'a [u8]) {
-    let chroma_width = (width / 2) as usize;
-    let chroma_height = (height / 2) as usize;
-    let needed = chroma_width * chroma_height;
-    u_scratch.resize(needed, 0);
-    v_scratch.resize(needed, 0);
-
-    for y in 0..chroma_height {
-        for x in 0..chroma_width {
-            let src_index = (y * chroma_width + x) * 2;
-            let dst_index = y * chroma_width + x;
-            u_scratch[dst_index] = data[src_index];
-            v_scratch[dst_index] = data[src_index + 1];
-        }
-    }
-
-    (&u_scratch[..needed], &v_scratch[..needed])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn nv12_deinterleave_splits_uv_pairs() {
-        let mut u_scratch = Vec::new();
-        let mut v_scratch = Vec::new();
-        let (u_plane, v_plane) =
-            deinterleave_nv12_into(4, 2, &[10, 20, 30, 40], &mut u_scratch, &mut v_scratch);
-        assert_eq!(u_plane, &[10, 30]);
-        assert_eq!(v_plane, &[20, 40]);
-    }
 
     #[test]
     fn viewport_letterboxes_wider_surface() {
@@ -1156,7 +1298,7 @@ fn lanczos_weight(x: f32, a: f32) -> f32 {
 // ---------------------------------------------------------------------------
 
 // Bicubic: 4x4 taps, Catmull-Rom.
-fn sample_bicubic(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
+fn sample_bicubic(tex: texture_2d<f32>, uv: vec2<f32>) -> vec2<f32> {
     let dims = vec2<f32>(textureDimensions(tex));
     let texel = uv * dims - 0.5;
     let base = floor(texel);
@@ -1174,12 +1316,12 @@ fn sample_bicubic(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
         wy_sum = wy_sum + wy[k];
     }
 
-    var sum = 0.0;
+    var sum = vec2<f32>(0.0);
     for (var j = 0; j < 4; j = j + 1) {
-        var row = 0.0;
+        var row = vec2<f32>(0.0);
         for (var i = 0; i < 4; i = i + 1) {
             let pos = (base + vec2<f32>(f32(i - 1), f32(j - 1)) + 0.5) / dims;
-            row = row + textureSample(tex, nearest_sampler, pos).r * wx[i];
+            row = row + textureSample(tex, nearest_sampler, pos).rg * wx[i];
         }
         sum = sum + row * wy[j];
     }
@@ -1187,7 +1329,7 @@ fn sample_bicubic(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
 }
 
 // Lanczos, 2-lobe: 4x4 taps, for moderate upscale ratios.
-fn sample_lanczos2(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
+fn sample_lanczos2(tex: texture_2d<f32>, uv: vec2<f32>) -> vec2<f32> {
     let a = 2.0;
     let dims = vec2<f32>(textureDimensions(tex));
     let texel = uv * dims - 0.5;
@@ -1206,12 +1348,12 @@ fn sample_lanczos2(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
         wy_sum = wy_sum + wy[k];
     }
 
-    var sum = 0.0;
+    var sum = vec2<f32>(0.0);
     for (var j = 0; j < 4; j = j + 1) {
-        var row = 0.0;
+        var row = vec2<f32>(0.0);
         for (var i = 0; i < 4; i = i + 1) {
             let pos = (base + vec2<f32>(f32(i - 1), f32(j - 1)) + 0.5) / dims;
-            row = row + textureSample(tex, nearest_sampler, pos).r * wx[i];
+            row = row + textureSample(tex, nearest_sampler, pos).rg * wx[i];
         }
         sum = sum + row * wy[j];
     }
@@ -1220,7 +1362,7 @@ fn sample_lanczos2(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
 
 // Lanczos, 3-lobe: 6x6 taps, for large upscale ratios (>2x). The wider kernel
 // avoids the aliasing/ringing the 2-lobe version shows at high magnification.
-fn sample_lanczos3(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
+fn sample_lanczos3(tex: texture_2d<f32>, uv: vec2<f32>) -> vec2<f32> {
     let a = 3.0;
     let dims = vec2<f32>(textureDimensions(tex));
     let texel = uv * dims - 0.5;
@@ -1239,12 +1381,12 @@ fn sample_lanczos3(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
         wy_sum = wy_sum + wy[k];
     }
 
-    var sum = 0.0;
+    var sum = vec2<f32>(0.0);
     for (var j = 0; j < 6; j = j + 1) {
-        var row = 0.0;
+        var row = vec2<f32>(0.0);
         for (var i = 0; i < 6; i = i + 1) {
             let pos = (base + vec2<f32>(f32(i - 2), f32(j - 2)) + 0.5) / dims;
-            row = row + textureSample(tex, nearest_sampler, pos).r * wx[i];
+            row = row + textureSample(tex, nearest_sampler, pos).rg * wx[i];
         }
         sum = sum + row * wy[j];
     }
@@ -1268,14 +1410,14 @@ fn sample_lanczos3(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
 // the bypass rarely applies to chroma.
 // ---------------------------------------------------------------------------
 
-fn sample_plane(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
+fn sample_plane(tex: texture_2d<f32>, uv: vec2<f32>) -> vec2<f32> {
     let src_dims = vec2<f32>(textureDimensions(tex));
     let scale = uniforms.viewport_size / max(src_dims, vec2<f32>(1.0));
     let max_scale = max(scale.x, scale.y);
 
     if max_scale <= 1.0 || uniforms.filter_mode == 0u {
         // Bilinear: hardware-accelerated, or forced when downscaling
-        return textureSample(tex, tex_sampler, uv).r;
+        return textureSample(tex, tex_sampler, uv).rg;
     }
 
     if uniforms.filter_mode == 1u {
@@ -1294,9 +1436,13 @@ fn sample_plane(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
 // ---------------------------------------------------------------------------
 
 fn decode_yuv_to_rgb(uv: vec2<f32>) -> vec3<f32> {
-    let y_raw = sample_plane(y_tex, uv);
-    let u_raw = sample_plane(u_tex, uv);
-    let v_raw = sample_plane(v_tex, uv);
+    let y_raw = sample_plane(y_tex, uv).r;
+    let chroma = sample_plane(u_tex, uv);
+    let u_raw = chroma.r;
+    var v_raw = chroma.g;
+    if uniforms.format_mode != 0u {
+        v_raw = sample_plane(v_tex, uv).r;
+    }
 
     var y: f32;
     var cb: f32;

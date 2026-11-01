@@ -295,7 +295,7 @@ fn draw_menu(
         .show(ctx, |ui| {
             Frame::new()
                 .fill(menu_background())
-                .stroke(Stroke::new(1.0, COLOR_MENU_BORDER))
+                .stroke(Stroke::new(1.0_f32, COLOR_MENU_BORDER))
                 .corner_radius(CornerRadius::same(12))
                 .inner_margin(Margin::same(18))
                 .show(ui, |ui| {

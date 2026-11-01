@@ -24,6 +24,34 @@ You can instead set `FFMPEG_DIR` to an existing shared development build with `b
 
 GPU decoding requires a compatible NVIDIA GPU and driver. The package includes nvJPEG and cudart, but never the NVIDIA driver DLL `nvcuda.dll`. Machines without compatible hardware automatically use software decoding.
 
+### Windows GNU fallback
+
+If MSVC installation is unavailable, an installed MSYS2 MinGW compiler at
+`C:\msys64\mingw64` can build and test the application with the official GNU
+Rust toolchain. LLVM/libclang and the pinned FFmpeg package are still required.
+This is an alternative local validation path; release CI continues to use MSVC.
+
+```powershell
+rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal --component rustfmt --component clippy
+. .\scripts\windows_gnu_build_environment.ps1
+cargo +stable-x86_64-pc-windows-gnu test --locked
+cargo +stable-x86_64-pc-windows-gnu test --locked gpu_shader_color_and_picture_reference -- --ignored --nocapture
+```
+
+To package the experimental native NV12 GPU backend on this GNU setup:
+
+```powershell
+.\scripts\package_rust_release.ps1 -PackageName TackleCast-Windows-x86_64-MF-GPU -Gnu -MfGpu -Zip
+```
+
+The archive includes the freshly compiled native bridge, FFmpeg and MinGW
+runtime DLLs, runtime licenses, and `Run-MF-GPU.cmd`. Use that launcher to opt
+in; direct `TackleCast.exe` launch retains the existing capture backend. No
+development PATH is needed. MF GPU applies to native NV12 modes, with GPU
+copies and CPU coordination; this is an experimental release, not a claim of
+zero-copy USB transport or measured latency improvement. MSVC packaging can
+also use `-MfGpu` from a Visual Studio developer shell (omit `-Gnu`).
+
 ## Linux
 
 On Ubuntu/Debian, install the build tools and audio headers:

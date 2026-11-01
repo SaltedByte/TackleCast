@@ -13,6 +13,8 @@ mod gpu_decode;
 #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
 mod gpu_monitor;
 mod logger;
+#[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+mod mf_gpu;
 mod render;
 mod settings;
 mod triple_buffer;
@@ -710,15 +712,8 @@ impl App {
             error!("failed to save settings: {error}");
         }
 
-        let video_changed = old_settings.video_device != self.settings.video_device
-            || old_settings.video_format != self.settings.video_format
-            || old_settings.resolution != self.settings.resolution
-            || old_settings.fps_mode != self.settings.fps_mode
-            || old_settings.custom_fps != self.settings.custom_fps;
-
-        let audio_device_changed = old_settings.video_device != self.settings.video_device
-            || old_settings.audio_input != self.settings.audio_input
-            || old_settings.audio_output != self.settings.audio_output;
+        let video_changed = old_settings.video_capture_changed(&self.settings);
+        let audio_device_changed = old_settings.audio_routing_changed(&self.settings);
 
         let mute_changed = old_settings.audio_muted != self.settings.audio_muted;
 
@@ -840,6 +835,32 @@ impl App {
                 "No video device discovered, using test pattern fallback",
             );
             return;
+        }
+
+        #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+        if std::env::var_os("TACKLECAST_MF_GPU").is_some() && {
+            let caps = capabilities::get_device_capabilities(&video_device);
+            let formats = capabilities::supported_video_formats(
+                &caps,
+                &self.settings.resolution,
+                capture_config.fps,
+            );
+            crate::mf_gpu::eligible(
+                self.settings.video_format,
+                formats.contains(&settings::VideoFormat::Nv12),
+            )
+        } {
+            if let Some(renderer) = &self.renderer {
+                self.capture = Some(CaptureThread::start_mf_gpu(
+                    renderer.capture_device(),
+                    crate::devices::video_device_label(&video_device),
+                    capture_config.width,
+                    capture_config.height,
+                    capture_config.fps,
+                    self.event_proxy.clone(),
+                ));
+                return;
+            }
         }
 
         // Try to initialize shared DX12 buffers for zero-copy GPU decode

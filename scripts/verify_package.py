@@ -20,6 +20,16 @@ def verify(package, require_gpu=False, commit=None):
                 if len(libraries) != 1:
                     raise RuntimeError(f'Expected one {component} runtime DLL, found {libraries}')
                 ctypes.WinDLL(str(libraries[0]), winmode=0x1100)
+            if info.get('mf_gpu_bundled'):
+                bridge = ctypes.WinDLL(str(package / 'tacklecast_mf_gpu.dll'), winmode=0x1100)
+                bridge.tc_mf_abi_version.restype = ctypes.c_uint
+                if bridge.tc_mf_abi_version() != 2:
+                    raise RuntimeError('Unsupported packaged MF GPU bridge ABI')
+                for symbol in ('tc_mf_open', 'tc_mf_close', 'tc_mf_metadata',
+                               'tc_mf_allocate', 'tc_mf_next_reuse'):
+                    getattr(bridge, symbol)
+                if not (package / 'Run-MF-GPU.cmd').is_file():
+                    raise RuntimeError('MF GPU opt-in launcher is missing')
             if require_gpu:
                 pairs = [(f'nvjpeg64_{major}.dll', f'cudart64_{major}.dll' if major != 11 else 'cudart64_110.dll') for major in (13, 12, 11)]
                 found = [pair for pair in pairs if all((package / name).is_file() for name in pair)]

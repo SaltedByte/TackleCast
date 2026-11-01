@@ -34,8 +34,16 @@ pub enum PixelFormat {
     Yuvj422p,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum CaptureFrame {
+    #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+    MfGpu(Arc<crate::mf_gpu::GpuFrame>),
+    /// Own the FFmpeg NV12 allocation until the renderer has staged its upload.
+    /// Arc clones retain ownership without copying pixel data.
+    Nv12Frame {
+        frame: Arc<Video>,
+        color_info: ColorInfo,
+    },
     /// Frame data lives in CPU memory (software decode or GPU decode fallback).
     Cpu {
         width: u32,
@@ -58,9 +66,22 @@ pub enum CaptureFrame {
     },
 }
 
+impl std::fmt::Debug for CaptureFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CaptureFrame")
+            .field("width", &self.width())
+            .field("height", &self.height())
+            .field("format", &self.format())
+            .finish_non_exhaustive()
+    }
+}
+
 impl CaptureFrame {
     pub fn color_info(&self) -> ColorInfo {
         match self {
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+            Self::MfGpu(frame) => frame.color_info,
+            Self::Nv12Frame { color_info, .. } => *color_info,
             Self::Cpu { color_info, .. } => *color_info,
             #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
             Self::Gpu { color_info, .. } => *color_info,
@@ -68,6 +89,13 @@ impl CaptureFrame {
     }
     pub fn set_color_info(&mut self, info: ColorInfo) {
         match self {
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+            Self::MfGpu(frame) => {
+                Arc::get_mut(frame)
+                    .expect("MF frame metadata must be unique")
+                    .color_info = info
+            }
+            Self::Nv12Frame { color_info, .. } => *color_info = info,
             Self::Cpu { color_info, .. } => *color_info = info,
             #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
             Self::Gpu { color_info, .. } => *color_info = info,
@@ -127,12 +155,15 @@ impl CaptureFrame {
                     v_data.as_mut_slice(),
                 )
             }
-            Self::Gpu { .. } => unreachable!("coerced to Cpu above"),
+            _ => unreachable!("coerced to Cpu above"),
         }
     }
 
     pub fn width(&self) -> u32 {
         match self {
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+            Self::MfGpu(frame) => frame.width,
+            Self::Nv12Frame { frame, .. } => frame.width(),
             Self::Cpu { width, .. } => *width,
             #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
             Self::Gpu { width, .. } => *width,
@@ -141,6 +172,9 @@ impl CaptureFrame {
 
     pub fn height(&self) -> u32 {
         match self {
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+            Self::MfGpu(frame) => frame.height,
+            Self::Nv12Frame { frame, .. } => frame.height(),
             Self::Cpu { height, .. } => *height,
             #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
             Self::Gpu { height, .. } => *height,
@@ -149,6 +183,9 @@ impl CaptureFrame {
 
     pub fn format(&self) -> Option<PixelFormat> {
         match self {
+            #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+            Self::MfGpu(_) => Some(PixelFormat::Nv12),
+            Self::Nv12Frame { .. } => Some(PixelFormat::Nv12),
             Self::Cpu { format, .. } => Some(*format),
             #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
             Self::Gpu { .. } => Some(PixelFormat::Yuvj422p), // nvJPEG always outputs YUV 4:2:2
@@ -220,6 +257,36 @@ pub struct CaptureThread {
 }
 
 impl CaptureThread {
+    #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+    pub fn start_mf_gpu(
+        device: wgpu::Device,
+        name: String,
+        width: u32,
+        height: u32,
+        rate: FrameRate,
+        events: EventLoopProxy<AppEvent>,
+    ) -> Self {
+        let (producer, frame_consumer) = crate::triple_buffer::triple_buffer(CaptureFrame::empty);
+        let (stats_tx, stats_rx) = unbounded();
+        let (error_tx, error_rx) = unbounded();
+        let (_negotiated_tx, negotiated_rx) = unbounded();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop = stop_flag.clone();
+        let join_handle = Some(thread::spawn(move || {
+            crate::mf_gpu::run(
+                device, name, width, height, rate, stop, producer, stats_tx, error_tx, events,
+            )
+        }));
+        Self {
+            frame_consumer,
+            stats_rx,
+            error_rx,
+            negotiated_rx,
+            stop_flag,
+            join_handle,
+        }
+    }
+
     pub fn start(config: CaptureConfig, event_proxy: EventLoopProxy<AppEvent>) -> Self {
         let (frame_producer, frame_consumer) =
             crate::triple_buffer::triple_buffer(CaptureFrame::empty);
@@ -843,19 +910,23 @@ fn run_device_capture_inner(
         }
 
         while decoder.receive_frame(&mut decoded).is_ok() {
-            let frame = capture_frame_from_video(
-                &decoded,
-                &mut scaler,
-                &mut scaled_frame,
-                matches!(
-                    decoded.format(),
-                    format::Pixel::YUVJ422P
-                        | format::Pixel::YUV422P
-                        | format::Pixel::YUYV422
-                        | format::Pixel::UYVY422
-                ),
-            )
-            .map_err(|error| format!("failed to convert decoded frame: {error}"))?;
+            let frame = if decoded.format() == format::Pixel::NV12 {
+                retain_nv12_frame(&mut decoded)
+            } else {
+                capture_frame_from_video(
+                    &decoded,
+                    &mut scaler,
+                    &mut scaled_frame,
+                    matches!(
+                        decoded.format(),
+                        format::Pixel::YUVJ422P
+                            | format::Pixel::YUV422P
+                            | format::Pixel::YUYV422
+                            | format::Pixel::UYVY422
+                    ),
+                )
+                .map_err(|error| format!("failed to convert decoded frame: {error}"))?
+            };
             let width = frame.width();
             let height = frame.height();
             total_frames += 1;
@@ -923,6 +994,19 @@ fn run_device_capture_inner(
     }
 
     Ok(())
+}
+
+fn retain_nv12_frame(decoded: &mut Video) -> CaptureFrame {
+    debug_assert_eq!(decoded.format(), format::Pixel::NV12);
+    let color_info = ColorInfo::from_ffmpeg(
+        decoded.color_space(),
+        decoded.color_range(),
+        decoded.format(),
+    );
+    CaptureFrame::Nv12Frame {
+        frame: Arc::new(std::mem::replace(decoded, Video::empty())),
+        color_info,
+    }
 }
 
 fn capture_frame_from_video(
@@ -1231,6 +1315,26 @@ fn generate_test_frame(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retained_nv12_keeps_pixels_alive_without_copying() {
+        let mut decoded = Video::new(format::Pixel::NV12, 4, 2);
+        decoded.data_mut(0)[0] = 73;
+        decoded.set_color_range(ffmpeg::color::Range::MPEG);
+        let pixels = decoded.data(0).as_ptr();
+        let captured = retain_nv12_frame(&mut decoded);
+        let cloned = captured.clone();
+        drop(captured);
+        decoded = Video::new(format::Pixel::NV12, 4, 2);
+        decoded.data_mut(0)[0] = 19;
+        let CaptureFrame::Nv12Frame { frame, color_info } = cloned else {
+            panic!("Expected retained frame");
+        };
+        assert_eq!(frame.data(0).as_ptr(), pixels);
+        assert_eq!(frame.data(0)[0], 73);
+        assert_eq!((frame.width(), frame.height()), (4, 2));
+        assert_eq!(color_info.range, Some(ColorRange::Limited));
+    }
+
     use super::*;
 
     #[test]
