@@ -6,13 +6,14 @@
 
 **A lightweight, GPU-accelerated capture card viewer for Windows and Linux.** No recording, no bloat, just your game on your screen.
 
-Built for capture cards like the Genki ShadowCast, Elgato, AVerMedia, and other UVC-compliant devices. Written in Rust with a zero-copy GPU pipeline and low-latency audio passthrough.
+Built for capture cards like the Genki ShadowCast, Elgato, AVerMedia, and other UVC-compliant devices. Written in Rust with a GPU-accelerated video pipeline and low-latency audio passthrough.
 
 ## Features
 
 - **GPU-accelerated rendering** via wgpu with a custom YUV-to-RGB shader
 - **NVIDIA GPU MJPEG decode on Windows** via nvJPEG/CUDA (automatic fallback to software decode)
 - **Zero-copy MJPEG pipeline on supported NVIDIA/Windows systems** - decoded frames stay on the GPU (CUDA to DX12 to wgpu)
+- **Native NV12 GPU capture on Windows** via Media Foundation for supported modes, with automatic DirectShow fallback
 - **Low-latency audio passthrough** via WASAPI (Windows) and ALSA, including PipeWire/PulseAudio compatibility plugins (Linux)
 - **Robust audio resampling & channel conversion** - handles mono, stereo, and variable sample rates (e.g. PS4/PS5/Switch audio over USB capture cards)
 - **Audio mute toggle & UI status** - mute control with real-time audio connection status
@@ -81,7 +82,7 @@ The overlay separates the selected **nominal FPS** from **delivered FPS**. For e
 
 ## How It Works
 
-TackleCast has a three-tier decode pipeline that automatically selects the best path for your hardware:
+For MJPEG capture, TackleCast has a three-tier decode pipeline that automatically selects the best path for your hardware:
 
 | Tier | Path | When |
 |---|---|---|
@@ -103,7 +104,8 @@ matrix and full/limited range when provided; missing metadata remains labeled
 as a default, and manual color controls override it. Explicit non-NV12 format
 selections use the existing capture path. When the native bridge DLL is bundled
 beside TackleCast.exe, this backend is selected automatically for eligible modes.
-If it fails, capture retries through DirectShow. No wrapper script is required;
+If it fails, or delivers no frames within five seconds of opening, capture
+retries through DirectShow. No wrapper script is required;
 see `scripts/MF_GPU_SETTINGS_AUDIT.md` for its controls and limitations.
 
 Color Auto follows stream/frame metadata. When metadata is missing, the UI labels the fallback as a default rather than presenting it as detected information. BT.2020 selects a conversion matrix; it does not implement HDR tone mapping.
@@ -119,6 +121,9 @@ src/
   color.rs         - Color metadata and explicit defaults
   gpu_decode.rs    - NVIDIA nvJPEG GPU MJPEG decode (feature-gated: gpu-decode)
   dx12_interop.rs  - DX12 shared buffers for CUDA/wgpu zero-copy (feature-gated: gpu-decode)
+  mf_gpu.rs        - Native Media Foundation GPU capture client (feature-gated: gpu-decode)
+  mf_gpu_native.cpp - Media Foundation to DX12 bridge, built as tacklecast_mf_gpu.dll
+  triple_buffer.rs - Lock-free latest-frame handoff from capture to renderer
   render.rs        - wgpu DX12/Vulkan renderer, YUV->RGB WGSL shader
   audio/           - Audio passthrough via cpal (WASAPI on Windows, PipeWire/ALSA on Linux)
   devices.rs       - Cross-platform video + audio device enumeration
@@ -130,6 +135,7 @@ src/
 ## Known Limitations
 
 - **MJPEG GPU decoding requires Windows and a compatible NVIDIA GPU/runtime.** Linux and other GPUs use software decoding with the same wgpu rendering path.
+- **Software MJPEG decoding uses one CPU thread.** High modes can exceed it and add visible latency as frames queue. On an Elgato 4K X with a Ryzen 7 9800X3D and an RX 9070 XT, 4K120 MJPEG decoded in about 12 ms per frame, so TackleCast delivered about 61 FPS and the capture buffer overflowed. Prefer an NV12 mode where available, such as 4K60 or 1440p120.
 - **Reported modes do not guarantee sustained throughput.** The HDMI source, USB connection, capture-card encoder, and PC can limit delivery. Capture cards and laptops may also throttle under sustained load; compare delivered FPS with nominal FPS in the overlay.
 - **Linux physical capture needs broader hardware validation.** Native V4L2 discovery is implemented, and Linux tests, shader checks, and packaged synthetic rendering have passed. The latest ShadowCast hardware checks were performed on Windows.
 - **FSR and HDR tone mapping are not included.** Scaling options are Bilinear, Bicubic, and Lanczos; BT.2020 is a color conversion matrix. Saved `fsr1` selections load as Bilinear while preserving other settings.

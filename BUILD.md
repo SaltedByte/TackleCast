@@ -13,7 +13,7 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --no-default-features
 cargo clippy --locked --all-targets --no-default-features -- -D warnings
-.\scripts\package_rust_release.ps1 -PackageName TackleCast-Windows-x86_64 -RequireGpuDlls -Zip
+.\scripts\package_rust_release.ps1 -PackageName TackleCast-Windows-x86_64 -RequireGpuDlls -MfGpu -Zip
 ```
 
 The setup downloads an exact FFmpeg 8.1.3 LGPL build and NVIDIA redistributables, verifies their SHA256 hashes, and extracts them into `.deps/`. Pins are in `scripts/windows-dependencies.json`. The FFmpeg monthly archive is retained by its publisher for two years; update that pin deliberately when upgrading dependencies. `LIBCLANG_PATH` defaults to `C:\Program Files\LLVM\bin`.
@@ -49,8 +49,9 @@ runtime DLLs, and runtime licenses. Launch `TackleCast.exe` directly; it finds
 the bundled bridge and automatically selects eligible GPU capture modes. No
 development PATH is needed. MF GPU applies to native NV12 modes, with GPU
 copies and CPU coordination; this is an experimental release, not a claim of
-zero-copy USB transport or measured latency improvement. MSVC packaging can
-also use `-MfGpu` from a Visual Studio developer shell (omit `-Gnu`).
+zero-copy USB transport or measured latency improvement. MSVC packaging also
+uses `-MfGpu` (omit `-Gnu`); `scripts/build_mf_bridge.ps1` enters the Visual
+Studio developer environment when `cl.exe` is not already on PATH.
 
 ## Linux
 
@@ -115,7 +116,7 @@ cargo test --locked gpu_shader_color_and_picture_reference -- --ignored
 
 ## CI and automated releases
 
-PRs and pushes to `main` run formatting, tests, Clippy, and release builds on Windows and Linux, with default and software-only feature configurations. Clippy failures are fatal. Cargo uses the checked-in lockfile; dependency downloads and Rust builds are cached.
+PRs and pushes to `main` run formatting, tests, Clippy, and release builds on Windows and Linux, with default and software-only feature configurations. Default Windows builds also compile the native MF GPU bridge with MSVC, and release packages must include it. Clippy failures are fatal. Cargo uses the checked-in lockfile; dependency downloads and Rust builds are cached.
 
 Create a version tag matching `Cargo.toml` (for example, `v2.2.0`) to release. The workflow resolves that existing tag to an exact commit, validates that commit through the reusable CI workflow, builds packages, extracts and verifies them, runs synthetic renderer tests, and uploads archives plus SHA256 files. Publication occurs only after both platforms pass, and only in `SaltedByte/TackleCast`.
 

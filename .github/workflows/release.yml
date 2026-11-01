@@ -98,9 +98,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          .\scripts\package_rust_release.ps1 -PackageName TackleCast-Windows-x86_64 -RequireGpuDlls -Zip
+          .\scripts\package_rust_release.ps1 -PackageName TackleCast-Windows-x86_64 -RequireGpuDlls -MfGpu -Zip
           Expand-Archive dist/TackleCast-Windows-x86_64.zip -DestinationPath dist/extracted-windows
-          python scripts/verify_package.py --package dist/extracted-windows --require-gpu --commit '${{ needs.resolve.outputs.commit }}'
+          python scripts/verify_package.py --package dist/extracted-windows --require-gpu --require-mf-gpu --commit '${{ needs.resolve.outputs.commit }}'
           if ($LASTEXITCODE -ne 0) { throw 'Package verification failed' }
           python scripts/smoke_test.py --binary dist/extracted-windows/TackleCast.exe
           if ($LASTEXITCODE -ne 0) { throw 'Synthetic rendering failed' }

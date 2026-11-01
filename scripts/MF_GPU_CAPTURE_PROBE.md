@@ -74,6 +74,9 @@ ownership, reuse allocated resources, and feed wgpu without pixel readback.
 
 ## Experimental viewer integration
 
+This section is a dated record. The bridge has since become automatic and is
+packaged; see `MF_GPU_SETTINGS_AUDIT.md` for current behavior.
+
 The viewer now has an opt-in native bridge, `src/mf_gpu_native.cpp`, loaded by
 `src/mf_gpu.rs`. Build and launch with the card free:
 

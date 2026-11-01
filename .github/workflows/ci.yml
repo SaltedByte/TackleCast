@@ -92,3 +92,7 @@ jobs:
           flags=()
           if [[ "$FEATURES" == software ]]; then flags+=(--no-default-features); fi
           cargo build --release --locked "${flags[@]}"
+      - name: Windows native GPU bridge
+        if: runner.os == 'Windows' && matrix.features == 'default'
+        shell: powershell
+        run: .\scripts\build_mf_bridge.ps1 -Output target\mf-bridge\tacklecast_mf_gpu.dll

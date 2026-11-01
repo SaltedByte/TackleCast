@@ -8,7 +8,7 @@ claim that every menu control has been physically exercised on every device.
 | Video device | Restarts capture with the selected device; audio Auto routing is reevaluated. MF requires an unambiguous friendly name. |
 | Resolution | Restarts capture; MF requires a matching native NV12 size. |
 | Frame rate / custom FPS | Restarts capture using the selected rate, including 100 ns interval rounding. No silent rate downgrade. |
-| Pixel format | NV12 uses MF when opted in. Auto uses MF only if NV12 is advertised at the requested mode. Explicit MJPEG/YUY2/UYVY/I420 use the existing capture path. |
+| Pixel format | NV12 uses MF when the native bridge is available. Auto uses MF only if NV12 is advertised at the requested mode. Explicit MJPEG/YUY2/UYVY/I420 use the existing capture path. |
 | Scaling filter | Updates the existing production shader live and on apply; shared by CPU and MF GPU frames. |
 | Color space | Auto resolves native MF YUV-matrix metadata. Explicit selection overrides metadata in the shader. Unknown metadata retains labeled defaults. |
 | Color range | Auto resolves native MF full/limited-range metadata. Explicit selection overrides metadata in the shader. Unsupported ranges are not mislabeled as detected. |
@@ -83,7 +83,8 @@ viewer was verified at 120 delivered FPS with the original settings restored.
 
 As of 2.2.2, packaged TackleCast.exe locates its native bridge in its own directory
 and automatically attempts eligible NV12 modes. Missing bridges use DirectShow;
-MF GPU errors trigger one DirectShow retry for that configuration. Changing a
-video setting permits a fresh GPU attempt. `TACKLECAST_MF_GPU=0` disables native
+MF GPU errors, or no frames within five seconds of opening, trigger one
+DirectShow retry for that configuration. Changing a video setting permits a
+fresh GPU attempt. `TACKLECAST_MF_GPU=0` disables native
 GPU capture for diagnostics; the absolute DLL override remains for developers.
 The package contains no batch launcher, duplicate icon file, or probe documents.

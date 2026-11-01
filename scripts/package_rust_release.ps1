@@ -80,14 +80,7 @@ try {
         }
     }
     if ($MfGpu) {
-        $bridge = Join-Path $outDir 'tacklecast_mf_gpu.dll'
-        if ($Gnu) {
-            & 'C:\msys64\mingw64\bin\g++.exe' -std=c++17 -Wall -Wextra -Werror -shared -static src/mf_gpu_native.cpp -o $bridge -lmfplat -lmf -lmfreadwrite -lmfuuid -lole32 -ld3d11 -ld3d12 -ldxgi
-        } else {
-            $bridgeObj = Join-Path $targetRoot 'release\mf_gpu_native.obj'
-            & cl /nologo /std:c++17 /EHsc /W4 /LD /MT src/mf_gpu_native.cpp "/Fo$bridgeObj" /link "/OUT:$bridge" mfplat.lib mf.lib mfreadwrite.lib mfuuid.lib ole32.lib d3d11.lib d3d12.lib dxgi.lib
-        }
-        if ($LASTEXITCODE -ne 0) { throw "MF GPU bridge build failed ($LASTEXITCODE)" }
+        & (Join-Path $PSScriptRoot 'build_mf_bridge.ps1') -Output (Join-Path $outDir 'tacklecast_mf_gpu.dll') -Gnu:$Gnu
     }
     Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $outDir
     $licensesDir = Join-Path $outDir 'licenses'

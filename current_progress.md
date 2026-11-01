@@ -1,8 +1,12 @@
 # TackleCast — Current Progress
 
-Last updated: 2026-10-14
+Last updated: 2026-11-01
 
-## Current local integration
+## Current status
+
+Version 2.2.2 uses native Media Foundation GPU capture automatically for eligible NV12 modes when `tacklecast_mf_gpu.dll` is bundled, with DirectShow fallback. Release packaging includes the bridge and CI compiles it. Measured on the 4K X with a Ryzen 7 9800X3D and RX 9070 XT during Switch gameplay: 1440p120 used about 0.25 cores in MF GPU NV12 and 1.09 cores in software MJPEG, both near 120 FPS. 4K120 is MJPEG-only and decoded in about 12 ms per frame on one thread, delivering about 61 FPS and overflowing the capture buffer. AMD AMF MJPEG decode measured slower than software on real frames (24 ms at 1440p, 31 ms at 4K), so it is not a latency fix. Parallel software decode with stale-frame dropping is the candidate fix if 4K120 becomes a priority.
+
+## Local integration (October 2026)
 
 PR #20 is being integrated with main's Windows/Linux and audio changes. Current behavior is documented in README.md and BUILD.md. Device modes and rational frame rates replace generic menus and resolution/FPS fallback. Auto format shows the actual stream format; color metadata and explicitly labeled defaults replace format-based guesses. Picture adjustments are live, and the four tabs retain the coral/navy branding. FSR is excluded for a separate implementation. Packaging does not require postproc, and Windows environment defaults are session-local.
 

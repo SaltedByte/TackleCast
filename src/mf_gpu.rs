@@ -16,6 +16,11 @@ use std::{
 };
 use windows::{core::Interface, Win32::Graphics::Direct3D12::ID3D12Resource};
 
+/// How long an opened session may deliver nothing before capture falls back.
+/// Native reads report "no sample yet" rather than failing, so without this a
+/// silent device would stay on "Connecting..." and never reach DirectShow.
+const FIRST_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub struct GpuFrame {
     pub buffer: wgpu::Buffer,
     pub width: u32,
@@ -116,6 +121,10 @@ fn native_color_info(matrix: u32, range: u32) -> ColorInfo {
         },
         ..ColorInfo::default()
     }
+}
+
+fn first_frame_overdue(received_frame: bool, waited: std::time::Duration) -> bool {
+    !received_frame && waited >= FIRST_FRAME_TIMEOUT
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -232,6 +241,8 @@ pub fn run(
             pool.len(),
             pool[0].layout.size
         );
+        let opened = Instant::now();
+        let mut received_frame = false;
         let mut started = Instant::now();
         let mut frames = 0;
         tracing::info!("experimental MF GPU NV12 capture opened: {width}x{height} @ {rate}");
@@ -249,6 +260,9 @@ pub fn run(
             let mut output = Output::default();
             let hr = unsafe { next(session.p, slot.resource.as_raw(), &mut output) };
             if hr == 1 {
+                if first_frame_overdue(received_frame, opened.elapsed()) {
+                    return Err("MF GPU capture delivered no frames".into());
+                }
                 continue;
             }
             if hr < 0 {
@@ -280,6 +294,7 @@ pub fn run(
                 _lease: lease,
             })));
             let _ = events.send_event(AppEvent::FrameReady);
+            received_frame = true;
             frames += 1;
             if started.elapsed().as_millis() >= 300 {
                 let _ = stats.send(CaptureStats {
@@ -347,6 +362,15 @@ mod tests {
             ColorSpace::Bt601
         );
         assert_eq!(info.resolve_range(ColorRange::Full), ColorRange::Full);
+    }
+    #[test]
+    fn silent_session_falls_back_only_before_first_frame() {
+        let just_under = FIRST_FRAME_TIMEOUT - std::time::Duration::from_millis(1);
+        assert!(!first_frame_overdue(false, just_under));
+        assert!(first_frame_overdue(false, FIRST_FRAME_TIMEOUT));
+        // A stream that has started may pause, for example during a source
+        // mode change, without abandoning the GPU path.
+        assert!(!first_frame_overdue(true, FIRST_FRAME_TIMEOUT * 100));
     }
     #[test]
     fn pool_slot_waits_for_final_consumer() {

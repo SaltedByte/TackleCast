@@ -7,11 +7,13 @@ from pathlib import Path
 import subprocess
 
 
-def verify(package, require_gpu=False, commit=None):
+def verify(package, require_gpu=False, commit=None, require_mf_gpu=False):
     package = package.resolve()
     info = json.loads((package / 'build-info.json').read_text(encoding='utf-8-sig'))
     if commit and info['commit'] != commit:
         raise RuntimeError('Packaged source commit does not match the requested release')
+    if require_mf_gpu and not info.get('mf_gpu_bundled'):
+        raise RuntimeError('Package does not include the MF GPU bridge')
     components = ['avcodec', 'avformat', 'avdevice', 'avutil', 'avfilter', 'swresample', 'swscale']
     if os.name == 'nt':
         with os.add_dll_directory(str(package)):
@@ -63,6 +65,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--package', type=Path, required=True)
     parser.add_argument('--require-gpu', action='store_true')
+    parser.add_argument('--require-mf-gpu', action='store_true')
     parser.add_argument('--commit')
     args = parser.parse_args()
-    verify(args.package, args.require_gpu, args.commit)
+    verify(args.package, args.require_gpu, args.commit, args.require_mf_gpu)
