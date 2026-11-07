@@ -145,7 +145,17 @@ impl SettingChange {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// The HDMI input's signal, as the card reports it.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Signal {
+    pub has_signal: bool,
+    pub width: i32,
+    pub height: i32,
+    pub frame_rate: f64,
+    pub hdcp: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Status {
     pub active: Profile,
     pub profiles: Vec<Profile>,
@@ -153,6 +163,8 @@ pub struct Status {
     pub saved_files: Vec<SavedEdid>,
     #[serde(default)]
     pub settings: CardSettings,
+    #[serde(default)]
+    pub signal: Option<Signal>,
     /// Elgato Studio is running, so changes are refused.
     pub studio_running: bool,
 }

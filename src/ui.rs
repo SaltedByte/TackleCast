@@ -843,6 +843,25 @@ fn elgato_sections(
             None => {}
         }
         let mut input = Vec::new();
+        if let Some(signal) = status.signal {
+            if !signal.has_signal {
+                warning_text(
+                    ui,
+                    "No HDMI signal from the source. If it went black after an EDID change, undock and redock the console (or replug its HDMI cable), then Refresh.",
+                    text_scale,
+                );
+            } else if signal.width > 0 && signal.height > 0 {
+                let rate = if (signal.frame_rate - signal.frame_rate.round()).abs() < 0.005 {
+                    format!("{:.0}", signal.frame_rate)
+                } else {
+                    format!("{:.2}", signal.frame_rate)
+                };
+                input.push(format!("{}×{} at {rate} Hz", signal.width, signal.height));
+            }
+            if signal.hdcp {
+                input.push("HDCP-protected".to_string());
+            }
+        }
         if let Some(hdr) = settings.video_hdr {
             input.push(if hdr { "HDR" } else { "SDR" }.to_string());
         }

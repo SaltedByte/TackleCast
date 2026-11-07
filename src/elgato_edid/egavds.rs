@@ -11,7 +11,7 @@
 //! * `bool` crosses the boundary as a 32-bit unsigned int.
 
 use super::win;
-use super::{CardSettings, Choice, Gain, SettingChange, Toggle};
+use super::{CardSettings, Choice, Gain, SettingChange, Signal, Toggle};
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::io::Write;
@@ -214,6 +214,15 @@ api! {
     get_is_video_hdr: fn(P, *mut u32) -> i32 = "GetIsVideoHDR";
     supports_input_color_space: fn(P) -> u32 = "SupportsInputColorSpace";
     get_input_color_space: fn(P, *mut i32) -> i32 = "GetInputColorSpace";
+
+    new_signal_status: fn() -> P = "new_EGAVDS_SIGNAL_STATUS";
+    delete_signal_status: fn(P) = "delete_EGAVDS_SIGNAL_STATUS";
+    get_signal_status: fn(P, P) -> i32 = "GetSignalStatus";
+    signal_has_signal: fn(P) -> u32 = "EGAVDS_SIGNAL_STATUS_hasSignal_get";
+    signal_width: fn(P) -> i32 = "EGAVDS_SIGNAL_STATUS_width_get";
+    signal_height: fn(P) -> i32 = "EGAVDS_SIGNAL_STATUS_height_get";
+    signal_frame_rate: fn(P) -> f64 = "EGAVDS_SIGNAL_STATUS_frameRate_get";
+    signal_hdcp: fn(P) -> u32 = "EGAVDS_SIGNAL_STATUS_isHDCPProtected_get";
 
     new_edid: fn() -> P = "new_EGAVDS_EDID";
     delete_edid: fn(P) = "delete_EGAVDS_EDID";
@@ -524,6 +533,28 @@ impl Device<'_> {
                 .supports(a.supports_input_color_space)
                 .then(|| self.read("GetInputColorSpace", a.get_input_color_space))
                 .flatten(),
+        }
+    }
+
+    /// The HDMI input's signal, as the card sees it.
+    pub fn signal(&self) -> Option<Signal> {
+        let a = self.api();
+        unsafe {
+            let s = (a.new_signal_status)();
+            if s.is_null() {
+                return None;
+            }
+            let signal = check("GetSignalStatus", (a.get_signal_status)(self.h, s))
+                .ok()
+                .map(|_| Signal {
+                    has_signal: (a.signal_has_signal)(s) != 0,
+                    width: (a.signal_width)(s),
+                    height: (a.signal_height)(s),
+                    frame_rate: (a.signal_frame_rate)(s),
+                    hdcp: (a.signal_hdcp)(s) != 0,
+                });
+            (a.delete_signal_status)(s);
+            signal
         }
     }
 

@@ -282,6 +282,7 @@ fn status(
             .collect(),
         saved_files: saved_edids(paths),
         settings: dev.settings(),
+        signal: dev.signal(),
         studio_running,
     })
 }
