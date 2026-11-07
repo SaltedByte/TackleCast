@@ -24,7 +24,7 @@ Built for capture cards like the Genki ShadowCast, Elgato, AVerMedia, and other 
 - **Live picture controls** - brightness, contrast, saturation, gamma, and reset
 - **Live FPS counter** with separate nominal and delivered frame rates
 - **Auto-detect capture cards** via DirectShow and V4L2
-- **Elgato 4K X EDID switching** on Windows, e.g. Switch 2 VRR or the PS5 default, using an installed Elgato Studio's device library
+- **Elgato 4K X card settings** on Windows - EDID profiles (e.g. Switch 2 VRR or the PS5 default) or an EDID file, HDMI color range, EDID mode, audio input and HDR tone mapping, using an installed Elgato Studio's device library
 - **Four-tab settings** - Video, Picture, Audio, and Display, retaining the coral/navy theme
 - **Fullscreen support** (F11 or toggle in settings)
 - **Zero recording overhead** - purely a viewer
@@ -51,17 +51,30 @@ In TackleCast, press Escape and select the capture card's audio input and your s
 
 Audio input **Auto (follow video)** uses a unique name match for the selected video device. Without a unique match, audio stays disconnected; it never substitutes another capture card or your system microphone. Select an explicit input to use audio independently of video. If sound is missing, select the capture card's input and inspect the input/output formats in `logs/`. Unit tests cover routing, channel conversion and resampling; console-specific behavior still depends on the card and needs hardware validation.
 
-### Elgato 4K X EDID (Windows)
+### Elgato 4K X settings and EDID (Windows)
 
-When an **Elgato 4K X** is selected, the Video tab adds an **Elgato EDID** section. It shows the EDID active on the card and lets you switch profiles without opening Elgato Studio, for example **4K X Switch 2 VRR** (Elgato's fix for Switch 2 freezes with VRR) and the default **Game Capture 4K X** for PS5. Choose a profile, select **Apply EDID…**, then **Write EDID**.
+When an **Elgato 4K X** is selected, the Video tab adds two sections with the card settings Elgato Studio offers, so you don't need Studio open. Other capture cards never see them, and a setting only appears if the card reports supporting it.
+
+**Elgato 4K X** applies each change as soon as you pick it; the card stays connected:
+
+| Setting | Options |
+|---|---|
+| HDMI color range | Auto, Expand (limited to full), Shrink (full to limited). This is the card's own conversion, separate from TackleCast's **Color Range**, which only sets how the picture is interpreted. |
+| Input EDID mode | Internal (the card's EDID), Display (the pass-through monitor's EDID), Merged |
+| Audio input | HDMI audio, Analog line in, plus line-in gain |
+| HDR tone mapping | Convert HDR input to SDR on the card |
+
+It also shows whether the HDMI input is HDR. These settings are stored on the card.
+
+**Elgato EDID** shows the EDID active on the card and writes another one: one of Elgato's profiles, such as **4K X Switch 2 VRR** (Elgato's fix for Switch 2 freezes with VRR) or the default **Game Capture 4K X** for PS5; an EDID Elgato Studio saved; or any EDID file with **Load EDID file…**. Choose one, select **Apply EDID…**, then **Write EDID**. With **Input EDID mode** set to Display and a pass-through monitor connected, the console may see the monitor's EDID instead.
 
 Elgato Studio doesn't toggle a preset on the 4K X: it writes a whole EDID file into the card's flash. TackleCast does the same through Studio's own device library, so:
 
 - **Elgato Studio must be installed** and opened at least once, so it has downloaded Elgato's EDID files. TackleCast copies Studio's library and EDID files to `%LOCALAPPDATA%\TackleCast\elgato-edid\`; it never ships Elgato's files.
-- **Close Elgato Studio before switching.** TackleCast refuses to write while Studio holds the card.
-- **Video and audio stop for about 20 s** while the card is re-flashed and reconnects; capture restarts by itself. Don't unplug the card until video returns.
+- **Close Elgato Studio before changing anything.** TackleCast refuses to change the card while Studio holds it.
+- **Writing an EDID stops video and audio for about 20 s** while the card is re-flashed and reconnects; capture restarts by itself. Don't unplug the card until video returns.
 
-Every file is checked against the SHA-256 in Elgato's EDID list before it is written, and the card is re-read afterwards to confirm the change. Elgato's library runs in a separate helper process, so a fault in it can't take down the viewer. It is private and undocumented, so a future Studio update may change it; TackleCast then shows an error instead of writing. The card's **EDID source** setting (shown in the section) is separate, and TackleCast doesn't change it.
+Elgato's profiles are checked against the SHA-256 in Elgato's EDID list before they are written. A file you load must be a well-formed EDID (one to four 128-byte blocks, a valid header and a valid checksum on every block); TackleCast keeps a copy in `user-edids\` and lists it next time. After a write, the card is re-read to report the result. Elgato's library runs in a separate helper process, so a fault in it can't take down the viewer. It is private and undocumented, so a future Studio update may change it; TackleCast then shows an error instead of changing the card.
 
 ## Building from Source
 
@@ -84,7 +97,7 @@ Press **Escape** to open the four-tab menu. Shorter tabs keep the same menu size
 
 | Tab | Controls |
 |---|---|
-| Video | Capture device, supported resolution/FPS/format combinations, scaling filter, color space, and color range; Elgato 4K X EDID profile on Windows |
+| Video | Capture device, supported resolution/FPS/format combinations, scaling filter, color space, and color range; Elgato 4K X settings and EDID on Windows |
 | Picture | Live brightness, contrast, saturation, and gamma adjustments, plus Reset Picture to Defaults |
 | Audio | Input/output devices, mute, volume, and connection status |
 | Display | Fullscreen, performance overlay, detailed scaling/color information, and Exit |
@@ -140,7 +153,7 @@ src/
   render.rs        - wgpu DX12/Vulkan renderer, YUV->RGB WGSL shader
   audio/           - Audio passthrough via cpal (WASAPI on Windows, PipeWire/ALSA on Linux)
   devices.rs       - Cross-platform video + audio device enumeration
-  elgato_edid/     - Elgato 4K X EDID switching via Elgato Studio's library in a helper process (feature-gated: elgato-edid)
+  elgato_edid/     - Elgato 4K X settings and EDID switching via Elgato Studio's library in a helper process (feature-gated: elgato-edid)
   settings.rs      - JSON settings load/save
   ui.rs            - egui overlay and settings menu
   logger.rs        - Rotating file logger via tracing

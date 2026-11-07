@@ -51,13 +51,23 @@ pub struct UiState {
     edid: EdidUi,
 }
 
-/// Menu-only state for the Elgato EDID section. Not saved: the card itself
-/// stores its EDID.
+/// Menu-only state for the Elgato sections. Not saved: the card itself stores
+/// its EDID and settings.
 #[derive(Default)]
 struct EdidUi {
     device: String,
-    choice: String,
+    choice: Option<EdidChoice>,
     confirming: bool,
+    /// Why the last picked file was rejected.
+    file_error: Option<String>,
+    /// Line-in gain while the slider is being dragged.
+    gain_draft: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EdidChoice {
+    Profile(String),
+    File(std::path::PathBuf),
 }
 
 #[derive(Clone)]
@@ -103,8 +113,10 @@ pub struct UiOutput {
     pub toggle_fullscreen: bool,
     pub exit_requested: bool,
     pub repaint_after: Duration,
-    /// Write this Elgato EDID profile: (video device ID, profile name).
-    pub edid_write: Option<(String, String)>,
+    /// Make this change on an Elgato card: (video device ID, change).
+    pub elgato_job: Option<(String, crate::elgato_edid::Job)>,
+    /// Open the file picker for an EDID file.
+    pub pick_edid_file: bool,
 }
 
 impl UiState {
@@ -390,17 +402,15 @@ fn draw_menu(
                                         if let Some(view) =
                                             crate::elgato_edid::view(&draft.video_device)
                                         {
-                                            card_section(ui, "ELGATO EDID", text_scale, |ui| {
-                                                edid_section(
-                                                    ui,
-                                                    ctx,
-                                                    view,
-                                                    &draft.video_device,
-                                                    edid,
-                                                    output,
-                                                    text_scale,
-                                                );
-                                            });
+                                            elgato_sections(
+                                                ui,
+                                                ctx,
+                                                view,
+                                                &draft.video_device,
+                                                edid,
+                                                output,
+                                                text_scale,
+                                            );
                                         }
                                         card_section(ui, "FORMAT & SCALING", text_scale, |ui| {
                                             let caps = capabilities::get_device_capabilities(
@@ -690,9 +700,66 @@ fn edid_profile_label(profile: &crate::elgato_edid::Profile) -> String {
     }
 }
 
-/// The Elgato 4K X EDID card: shows the active EDID and writes another one.
-/// Writing takes two clicks because the card goes offline for about 20 s.
-fn edid_section(
+fn edid_choice_label(choice: &EdidChoice, status: &crate::elgato_edid::Status) -> String {
+    match choice {
+        EdidChoice::Profile(name) => status
+            .profiles
+            .iter()
+            .find(|p| &p.name == name)
+            .map(edid_profile_label)
+            .unwrap_or_else(|| name.clone()),
+        EdidChoice::File(path) => {
+            let name = status
+                .saved_files
+                .iter()
+                .find(|f| &f.path == path)
+                .map(|f| f.name.clone())
+                .unwrap_or_else(|| {
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                });
+            format!("File: {name}")
+        }
+    }
+}
+
+/// A combo box for one card setting. Returns the newly picked value.
+fn card_setting_combo(
+    ui: &mut egui::Ui,
+    label: &str,
+    choice: crate::elgato_edid::Choice,
+    options: &[(i32, &'static str)],
+) -> Option<i32> {
+    use crate::elgato_edid::label_for;
+    let mut picked = None;
+    ui.label(RichText::new(label).color(COLOR_TEXT_SECONDARY));
+    ComboBox::from_id_salt(("elgato_setting", label))
+        .width(ui.available_width())
+        .selected_text(label_for(options, choice.value))
+        .show_ui(ui, |ui| {
+            for (value, name) in options {
+                let text = if choice.default == Some(*value) {
+                    format!("{name} (default)")
+                } else {
+                    (*name).to_string()
+                };
+                if ui.selectable_label(choice.value == *value, text).clicked()
+                    && choice.value != *value
+                {
+                    picked = Some(*value);
+                }
+            }
+        });
+    picked
+}
+
+/// The Elgato 4K X cards: the card's own settings, applied as soon as they
+/// change, and its EDID, which takes two clicks because writing it re-flashes
+/// the card and takes it offline for about 20 s.
+#[allow(clippy::too_many_arguments)]
+fn elgato_sections(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
     view: crate::elgato_edid::View,
@@ -701,121 +768,253 @@ fn edid_section(
     output: &mut UiOutput,
     text_scale: f32,
 ) {
-    use crate::elgato_edid::View;
+    use crate::elgato_edid::{self as elgato, Job, SettingChange, View};
     if edid.device != device {
         *edid = EdidUi {
             device: device.to_string(),
             ..EdidUi::default()
         };
     }
+    if let Some(path) = elgato::take_picked_file() {
+        edid.file_error = std::fs::read(&path)
+            .map_err(|e| format!("Cannot read {}: {e}", path.display()))
+            .and_then(|bytes| elgato::validate_edid(&bytes))
+            .err();
+        if edid.file_error.is_none() {
+            edid.choice = Some(EdidChoice::File(path));
+            edid.confirming = false;
+        }
+    }
+
     let status = match view {
-        View::Loading => {
-            muted_text(ui, "Reading the card's EDID…", text_scale);
-            ctx.request_repaint_after(Duration::from_millis(200));
+        View::Ready(status) => status,
+        other => {
+            card_section(ui, "ELGATO 4K X", text_scale, |ui| match other {
+                View::Loading => {
+                    muted_text(ui, "Reading the card's settings…", text_scale);
+                    ctx.request_repaint_after(Duration::from_millis(200));
+                }
+                View::Busy(busy) if busy.pauses_capture => {
+                    warning_text(
+                        ui,
+                        &format!(
+                            "Writing {} to the card ({}s). Video returns when it reconnects. Don't unplug the card.",
+                            busy.label,
+                            busy.elapsed.as_secs()
+                        ),
+                        text_scale,
+                    );
+                    ctx.request_repaint_after(Duration::from_millis(250));
+                }
+                View::Busy(busy) => {
+                    muted_text(ui, &format!("Applying {}…", busy.label), text_scale);
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                }
+                View::Error(message) => {
+                    warning_text(ui, &message, text_scale);
+                    if ui.small_button("Retry").clicked() {
+                        elgato::refresh(device);
+                        ctx.request_repaint();
+                    }
+                }
+                View::Ready(_) => {}
+            });
             return;
         }
-        View::Writing { target, elapsed } => {
+    };
+    let settings = &status.settings;
+    let can_change = !status.studio_running;
+    let mut job = None;
+
+    card_section(ui, "ELGATO 4K X", text_scale, |ui| {
+        if status.studio_running {
             warning_text(
                 ui,
-                &format!(
-                    "Writing \"{target}\" to the card ({}s). Video returns when it reconnects. Don't unplug the card.",
-                    elapsed.as_secs()
-                ),
+                "Close Elgato Studio to change these settings; it holds the card.",
                 text_scale,
             );
-            ctx.request_repaint_after(Duration::from_millis(250));
-            return;
         }
-        View::Error(message) => {
-            warning_text(ui, &message, text_scale);
-            if ui.small_button("Retry").clicked() {
-                crate::elgato_edid::refresh(device);
-                ctx.request_repaint();
-            }
-            return;
+        match elgato::notice(device) {
+            Some(Ok(message)) => muted_text(ui, &message, text_scale),
+            Some(Err(message)) => warning_text(ui, &message, text_scale),
+            None => {}
         }
-        View::Ready(status) => status,
-    };
-
-    ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new("Active:").color(COLOR_TEXT_SECONDARY));
-        ui.label(RichText::new(edid_profile_label(&status.active)).strong());
-    });
-    if let Some(source) = &status.source {
-        muted_text(ui, &format!("EDID source: {source}"), text_scale);
-    }
-    match crate::elgato_edid::notice(device) {
-        Some(Ok(message)) => muted_text(ui, &message, text_scale),
-        Some(Err(message)) => warning_text(ui, &message, text_scale),
-        None => {}
-    }
-
-    if !status.profiles.iter().any(|p| p.name == edid.choice) {
-        edid.choice = status.active.name.clone();
-    }
-    let before = edid.choice.clone();
-    ui.label(RichText::new("Profile").color(COLOR_TEXT_SECONDARY));
-    let selected = status
-        .profiles
-        .iter()
-        .find(|p| p.name == edid.choice)
-        .map(edid_profile_label)
-        .unwrap_or_else(|| edid.choice.clone());
-    ComboBox::from_id_salt("elgato_edid_profile")
-        .width(ui.available_width())
-        .selected_text(selected)
-        .show_ui(ui, |ui| {
-            for profile in &status.profiles {
-                let mut label = edid_profile_label(profile);
-                if !profile.available {
-                    label.push_str(" (not downloaded)");
+        let mut input = Vec::new();
+        if let Some(hdr) = settings.video_hdr {
+            input.push(if hdr { "HDR" } else { "SDR" }.to_string());
+        }
+        if let Some(space) = settings.input_color_space {
+            input.push(elgato::label_for(&elgato::INPUT_COLOR_SPACES, space));
+        }
+        if !input.is_empty() {
+            muted_text(ui, &format!("HDMI input: {}", input.join(", ")), text_scale);
+        }
+        ui.add_enabled_ui(can_change, |ui| {
+            if let Some(choice) = settings.color_range {
+                if let Some(v) =
+                    card_setting_combo(ui, "HDMI color range", choice, &elgato::COLOR_RANGES)
+                {
+                    job = Some(Job::Setting(SettingChange::ColorRange(v)));
                 }
-                ui.add_enabled_ui(profile.available, |ui| {
-                    ui.selectable_value(&mut edid.choice, profile.name.clone(), label);
-                });
+            }
+            if let Some(choice) = settings.edid_mode {
+                if let Some(v) =
+                    card_setting_combo(ui, "Input EDID mode", choice, &elgato::EDID_MODES)
+                {
+                    job = Some(Job::Setting(SettingChange::EdidMode(v)));
+                }
+            }
+            if let Some(choice) = settings.audio_input {
+                if let Some(v) =
+                    card_setting_combo(ui, "Audio input", choice, &elgato::AUDIO_INPUTS)
+                {
+                    job = Some(Job::Setting(SettingChange::AudioInput(v)));
+                }
+            }
+            if let Some(gain) = settings.line_in_gain {
+                ui.label(RichText::new("Line-in gain").color(COLOR_TEXT_SECONDARY));
+                let value = edid.gain_draft.get_or_insert(gain.value);
+                let response = ui.add(Slider::new(value, gain.min..=gain.max));
+                let released =
+                    response.drag_stopped() || (response.changed() && !response.dragged());
+                if released && *value != gain.value {
+                    job = Some(Job::Setting(SettingChange::LineInGain(*value)));
+                }
+            }
+            if let Some(toggle) = settings.hdr_tonemapping {
+                let mut on = toggle.value;
+                if ui
+                    .checkbox(&mut on, "HDR tone mapping")
+                    .on_hover_text("Convert HDR input to SDR on the card")
+                    .changed()
+                {
+                    job = Some(Job::Setting(SettingChange::HdrTonemapping(on)));
+                }
             }
         });
-    if edid.choice != before {
-        edid.confirming = false;
-    }
+        if ui.small_button("Refresh").clicked() {
+            edid.gain_draft = None;
+            elgato::refresh(device);
+            ctx.request_repaint();
+        }
+    });
 
-    let changed = edid.choice != status.active.name;
-    if status.studio_running {
-        warning_text(
-            ui,
-            "Close Elgato Studio to change the EDID; it holds the card.",
-            text_scale,
-        );
-    }
-    let can_write = changed && !status.studio_running;
-    if edid.confirming && can_write {
-        warning_text(
-            ui,
-            "The card is re-flashed and disconnects for about 20 s, so video and audio stop. Don't unplug it until video returns.",
-            text_scale,
-        );
-        ui.horizontal(|ui| {
-            if styled_button(ui, "Write EDID").clicked() {
-                output.edid_write = Some((device.to_string(), edid.choice.clone()));
-                edid.confirming = false;
-            }
-            if styled_button(ui, "Cancel").clicked() {
-                edid.confirming = false;
-            }
+    card_section(ui, "ELGATO EDID", text_scale, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Active:").color(COLOR_TEXT_SECONDARY));
+            ui.label(RichText::new(edid_profile_label(&status.active)).strong());
         });
-    } else {
-        ui.horizontal(|ui| {
-            let apply = ui
-                .add_enabled_ui(can_write, |ui| styled_button(ui, "Apply EDID…"))
-                .inner;
-            if apply.clicked() {
-                edid.confirming = true;
-            }
-            if ui.small_button("Refresh").clicked() {
-                crate::elgato_edid::refresh(device);
-                ctx.request_repaint();
-            }
-        });
+        if settings
+            .edid_mode
+            .is_some_and(|m| m.value != elgato::EDID_MODE_INTERNAL)
+        {
+            muted_text(
+                ui,
+                "Input EDID mode isn't Internal, so with a pass-through monitor connected the console may see the monitor's EDID instead of this one.",
+                text_scale,
+            );
+        }
+
+        let active = EdidChoice::Profile(status.active.name.clone());
+        let valid = match &edid.choice {
+            Some(EdidChoice::Profile(name)) => status.profiles.iter().any(|p| &p.name == name),
+            Some(EdidChoice::File(_)) => true,
+            None => false,
+        };
+        if !valid {
+            edid.choice = Some(active.clone());
+        }
+        let before = edid.choice.clone();
+        let choice = edid.choice.get_or_insert(active.clone());
+        ui.label(RichText::new("EDID").color(COLOR_TEXT_SECONDARY));
+        ComboBox::from_id_salt("elgato_edid_choice")
+            .width(ui.available_width())
+            .selected_text(edid_choice_label(choice, &status))
+            .show_ui(ui, |ui| {
+                for profile in &status.profiles {
+                    let mut label = edid_profile_label(profile);
+                    if !profile.available {
+                        label.push_str(" (not downloaded)");
+                    }
+                    ui.add_enabled_ui(profile.available, |ui| {
+                        ui.selectable_value(
+                            choice,
+                            EdidChoice::Profile(profile.name.clone()),
+                            label,
+                        );
+                    });
+                }
+                if !status.saved_files.is_empty() {
+                    ui.separator();
+                }
+                for file in &status.saved_files {
+                    ui.selectable_value(
+                        choice,
+                        EdidChoice::File(file.path.clone()),
+                        format!("File: {}", file.name),
+                    );
+                }
+                if let EdidChoice::File(path) = choice {
+                    if !status.saved_files.iter().any(|f| &f.path == path) {
+                        // The picked file, already selected.
+                        let label = edid_choice_label(choice, &status);
+                        let _ = ui.selectable_label(true, label);
+                    }
+                }
+            });
+        if edid.choice != before {
+            edid.confirming = false;
+            edid.file_error = None;
+        }
+        if let Some(error) = &edid.file_error {
+            warning_text(ui, error, text_scale);
+        }
+
+        let changed = edid.choice.as_ref() != Some(&active);
+        let can_write = changed && can_change;
+        if edid.confirming && can_write {
+            warning_text(
+                ui,
+                "The card is re-flashed and disconnects for about 20 s, so video and audio stop. Don't unplug it until video returns.",
+                text_scale,
+            );
+            ui.horizontal(|ui| {
+                if styled_button(ui, "Write EDID").clicked() {
+                    job = match edid.choice.clone() {
+                        Some(EdidChoice::Profile(name)) => Some(Job::Profile(name)),
+                        Some(EdidChoice::File(path)) => Some(Job::File(path)),
+                        None => None,
+                    };
+                    edid.confirming = false;
+                }
+                if styled_button(ui, "Cancel").clicked() {
+                    edid.confirming = false;
+                }
+            });
+        } else {
+            ui.horizontal(|ui| {
+                let apply = ui
+                    .add_enabled_ui(can_write, |ui| styled_button(ui, "Apply EDID…"))
+                    .inner;
+                if apply.clicked() {
+                    edid.confirming = true;
+                }
+                if ui
+                    .add_enabled_ui(can_change, |ui| styled_button(ui, "Load EDID file…"))
+                    .inner
+                    .clicked()
+                {
+                    output.pick_edid_file = true;
+                }
+            });
+        }
+    });
+
+    if let Some(job) = job {
+        if matches!(job, Job::Setting(SettingChange::LineInGain(_))) {
+            edid.gain_draft = None;
+        }
+        output.elgato_job = Some((device.to_string(), job));
     }
 }
 

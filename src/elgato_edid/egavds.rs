@@ -11,6 +11,7 @@
 //! * `bool` crosses the boundary as a 32-bit unsigned int.
 
 use super::win;
+use super::{CardSettings, Choice, Gain, SettingChange, Toggle};
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::io::Write;
@@ -63,15 +64,6 @@ impl EdidType {
             Self::Passthrough => "pass-through monitor",
             Self::Other(_) => "other",
         }
-    }
-}
-
-pub fn edid_mode_name(m: i32) -> &'static str {
-    match m {
-        0 => "Internal",
-        1 => "Display (pass-through monitor)",
-        2 => "Merged",
-        _ => "Unknown",
     }
 }
 
@@ -199,6 +191,30 @@ api! {
     get_custom_edid_count: fn(P, *mut i32) -> i32 = "GetCustomEDIDCount";
     get_custom_edid: fn(P, i32, P) -> i32 = "GetCustomEDID";
 
+    supports_color_range: fn(P) -> u32 = "SupportsVideoColorRange";
+    get_color_range: fn(P, *mut i32) -> i32 = "GetVideoColorRange";
+    get_color_range_default: fn(P, *mut i32) -> i32 = "GetVideoColorRangeDefault";
+    set_color_range: fn(P, i32) -> i32 = "SetVideoColorRange";
+    get_edid_mode_default: fn(P, *mut i32) -> i32 = "GetEDIDModeDefault";
+    set_edid_mode: fn(P, i32) -> i32 = "SetEDIDMode";
+    supports_audio_input: fn(P) -> u32 = "SupportsAudioInputSelection";
+    get_audio_input: fn(P, *mut i32) -> i32 = "GetAudioInputSelection";
+    get_audio_input_default: fn(P, *mut i32) -> i32 = "GetAudioInputSelectionDefault";
+    set_audio_input: fn(P, i32) -> i32 = "SetAudioInputSelection";
+    supports_line_in_gain: fn(P) -> u32 = "SupportsLineInAudioGainControl";
+    get_line_in_gain: fn(P, *mut i64) -> i32 = "GetLineInAudioGain";
+    get_line_in_gain_min: fn(P, *mut i64) -> i32 = "GetLineInAudioGainMin";
+    get_line_in_gain_max: fn(P, *mut i64) -> i32 = "GetLineInAudioGainMax";
+    get_line_in_gain_default: fn(P, *mut i64) -> i32 = "GetLineInAudioGainDefault";
+    set_line_in_gain: fn(P, i64) -> i32 = "SetLineInAudioGain";
+    supports_hdr_tonemapping: fn(P) -> u32 = "SupportsHDRTonemapping";
+    get_hdr_tonemapping: fn(P, *mut u32) -> i32 = "GetHDRTonemappingEnabled";
+    get_hdr_tonemapping_default: fn(P, *mut u32) -> i32 = "GetHDRTonemappingEnabledDefault";
+    set_hdr_tonemapping: fn(P, u32) -> i32 = "SetHDRTonemappingEnabled";
+    get_is_video_hdr: fn(P, *mut u32) -> i32 = "GetIsVideoHDR";
+    supports_input_color_space: fn(P) -> u32 = "SupportsInputColorSpace";
+    get_input_color_space: fn(P, *mut i32) -> i32 = "GetInputColorSpace";
+
     new_edid: fn() -> P = "new_EGAVDS_EDID";
     delete_edid: fn(P) = "delete_EGAVDS_EDID";
     edid_name: fn(P) -> *mut c_char = "EGAVDS_EDID_name_get";
@@ -231,6 +247,14 @@ pub struct Paths {
 
 pub struct Library {
     api: Api,
+}
+
+fn known(value: i32, options: &[(i32, &str)]) -> Result<(), String> {
+    if options.iter().any(|(v, _)| *v == value) {
+        Ok(())
+    } else {
+        Err(format!("Unknown setting value {value}"))
+    }
 }
 
 fn check(what: &str, r: i32) -> Result<i32, String> {
@@ -403,18 +427,6 @@ impl Device<'_> {
         unsafe { (self.api().supports_edid_functions)(self.h) != 0 }
     }
 
-    pub fn edid_mode(&self) -> Option<i32> {
-        unsafe {
-            if (self.api().supports_edid_mode)(self.h) == 0 {
-                return None;
-            }
-            let mut m = -1;
-            check("GetEDIDMode", (self.api().get_edid_mode)(self.h, &mut m))
-                .ok()
-                .map(|_| m)
-        }
-    }
-
     /// Read the EDID currently stored on the card and identify it.
     pub fn current_edid(&self) -> Result<EdidInfo, String> {
         let h = self.h;
@@ -438,6 +450,115 @@ impl Device<'_> {
         (0..n)
             .map(|i| self.read_edid("GetCustomEDID", |e| unsafe { f(h, i, e) }))
             .collect()
+    }
+
+    /// Read a value through a `Get…(handle, &mut out)` call. `None` when the
+    /// card reports an error for it.
+    fn read<T: Default>(
+        &self,
+        what: &str,
+        f: unsafe extern "system" fn(P, *mut T) -> i32,
+    ) -> Option<T> {
+        let mut out = T::default();
+        check(what, unsafe { f(self.h, &mut out) })
+            .ok()
+            .map(|_| out)
+    }
+
+    fn supports(&self, f: unsafe extern "system" fn(P) -> u32) -> bool {
+        unsafe { f(self.h) != 0 }
+    }
+
+    /// Every adjustable card setting the card reports it supports.
+    pub fn settings(&self) -> CardSettings {
+        let a = self.api();
+        let choice = |get, default| {
+            self.read::<i32>("Get", get).map(|value| Choice {
+                value,
+                default: self.read::<i32>("GetDefault", default),
+            })
+        };
+        CardSettings {
+            color_range: self
+                .supports(a.supports_color_range)
+                .then(|| choice(a.get_color_range, a.get_color_range_default))
+                .flatten(),
+            edid_mode: self
+                .supports(a.supports_edid_mode)
+                .then(|| choice(a.get_edid_mode, a.get_edid_mode_default))
+                .flatten(),
+            audio_input: self
+                .supports(a.supports_audio_input)
+                .then(|| choice(a.get_audio_input, a.get_audio_input_default))
+                .flatten(),
+            line_in_gain: self
+                .supports(a.supports_line_in_gain)
+                .then(|| {
+                    Some(Gain {
+                        value: self.read("GetLineInAudioGain", a.get_line_in_gain)?,
+                        min: self.read("GetLineInAudioGainMin", a.get_line_in_gain_min)?,
+                        max: self.read("GetLineInAudioGainMax", a.get_line_in_gain_max)?,
+                        default: self.read("GetLineInAudioGainDefault", a.get_line_in_gain_default),
+                    })
+                })
+                .flatten(),
+            hdr_tonemapping: self
+                .supports(a.supports_hdr_tonemapping)
+                .then(|| {
+                    self.read::<u32>("GetHDRTonemappingEnabled", a.get_hdr_tonemapping)
+                        .map(|value| Toggle {
+                            value: value != 0,
+                            default: self
+                                .read::<u32>(
+                                    "GetHDRTonemappingEnabledDefault",
+                                    a.get_hdr_tonemapping_default,
+                                )
+                                .map(|v| v != 0),
+                        })
+                })
+                .flatten(),
+            video_hdr: self
+                .read::<u32>("GetIsVideoHDR", a.get_is_video_hdr)
+                .map(|v| v != 0),
+            input_color_space: self
+                .supports(a.supports_input_color_space)
+                .then(|| self.read("GetInputColorSpace", a.get_input_color_space))
+                .flatten(),
+        }
+    }
+
+    /// Change one card setting. Values are checked against the known range
+    /// before they reach the card.
+    pub fn apply(&self, change: &SettingChange) -> Result<(), String> {
+        let a = self.api();
+        let h = self.h;
+        let r = unsafe {
+            match *change {
+                SettingChange::ColorRange(v) => {
+                    known(v, &super::COLOR_RANGES)?;
+                    (a.set_color_range)(h, v)
+                }
+                SettingChange::EdidMode(v) => {
+                    known(v, &super::EDID_MODES)?;
+                    (a.set_edid_mode)(h, v)
+                }
+                SettingChange::AudioInput(v) => {
+                    known(v, &super::AUDIO_INPUTS)?;
+                    (a.set_audio_input)(h, v)
+                }
+                SettingChange::LineInGain(v) => {
+                    let min = self.read("GetLineInAudioGainMin", a.get_line_in_gain_min);
+                    let max = self.read("GetLineInAudioGainMax", a.get_line_in_gain_max);
+                    match (min, max) {
+                        (Some(min), Some(max)) if (min..=max).contains(&v) => {}
+                        _ => return Err(format!("Line-in gain {v} is outside the card's range")),
+                    }
+                    (a.set_line_in_gain)(h, v)
+                }
+                SettingChange::HdrTonemapping(on) => (a.set_hdr_tonemapping)(h, on as u32),
+            }
+        };
+        check(change.label(), r).map(|_| ())
     }
 
     /// Write an EDID file to the card. Blocks while the card re-enumerates.
