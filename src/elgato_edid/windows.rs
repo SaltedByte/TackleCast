@@ -6,6 +6,7 @@
 //! it, and prints to the console. None of that should touch the viewer, which
 //! loads FFmpeg, CUDA and the MF bridge DLLs itself.
 
+use super::assets;
 use super::egavds::{EdidInfo, EdidType, Library, Paths};
 use super::win;
 use super::{validate_edid, Job, Profile, SavedEdid, SettingChange, Status};
@@ -163,6 +164,9 @@ pub fn handle_helper_args() -> bool {
         SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     }
     let command = args.next().unwrap_or_default();
+    if command == "selftest" {
+        std::process::exit(selftest());
+    }
     let device = args.next().unwrap_or_default();
     let argument = args.next();
     let request = match (command.as_str(), argument) {
@@ -185,12 +189,14 @@ pub fn handle_helper_args() -> bool {
     true
 }
 
-fn run(device_path: &str, job: Option<Job>) -> Result<Status, String> {
+/// Find the installed Elgato Studio and copy its device library next to our
+/// data. Returns Studio's install folder and our paths.
+fn prepare() -> Result<(PathBuf, Paths), String> {
     let studio_dir = win::package_path_for_family(STUDIO_FAMILY)
         .filter(|dir| dir.join("EGAVDeviceSupport.dll").is_file())
         .ok_or(
             "Elgato Studio is not installed. TackleCast uses Studio's device library for the \
-             card's settings, so install Studio and open it once.",
+             card's settings, so install Studio.",
         )?;
     let data_dir = data_dir()?;
     let paths = Paths {
@@ -201,18 +207,55 @@ fn run(device_path: &str, job: Option<Job>) -> Result<Status, String> {
         data_dir,
     };
     copy_studio_libs(&studio_dir, &paths.lib_dir)?;
+    Ok((studio_dir, paths))
+}
 
+fn studio_temp_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join("Packages")
+        .join(STUDIO_FAMILY)
+        .join("TempState")
+}
+
+fn run(device_path: &str, job: Option<Job>) -> Result<Status, String> {
+    let (_, paths) = prepare()?;
     let studio_running = studio_running();
     if job.is_some() && studio_running {
         return Err(
             "Elgato Studio is running and holds the card. Close it, then try again.".into(),
         );
     }
-    let manifest = sync_from_studio(&paths)?.ok_or(
-        "Elgato's EDID list isn't on this PC yet. Open Elgato Studio once so it downloads it.",
-    )?;
+    // Writes skip the network: the status read that opened the menu already
+    // brought the EDID files up to date.
+    let assets = if job.is_none() {
+        assets::sync(&paths.data_dir, &paths.edid_dir, &studio_temp_dir(), false)?
+    } else {
+        let manifest = std::fs::read(paths.data_dir.join(assets::MANIFEST_FILE))
+            .map_err(|_| "Elgato's EDID list isn't on this PC yet; refresh the menu first")?;
+        assets::Assets {
+            manifest,
+            source: String::new(),
+            edids_needed: 0,
+            edids_ok: 0,
+            note: None,
+        }
+    };
+    run_on_card(device_path, job, &paths, &assets.manifest, studio_running).map(|mut status| {
+        status.asset_note = assets.note;
+        status
+    })
+}
 
-    let lib = Library::init(&paths, Some(&manifest))?;
+fn run_on_card(
+    device_path: &str,
+    job: Option<Job>,
+    paths: &Paths,
+    manifest: &[u8],
+    studio_running: bool,
+) -> Result<Status, String> {
+    let lib = Library::init(paths, Some(manifest))?;
     let profiles = {
         let dev = lib.open(device_path)?;
         if !dev.supports_edid() {
@@ -221,10 +264,10 @@ fn run(device_path: &str, job: Option<Job>) -> Result<Status, String> {
         let mut all = vec![dev.default_edid()?];
         all.extend(dev.custom_edids()?);
         let file = match job {
-            None => return status(&dev, &all, &paths, studio_running),
+            None => return status(&dev, &all, paths, studio_running),
             Some(Job::Setting(change)) => {
                 dev.apply(&change)?;
-                return status(&dev, &all, &paths, false);
+                return status(&dev, &all, paths, false);
             }
             Some(Job::Profile(name)) => {
                 let entry = all
@@ -233,11 +276,11 @@ fn run(device_path: &str, job: Option<Job>) -> Result<Status, String> {
                     .ok_or_else(|| format!("No EDID profile named \"{name}\" for this card"))?;
                 let current = dev.current_edid().ok();
                 if current.as_ref().is_some_and(|c| same_edid(c, entry)) {
-                    return status(&dev, &all, &paths, false);
+                    return status(&dev, &all, paths, false);
                 }
                 verified_profile_file(entry)?
             }
-            Some(Job::File(path)) => store_user_edid(&paths, &path)?,
+            Some(Job::File(path)) => store_user_edid(paths, &path)?,
         };
         dev.set_edid(&file)?;
         all
@@ -247,7 +290,7 @@ fn run(device_path: &str, job: Option<Job>) -> Result<Status, String> {
     let mut last_error = String::new();
     while Instant::now() < deadline {
         match lib.open(device_path) {
-            Ok(dev) => return status(&dev, &profiles, &paths, false),
+            Ok(dev) => return status(&dev, &profiles, paths, false),
             Err(error) => last_error = error,
         }
         std::thread::sleep(Duration::from_secs(2));
@@ -283,6 +326,7 @@ fn status(
         saved_files: saved_edids(paths),
         settings: dev.settings(),
         signal: dev.signal(),
+        asset_note: None,
         studio_running,
     })
 }
@@ -421,32 +465,83 @@ fn copy_studio_libs(studio_dir: &Path, lib_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Copy Studio's downloaded EDID files and asset manifest into our own folder
-/// (Studio keeps them in TempState, which Windows may clean up) and return the
-/// manifest JSON.
-fn sync_from_studio(paths: &Paths) -> Result<Option<Vec<u8>>, String> {
-    std::fs::create_dir_all(&paths.edid_dir)
-        .map_err(|e| format!("Cannot create {}: {e}", paths.edid_dir.display()))?;
-    let studio_tmp = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_default()
-        .join("Packages")
-        .join(STUDIO_FAMILY)
-        .join("TempState");
-    let ours = paths.data_dir.join("device-asset-manifest.json");
-    copy_if_changed(&studio_tmp.join("device-asset-manifest.json"), &ours)?;
-    if let Ok(entries) = std::fs::read_dir(studio_tmp.join("EDIDFiles")) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path
-                .extension()
-                .is_some_and(|x| x.eq_ignore_ascii_case("bin"))
-            {
-                copy_if_changed(&path, &paths.edid_dir.join(entry.file_name()))?;
+/// `TackleCast.exe --elgato-edid selftest`: check, without touching any card,
+/// that the installed Elgato Studio's library still has every function
+/// TackleCast calls and that Elgato's EDID list and files are available.
+/// Prints a report (pipe it, e.g. `| Out-String`, since TackleCast is a GUI
+/// app), saves it as `selftest.txt`, and returns the exit code.
+fn selftest() -> i32 {
+    let mut lines = Vec::new();
+    let mut ok = true;
+    let mut check = |passed: bool, text: String| {
+        ok &= passed;
+        lines.push(format!("{} {text}", if passed { "OK  " } else { "FAIL" }));
+    };
+    match prepare() {
+        Err(error) => check(false, error),
+        Ok((studio_dir, paths)) => {
+            check(
+                true,
+                format!(
+                    "Elgato Studio found: {}",
+                    studio_dir.file_name().unwrap_or_default().to_string_lossy()
+                ),
+            );
+            match super::egavds::missing_exports(&paths.lib_dir) {
+                Ok(missing) if missing.is_empty() => check(
+                    true,
+                    "EGAVDeviceSupport.dll has every function TackleCast uses".into(),
+                ),
+                Ok(missing) => check(
+                    false,
+                    format!(
+                        "EGAVDeviceSupport.dll is missing {} function(s) TackleCast uses: {}",
+                        missing.len(),
+                        missing.join(", ")
+                    ),
+                ),
+                Err(error) => check(false, error),
             }
+            match assets::sync(&paths.data_dir, &paths.edid_dir, &studio_temp_dir(), true) {
+                Ok(found) => {
+                    check(true, format!("Elgato's EDID list: {}", found.source));
+                    check(
+                        found.edids_needed > 0 && found.edids_ok == found.edids_needed,
+                        format!(
+                            "4K X EDID files present and verified: {} of {}",
+                            found.edids_ok, found.edids_needed
+                        ),
+                    );
+                    if let Some(note) = found.note {
+                        lines.push(format!("NOTE {note}"));
+                    }
+                }
+                Err(error) => check(false, error),
+            }
+            let report = lines.join("\r\n") + "\r\n";
+            let _ = std::fs::write(paths.data_dir.join("selftest.txt"), &report);
         }
     }
-    Ok(std::fs::read(&ours).ok())
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    for line in &lines {
+        let _ = writeln!(out, "{line}");
+    }
+    let _ = writeln!(
+        out,
+        "{}",
+        if ok {
+            "Self-test passed."
+        } else {
+            "Self-test FAILED."
+        }
+    );
+    let _ = out.flush();
+    if ok {
+        0
+    } else {
+        1
+    }
 }
 
 fn copy_if_changed(src: &Path, dst: &Path) -> Result<(), String> {

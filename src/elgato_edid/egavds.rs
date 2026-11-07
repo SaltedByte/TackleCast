@@ -151,7 +151,29 @@ macro_rules! api {
                 }, )* })
             }
         }
+        /// Every DLL export the function table needs.
+        const API_SYMBOLS: &[&str] = &[ $( concat!("CSharp_ElgatofEGAVDeviceSupport_", $sym, "___"), )* ];
     };
+}
+
+/// SWIG registration exports, called before the function table loads.
+const REGISTRATION_SYMBOLS: &[&str] = &[
+    "SWIGRegisterStringCallback_EGAVDS",
+    "SWIGRegisterExceptionCallbacks_EGAVDS",
+    "SWIGRegisterExceptionArgumentCallbacks_EGAVDS",
+];
+
+/// Load the DLL from `lib_dir` and list the exports TackleCast needs that it
+/// lacks. Doesn't initialize the library or open any device.
+pub fn missing_exports(lib_dir: &Path) -> Result<Vec<String>, String> {
+    let module =
+        win::with_stdout_muted(|| win::load_library_from(&lib_dir.join("EGAVDeviceSupport.dll")))?;
+    Ok(REGISTRATION_SYMBOLS
+        .iter()
+        .chain(API_SYMBOLS)
+        .filter(|name| win::proc_address(module, name).is_none())
+        .map(|name| name.to_string())
+        .collect())
 }
 
 api! {

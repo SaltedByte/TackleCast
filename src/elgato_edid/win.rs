@@ -272,6 +272,170 @@ pub fn sha256_hex(data: &[u8]) -> Result<String, String> {
     Ok(out.iter().map(|b| format!("{b:02X}")).collect())
 }
 
+#[link(name = "winhttp")]
+extern "system" {
+    fn WinHttpOpen(
+        agent: *const u16,
+        access: u32,
+        proxy: *const u16,
+        bypass: *const u16,
+        flags: u32,
+    ) -> *mut c_void;
+    fn WinHttpConnect(
+        session: *mut c_void,
+        server: *const u16,
+        port: u16,
+        reserved: u32,
+    ) -> *mut c_void;
+    fn WinHttpOpenRequest(
+        connect: *mut c_void,
+        verb: *const u16,
+        object: *const u16,
+        version: *const u16,
+        referrer: *const u16,
+        accept: *const *const u16,
+        flags: u32,
+    ) -> *mut c_void;
+    fn WinHttpSetTimeouts(
+        handle: *mut c_void,
+        resolve: i32,
+        connect: i32,
+        send: i32,
+        receive: i32,
+    ) -> i32;
+    fn WinHttpSendRequest(
+        request: *mut c_void,
+        headers: *const u16,
+        headers_len: u32,
+        optional: *const c_void,
+        optional_len: u32,
+        total_len: u32,
+        context: usize,
+    ) -> i32;
+    fn WinHttpReceiveResponse(request: *mut c_void, reserved: *mut c_void) -> i32;
+    fn WinHttpQueryHeaders(
+        request: *mut c_void,
+        level: u32,
+        name: *const u16,
+        buffer: *mut c_void,
+        len: *mut u32,
+        index: *mut u32,
+    ) -> i32;
+    fn WinHttpReadData(request: *mut c_void, buffer: *mut c_void, len: u32, read: *mut u32) -> i32;
+    fn WinHttpCloseHandle(handle: *mut c_void) -> i32;
+}
+
+/// Hosts the Elgato helper may download from: Elgato's update service (the
+/// asset manifest) and its CDN (the EDID files the manifest lists).
+pub const ALLOWED_HOSTS: &[&str] = &["gc-updates.elgato.com", "edge.elgato.com"];
+
+struct HttpHandle(*mut c_void);
+impl Drop for HttpHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { WinHttpCloseHandle(self.0) };
+        }
+    }
+}
+
+/// HTTPS GET through WinHTTP (system proxy settings, Windows' TLS), allowed
+/// only for [`ALLOWED_HOSTS`]. Fails on a non-200 status or a body larger than
+/// `max_bytes`.
+pub fn https_get(url: &str, max_bytes: usize, timeout_ms: i32) -> Result<Vec<u8>, String> {
+    const ACCESS_AUTOMATIC_PROXY: u32 = 4;
+    const FLAG_SECURE: u32 = 0x0080_0000;
+    const QUERY_STATUS_CODE: u32 = 19;
+    const QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| format!("Refusing a non-HTTPS download: {url}"))?;
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if !ALLOWED_HOSTS.contains(&host.to_ascii_lowercase().as_str()) {
+        return Err(format!(
+            "Refusing a download from {host}: not an Elgato host"
+        ));
+    }
+    let failed = |what: &str| {
+        format!("{what} failed for {url} (Win32 error {})", unsafe {
+            GetLastError()
+        })
+    };
+    unsafe {
+        let agent = wide(concat!("TackleCast/", env!("CARGO_PKG_VERSION")));
+        let session = HttpHandle(WinHttpOpen(
+            agent.as_ptr(),
+            ACCESS_AUTOMATIC_PROXY,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        ));
+        if session.0.is_null() {
+            return Err(failed("WinHttpOpen"));
+        }
+        WinHttpSetTimeouts(session.0, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
+        let connect = HttpHandle(WinHttpConnect(session.0, wide(host).as_ptr(), 443, 0));
+        if connect.0.is_null() {
+            return Err(failed("Connecting"));
+        }
+        let object = wide(format!("/{path}"));
+        let request = HttpHandle(WinHttpOpenRequest(
+            connect.0,
+            wide("GET").as_ptr(),
+            object.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            FLAG_SECURE,
+        ));
+        if request.0.is_null() {
+            return Err(failed("Opening the request"));
+        }
+        if WinHttpSendRequest(request.0, std::ptr::null(), 0, std::ptr::null(), 0, 0, 0) == 0
+            || WinHttpReceiveResponse(request.0, std::ptr::null_mut()) == 0
+        {
+            return Err(failed("The download"));
+        }
+        let mut status = 0u32;
+        let mut len = std::mem::size_of::<u32>() as u32;
+        if WinHttpQueryHeaders(
+            request.0,
+            QUERY_STATUS_CODE | QUERY_FLAG_NUMBER,
+            std::ptr::null(),
+            (&mut status as *mut u32).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            return Err(failed("Reading the response status"));
+        }
+        if status != 200 {
+            return Err(format!("{url} returned HTTP {status}"));
+        }
+        let mut body = Vec::new();
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            let mut read = 0u32;
+            if WinHttpReadData(
+                request.0,
+                chunk.as_mut_ptr().cast(),
+                chunk.len() as u32,
+                &mut read,
+            ) == 0
+            {
+                return Err(failed("Reading the download"));
+            }
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..read as usize]);
+            if body.len() > max_bytes {
+                return Err(format!("{url} is larger than expected"));
+            }
+        }
+        Ok(body)
+    }
+}
+
 /// Lower-case executable names of running processes.
 pub fn running_process_names() -> Vec<String> {
     let mut out = Vec::new();

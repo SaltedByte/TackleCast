@@ -26,10 +26,64 @@ mod platform;
 #[path = "elgato_edid/win.rs"]
 mod win;
 
-const ELGATO_VID: &str = "vid_0fd9";
-/// The 4K X enumerates with a different product ID per USB link speed.
-const PIDS_4KX: &[&str] = &["pid_009b", "pid_009c", "pid_009d"];
+#[cfg(all(target_os = "windows", feature = "elgato-edid"))]
+#[path = "elgato_edid/assets.rs"]
+mod assets;
+
+pub const ELGATO_VENDOR_ID: u16 = 0x0FD9;
+/// The 4K X enumerates with a different product ID per USB link speed. These
+/// are used until Elgato's manifest has been downloaded, and alongside it.
+const FALLBACK_4KX_PIDS: [u16; 3] = [0x009B, 0x009C, 0x009D];
 const DSHOW_PNP_PREFIX: &str = "@device_pnp_";
+
+/// The 4K X's USB product IDs listed in Elgato's asset manifest, so a new
+/// revision is recognized without a TackleCast update.
+pub fn pids_from_manifest(manifest: &[u8]) -> Vec<u16> {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(manifest) else {
+        return Vec::new();
+    };
+    let mut pids = Vec::new();
+    for device in json["hardwareDevices"].as_array().into_iter().flatten() {
+        let id = &device["id"];
+        let named_4kx = device["name"]
+            .as_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case("Game Capture 4K X"));
+        if named_4kx
+            && id["type"] == "usb"
+            && id["vendorId"].as_u64() == Some(u64::from(ELGATO_VENDOR_ID))
+        {
+            if let Some(pid) = id["productId"].as_u64().and_then(|p| u16::try_from(p).ok()) {
+                if !pids.contains(&pid) {
+                    pids.push(pid);
+                }
+            }
+        }
+    }
+    pids
+}
+
+/// Product IDs that identify a 4K X: the built-in ones plus any from the
+/// manifest TackleCast saved last time. Read once per run.
+fn known_4kx_pids() -> &'static [u16] {
+    static PIDS: OnceLock<Vec<u16>> = OnceLock::new();
+    PIDS.get_or_init(|| {
+        let mut pids = FALLBACK_4KX_PIDS.to_vec();
+        let saved = std::env::var_os("LOCALAPPDATA").map(|dir| {
+            PathBuf::from(dir)
+                .join("TackleCast")
+                .join("elgato-edid")
+                .join("device-asset-manifest.json")
+        });
+        if let Some(bytes) = saved.and_then(|path| std::fs::read(path).ok()) {
+            for pid in pids_from_manifest(&bytes) {
+                if !pids.contains(&pid) {
+                    pids.push(pid);
+                }
+            }
+        }
+        pids
+    })
+}
 
 /// `EGAVDS_COLOR_RANGE` values. Studio shows Bypass as "Auto".
 pub const COLOR_RANGES: [(i32, &str); 3] = [
@@ -165,6 +219,9 @@ pub struct Status {
     pub settings: CardSettings,
     #[serde(default)]
     pub signal: Option<Signal>,
+    /// A problem keeping Elgato's EDID list current, e.g. Elgato unreachable.
+    #[serde(default)]
+    pub asset_note: Option<String>,
     /// Elgato Studio is running, so changes are refused.
     pub studio_running: bool,
 }
@@ -256,12 +313,18 @@ fn lock_state() -> std::sync::MutexGuard<'static, State> {
 /// `@device_pnp_\\?\usb#vid_0fd9&pid_009b&mi_00#...#{65e8773d-...}\global`
 /// (TackleCast stores them with `:` replaced by `_`).
 pub fn interface_path(device_id: &str) -> Option<String> {
+    interface_path_for(device_id, known_4kx_pids())
+}
+
+fn interface_path_for(device_id: &str, pids: &[u16]) -> Option<String> {
     let path = device_id.strip_prefix(DSHOW_PNP_PREFIX)?;
     let lower = path.to_ascii_lowercase();
     let is_4kx = lower.starts_with(r"\\?\usb#")
-        && lower.contains(ELGATO_VID)
+        && lower.contains(&format!("vid_{ELGATO_VENDOR_ID:04x}&"))
         && lower.contains("&mi_00")
-        && PIDS_4KX.iter().any(|pid| lower.contains(pid));
+        && pids
+            .iter()
+            .any(|pid| lower.contains(&format!("&pid_{pid:04x}&")));
     is_4kx.then(|| path.to_string())
 }
 
@@ -520,6 +583,29 @@ mod tests {
         ] {
             assert_eq!(interface_path(id), None, "{id}");
         }
+    }
+
+    #[test]
+    fn reads_4k_x_product_ids_from_the_manifest() {
+        let manifest = br#"{"appDevices":[],"hardwareDevices":[
+            {"name":"Game Capture 4K X","id":{"type":"usb","vendorId":4057,"productId":155}},
+            {"name":"Game Capture 4K X","id":{"type":"usb","vendorId":4057,"productId":155,"bcdVersion":304}},
+            {"name":"Game Capture 4K X","id":{"type":"usb","vendorId":4057,"productId":190}},
+            {"name":"Game Capture 4K S","id":{"type":"usb","vendorId":4057,"productId":175}},
+            {"name":"4K Pro","id":{"type":"pci","vendorId":7418,"productId":18}}
+        ]}"#;
+        assert_eq!(pids_from_manifest(manifest), vec![155, 190]);
+        assert!(pids_from_manifest(b"not json").is_empty());
+    }
+
+    #[test]
+    fn a_product_id_from_the_manifest_is_recognized() {
+        let id = r"@device_pnp_\\?\usb#vid_0fd9&pid_00be&mi_00#7&1&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global";
+        assert_eq!(interface_path_for(id, &FALLBACK_4KX_PIDS), None);
+        assert!(interface_path_for(id, &[0x00BE]).is_some());
+        // A product ID must match whole, not as a prefix.
+        let longer = id.replace("pid_00be", "pid_009b0");
+        assert_eq!(interface_path_for(&longer, &FALLBACK_4KX_PIDS), None);
     }
 
     /// A minimal EDID with `extensions` empty extension blocks and valid checksums.

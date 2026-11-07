@@ -947,6 +947,9 @@ fn elgato_sections(
             ui.label(RichText::new("Active:").color(COLOR_TEXT_SECONDARY));
             ui.label(RichText::new(edid_profile_label(&status.active)).strong());
         });
+        if let Some(note) = &status.asset_note {
+            muted_text(ui, note, text_scale);
+        }
         if settings
             .edid_mode
             .is_some_and(|m| m.value != elgato::EDID_MODE_INTERNAL)
