@@ -70,11 +70,16 @@ It also shows whether the HDMI input is HDR. These settings are stored on the ca
 
 Elgato Studio doesn't toggle a preset on the 4K X: it writes a whole EDID file into the card's flash. TackleCast does the same through Studio's own device library, so:
 
-- **Elgato Studio must be installed**, because its device library makes the changes. TackleCast copies that library to `%LOCALAPPDATA%\TackleCast\elgato-edid\` (Windows won't let other apps load it from Studio's folder) and never ships Elgato's files. The Microsoft Store keeps Studio, and so the library, up to date.
+- **Elgato's device library makes the changes**, so TackleCast needs it on the PC; it never ships Elgato's files. It uses, in order:
+  1. the library from an installed **Elgato Studio**, kept up to date by the Microsoft Store;
+  2. otherwise, a copy it **downloads from Elgato**. Without Studio, the menu offers **Download Elgato's device library**: one click, the first time only. TackleCast reads Elgato's current Studio package on `edge.elgato.com` and fetches just the four files it needs (about 5 MB of a 117 MB package), checks each against the package's size and CRC, and accepts the DLLs only with a valid Authenticode signature from Corsair Memory, Inc. (Elgato's parent company). After that it checks Elgato for a newer version once a day.
+  3. if the installed Studio and Elgato's newest package are both incompatible (an update renamed functions TackleCast calls), Studio **2.0.0.3364**, the version TackleCast was tested with. Its files must also match recorded SHA-256 hashes.
+
+  Each library must export every function TackleCast calls before it's used; the menu says which one is in use. Copies live in `%LOCALAPPDATA%\TackleCast\elgato-edid\lib\`, because Windows won't let other apps load DLLs from Studio's folder.
 - **Close Elgato Studio before changing anything.** TackleCast refuses to change the card while Studio holds it.
 - **Writing an EDID stops video and audio for about 20 s** while the card is re-flashed and reconnects; capture restarts by itself. Don't unplug the card until video returns.
 
-**Elgato's EDID list and files come from Elgato.** When a 4K X is selected and the menu reads the card, TackleCast checks Elgato's update service (`gc-updates.elgato.com`, the same one Studio uses) for the current EDID list, at most once a day. It downloads any EDID file the 4K X needs from Elgato's CDN (`edge.elgato.com`). These are the only network requests TackleCast makes; they carry no information about you, and nothing is sent unless a 4K X is selected. Without a connection, TackleCast uses the copy it saved last time, or Studio's. The list also tells TackleCast which USB product IDs belong to a 4K X, so a new revision is recognized without an update.
+**Elgato's EDID list and files come from Elgato.** When a 4K X is selected and the menu reads the card, TackleCast checks Elgato's update service (`gc-updates.elgato.com`, the same one Studio uses) for the current EDID list, at most once a day. It downloads any EDID file the 4K X needs from Elgato's CDN (`edge.elgato.com`). Those, and the library download above once you've agreed to it, are the only network requests TackleCast makes. They go only to Elgato over HTTPS, carry no information about you, and nothing is sent unless a 4K X is selected. Without a connection, TackleCast uses the copy it saved last time, or Studio's. The list also tells TackleCast which USB product IDs belong to a 4K X, so a new revision is recognized without an update.
 
 Every Elgato profile is checked against the SHA-256 in Elgato's EDID list, both when it is downloaded and before it is written. A file you load must be a well-formed EDID (one to four 128-byte blocks, a valid header and a valid checksum on every block); TackleCast keeps a copy in `user-edids\` and lists it next time. After a write, the card is re-read to report the result. Elgato's library runs in a separate helper process, so a fault in it can't take down the viewer.
 
@@ -84,7 +89,7 @@ Every Elgato profile is checked against the SHA-256 in Elgato's EDID list, both 
 .\TackleCast.exe --elgato-edid selftest | Out-String
 ```
 
-It reports whether every library function TackleCast uses is still there, and whether Elgato's EDID list and the 4K X's EDID files are available. The report is also saved as `selftest.txt` in the folder above, and the exit code is 0 when everything passed. Studio's library is private and undocumented, so an update could change it; TackleCast then shows "This Elgato Studio version is not supported" instead of changing the card, and the self-test names the missing functions.
+It reports whether the installed Studio's library still has every function TackleCast uses (naming any that are missing), which library TackleCast will use, and whether Elgato's EDID list and the 4K X's EDID files are available. It reads the DLLs' export tables without loading them. The report is also saved as `selftest.txt` in the folder above, and the exit code is 0 when TackleCast can work with the card. Studio's library is private and undocumented: a Studio update that breaks it makes TackleCast fall back to a downloaded library, as above, and the self-test shows that as a note. To try the download path on a PC that has Studio, set `TACKLECAST_ELGATO_IGNORE_STUDIO=1`.
 
 ## Building from Source
 

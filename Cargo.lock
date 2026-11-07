@@ -3038,6 +3038,7 @@ dependencies = [
  "image",
  "instant",
  "libloading",
+ "miniz_oxide",
  "pollster",
  "serde",
  "serde_json",

@@ -163,15 +163,15 @@ const REGISTRATION_SYMBOLS: &[&str] = &[
     "SWIGRegisterExceptionArgumentCallbacks_EGAVDS",
 ];
 
-/// Load the DLL from `lib_dir` and list the exports TackleCast needs that it
-/// lacks. Doesn't initialize the library or open any device.
+/// List the exports TackleCast needs that the DLL in `lib_dir` lacks. Reads
+/// the DLL's export table from the file, so candidate libraries can be
+/// compared without loading two copies of Elgato's code into one process.
 pub fn missing_exports(lib_dir: &Path) -> Result<Vec<String>, String> {
-    let module =
-        win::with_stdout_muted(|| win::load_library_from(&lib_dir.join("EGAVDeviceSupport.dll")))?;
+    let exports = win::dll_export_names(&lib_dir.join("EGAVDeviceSupport.dll"))?;
     Ok(REGISTRATION_SYMBOLS
         .iter()
         .chain(API_SYMBOLS)
-        .filter(|name| win::proc_address(module, name).is_none())
+        .filter(|name| !exports.iter().any(|e| e == *name))
         .map(|name| name.to_string())
         .collect())
 }

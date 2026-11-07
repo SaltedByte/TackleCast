@@ -342,9 +342,33 @@ impl Drop for HttpHandle {
 /// only for [`ALLOWED_HOSTS`]. Fails on a non-200 status or a body larger than
 /// `max_bytes`.
 pub fn https_get(url: &str, max_bytes: usize, timeout_ms: i32) -> Result<Vec<u8>, String> {
+    https_request(url, None, max_bytes, timeout_ms).map(|(body, _)| body)
+}
+
+/// HTTPS GET of part of a file. `range` is an HTTP byte range such as
+/// `"0-99"` or `"-65536"` (the last 64 KiB). Returns the bytes and the file's
+/// total size from `Content-Range`.
+pub fn https_get_range(
+    url: &str,
+    range: &str,
+    max_bytes: usize,
+    timeout_ms: i32,
+) -> Result<(Vec<u8>, u64), String> {
+    let (body, total) = https_request(url, Some(range), max_bytes, timeout_ms)?;
+    let total = total.ok_or_else(|| format!("{url} ignored the byte range request"))?;
+    Ok((body, total))
+}
+
+fn https_request(
+    url: &str,
+    range: Option<&str>,
+    max_bytes: usize,
+    timeout_ms: i32,
+) -> Result<(Vec<u8>, Option<u64>), String> {
     const ACCESS_AUTOMATIC_PROXY: u32 = 4;
     const FLAG_SECURE: u32 = 0x0080_0000;
     const QUERY_STATUS_CODE: u32 = 19;
+    const QUERY_CUSTOM: u32 = 65535;
     const QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
     let rest = url
         .strip_prefix("https://")
@@ -390,7 +414,13 @@ pub fn https_get(url: &str, max_bytes: usize, timeout_ms: i32) -> Result<Vec<u8>
         if request.0.is_null() {
             return Err(failed("Opening the request"));
         }
-        if WinHttpSendRequest(request.0, std::ptr::null(), 0, std::ptr::null(), 0, 0, 0) == 0
+        let header = range.map(|r| wide(format!("Range: bytes={r}")));
+        let (header_ptr, header_len) = match &header {
+            // Length -1: the header string is NUL-terminated.
+            Some(h) => (h.as_ptr(), u32::MAX),
+            None => (std::ptr::null(), 0),
+        };
+        if WinHttpSendRequest(request.0, header_ptr, header_len, std::ptr::null(), 0, 0, 0) == 0
             || WinHttpReceiveResponse(request.0, std::ptr::null_mut()) == 0
         {
             return Err(failed("The download"));
@@ -408,9 +438,33 @@ pub fn https_get(url: &str, max_bytes: usize, timeout_ms: i32) -> Result<Vec<u8>
         {
             return Err(failed("Reading the response status"));
         }
-        if status != 200 {
+        let expected = if range.is_some() { 206 } else { 200 };
+        if status != expected {
             return Err(format!("{url} returned HTTP {status}"));
         }
+        // "Content-Range: bytes 100-199/12345" carries the file's total size.
+        let total = if range.is_some() {
+            let name = wide("Content-Range");
+            let mut buffer = vec![0u16; 128];
+            let mut len = (buffer.len() * 2) as u32;
+            if WinHttpQueryHeaders(
+                request.0,
+                QUERY_CUSTOM,
+                name.as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                return Err(failed("Reading Content-Range"));
+            }
+            let value = String::from_utf16_lossy(&buffer[..len as usize / 2]);
+            value
+                .rsplit_once('/')
+                .and_then(|(_, total)| total.trim().parse::<u64>().ok())
+        } else {
+            None
+        };
         let mut body = Vec::new();
         let mut chunk = vec![0u8; 64 * 1024];
         loop {
@@ -432,7 +486,215 @@ pub fn https_get(url: &str, max_bytes: usize, timeout_ms: i32) -> Result<Vec<u8>
                 return Err(format!("{url} is larger than expected"));
             }
         }
-        Ok(body)
+        Ok((body, total))
+    }
+}
+
+/// The names a DLL exports, read from its PE export table without loading it.
+pub fn dll_export_names(path: &Path) -> Result<Vec<String>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+    parse_export_names(&bytes).ok_or_else(|| format!("{} isn't a readable DLL", path.display()))
+}
+
+fn parse_export_names(b: &[u8]) -> Option<Vec<String>> {
+    let u16_at = |at: usize| Some(u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?));
+    let u32_at = |at: usize| Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?));
+    if b.get(..2)? != b"MZ" {
+        return None;
+    }
+    let pe = u32_at(0x3C)? as usize;
+    if b.get(pe..pe + 4)? != b"PE\0\0" {
+        return None;
+    }
+    let sections = usize::from(u16_at(pe + 6)?);
+    let optional_size = usize::from(u16_at(pe + 20)?);
+    let optional = pe + 24;
+    // PE32+ (0x20B) has the data directories 16 bytes later than PE32.
+    let directories = match u16_at(optional)? {
+        0x20B => optional + 112,
+        0x10B => optional + 96,
+        _ => return None,
+    };
+    let export_rva = u32_at(directories)?;
+    if export_rva == 0 {
+        return Some(Vec::new());
+    }
+    let section_table = optional + optional_size;
+    let to_offset = |rva: u32| -> Option<usize> {
+        (0..sections).find_map(|i| {
+            let s = section_table + i * 40;
+            let virtual_size = u32_at(s + 8)?;
+            let virtual_address = u32_at(s + 12)?;
+            let raw_size = u32_at(s + 16)?;
+            let raw_pointer = u32_at(s + 20)?;
+            let size = virtual_size.max(raw_size);
+            (rva >= virtual_address && rva < virtual_address + size)
+                .then(|| (rva - virtual_address + raw_pointer) as usize)
+        })
+    };
+    let export = to_offset(export_rva)?;
+    let count = u32_at(export + 24)? as usize;
+    let names = to_offset(u32_at(export + 32)?)?;
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count.min(100_000) {
+        let name = to_offset(u32_at(names + i * 4)?)?;
+        let end = b.get(name..)?.iter().position(|&c| c == 0)?;
+        out.push(String::from_utf8_lossy(&b[name..name + end]).into_owned());
+    }
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
+// Authenticode
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+struct WintrustFileInfo {
+    cb_struct: u32,
+    file_path: *const u16,
+    file: isize,
+    known_subject: *const Guid,
+}
+
+#[repr(C)]
+struct WintrustData {
+    cb_struct: u32,
+    policy_callback_data: *mut c_void,
+    sip_client_data: *mut c_void,
+    ui_choice: u32,
+    revocation_checks: u32,
+    union_choice: u32,
+    file: *mut WintrustFileInfo,
+    state_action: u32,
+    state_data: isize,
+    url_reference: *const u16,
+    prov_flags: u32,
+    ui_context: u32,
+    signature_settings: *mut c_void,
+}
+
+#[repr(C)]
+struct ProviderCert {
+    cb_struct: u32,
+    cert: *const c_void,
+}
+
+#[repr(C)]
+struct ProviderSigner {
+    cb_struct: u32,
+    verify_as_of: [u32; 2],
+    cert_count: u32,
+    certs: *const ProviderCert,
+}
+
+#[repr(C)]
+pub struct Guid(u32, u16, u16, [u8; 8]);
+
+#[link(name = "wintrust")]
+extern "system" {
+    fn WinVerifyTrust(hwnd: isize, action: *const Guid, data: *mut c_void) -> i32;
+    fn WTHelperProvDataFromStateData(state: isize) -> *mut c_void;
+    fn WTHelperGetProvSignerFromChain(
+        provider: *mut c_void,
+        signer: u32,
+        counter_signer: i32,
+        counter_signer_index: u32,
+    ) -> *const ProviderSigner;
+}
+
+#[link(name = "crypt32")]
+extern "system" {
+    fn CertGetNameStringW(
+        cert: *const c_void,
+        kind: u32,
+        flags: u32,
+        type_para: *const c_void,
+        name: *mut u16,
+        len: u32,
+    ) -> u32;
+}
+
+/// Check that `path` carries a valid Authenticode signature that chains to a
+/// trusted root, and return the signer's name (e.g. "Corsair Memory, Inc.").
+pub fn authenticode_signer(path: &Path) -> Result<String, String> {
+    const GENERIC_VERIFY_V2: Guid = Guid(
+        0x00AA_C56B,
+        0xCD44,
+        0x11D0,
+        [0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE],
+    );
+    const UI_NONE: u32 = 2;
+    const REVOKE_NONE: u32 = 0;
+    const CHOICE_FILE: u32 = 1;
+    const STATE_VERIFY: u32 = 1;
+    const STATE_CLOSE: u32 = 2;
+    const NAME_SIMPLE_DISPLAY: u32 = 4;
+    let wide_path = wide(path);
+    let mut file = WintrustFileInfo {
+        cb_struct: std::mem::size_of::<WintrustFileInfo>() as u32,
+        file_path: wide_path.as_ptr(),
+        file: 0,
+        known_subject: std::ptr::null(),
+    };
+    let mut data = WintrustData {
+        cb_struct: std::mem::size_of::<WintrustData>() as u32,
+        policy_callback_data: std::ptr::null_mut(),
+        sip_client_data: std::ptr::null_mut(),
+        ui_choice: UI_NONE,
+        revocation_checks: REVOKE_NONE,
+        union_choice: CHOICE_FILE,
+        file: &mut file,
+        state_action: STATE_VERIFY,
+        state_data: 0,
+        url_reference: std::ptr::null(),
+        prov_flags: 0,
+        ui_context: 0,
+        signature_settings: std::ptr::null_mut(),
+    };
+    unsafe {
+        let status = WinVerifyTrust(
+            -1,
+            &GENERIC_VERIFY_V2,
+            (&mut data as *mut WintrustData).cast(),
+        );
+        let signer = if status == 0 {
+            let provider = WTHelperProvDataFromStateData(data.state_data);
+            let signer = if provider.is_null() {
+                std::ptr::null()
+            } else {
+                WTHelperGetProvSignerFromChain(provider, 0, 0, 0)
+            };
+            if signer.is_null() || (*signer).cert_count == 0 || (*signer).certs.is_null() {
+                Err(format!("{} has no readable signer", path.display()))
+            } else {
+                let cert = (*(*signer).certs).cert;
+                let mut name = vec![0u16; 256];
+                let len = CertGetNameStringW(
+                    cert,
+                    NAME_SIMPLE_DISPLAY,
+                    0,
+                    std::ptr::null(),
+                    name.as_mut_ptr(),
+                    name.len() as u32,
+                );
+                Ok(String::from_utf16_lossy(
+                    &name[..len.saturating_sub(1) as usize],
+                ))
+            }
+        } else {
+            Err(format!(
+                "{} is not validly signed (WinVerifyTrust {:#x})",
+                path.display(),
+                status as u32
+            ))
+        };
+        data.state_action = STATE_CLOSE;
+        WinVerifyTrust(
+            -1,
+            &GENERIC_VERIFY_V2,
+            (&mut data as *mut WintrustData).cast(),
+        );
+        signer
     }
 }
 

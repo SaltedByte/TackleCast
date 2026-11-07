@@ -8,6 +8,7 @@
 
 use super::assets;
 use super::egavds::{EdidInfo, EdidType, Library, Paths};
+use super::library;
 use super::win;
 use super::{validate_edid, Job, Profile, SavedEdid, SettingChange, Status};
 use std::io::Read;
@@ -55,6 +56,7 @@ pub fn run_job(device_path: &str, job: &Job) -> Result<Status, String> {
             let json = serde_json::to_string(change).map_err(|e| e.to_string())?;
             run_helper(&["setting", device_path, &json], None)
         }
+        Job::DownloadLibrary => run_helper(&["download-library", device_path], None),
     }
 }
 
@@ -172,6 +174,7 @@ pub fn handle_helper_args() -> bool {
     let request = match (command.as_str(), argument) {
         _ if device.is_empty() => Err("Missing capture device".to_string()),
         ("status", _) => Ok(None),
+        ("download-library", _) => Ok(Some(Job::DownloadLibrary)),
         ("profile", Some(name)) => Ok(Some(Job::Profile(name))),
         ("file", Some(path)) => Ok(Some(Job::File(PathBuf::from(path)))),
         ("setting", Some(json)) => serde_json::from_str::<SettingChange>(&json)
@@ -189,25 +192,153 @@ pub fn handle_helper_args() -> bool {
     true
 }
 
-/// Find the installed Elgato Studio and copy its device library next to our
-/// data. Returns Studio's install folder and our paths.
-fn prepare() -> Result<(PathBuf, Paths), String> {
-    let studio_dir = win::package_path_for_family(STUDIO_FAMILY)
+/// Set once the user has agreed to download Elgato's library.
+const LIBRARY_CONSENT: &str = "library-consent";
+/// When a downloaded library last checked Elgato for a newer version.
+const LIBRARY_CHECKED: &str = "library-checked";
+const LIBRARY_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+struct Prepared {
+    paths: Paths,
+    /// Which library is in use, e.g. "Elgato Studio 2.0.0.3364 (installed)".
+    library: String,
+    /// Why a fallback library is in use, if one is.
+    note: Option<String>,
+}
+
+/// The installed Elgato Studio's folder, unless `TACKLECAST_ELGATO_IGNORE_STUDIO`
+/// is set (for testing the download path on a PC that has Studio).
+fn installed_studio() -> Option<PathBuf> {
+    if std::env::var_os("TACKLECAST_ELGATO_IGNORE_STUDIO").is_some() {
+        return None;
+    }
+    win::package_path_for_family(STUDIO_FAMILY)
         .filter(|dir| dir.join("EGAVDeviceSupport.dll").is_file())
-        .ok_or(
-            "Elgato Studio is not installed. TackleCast uses Studio's device library for the \
-             card's settings, so install Studio.",
-        )?;
+}
+
+fn compatible(lib_dir: &Path) -> bool {
+    super::egavds::missing_exports(lib_dir).is_ok_and(|missing| missing.is_empty())
+}
+
+/// Choose Elgato's device library, in order: the installed Studio's; a copy
+/// downloaded from Elgato before; Elgato's newest package; the pinned
+/// known-good version. Each must have every function TackleCast calls.
+/// Downloads only happen once the user has agreed (`download_now` records that
+/// agreement); until then a missing library returns [`super::LIBRARY_MISSING`].
+fn prepare(download_now: bool) -> Result<Prepared, String> {
     let data_dir = data_dir()?;
-    let paths = Paths {
-        lib_dir: data_dir
-            .join("lib")
-            .join(studio_dir.file_name().unwrap_or_default()),
-        edid_dir: data_dir.join("EDIDFiles"),
-        data_dir,
+    let lib_root = data_dir.join("lib");
+    let make = |lib_dir: PathBuf, library: String, note: Option<String>| Prepared {
+        paths: Paths {
+            lib_dir,
+            edid_dir: data_dir.join("EDIDFiles"),
+            data_dir: data_dir.clone(),
+        },
+        library,
+        note,
     };
-    copy_studio_libs(&studio_dir, &paths.lib_dir)?;
-    Ok((studio_dir, paths))
+    let mut problems = Vec::new();
+
+    if let Some(studio_dir) = installed_studio() {
+        let name = studio_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let version = name.split('_').nth(1).unwrap_or("?").to_string();
+        let lib_dir = lib_root.join(&name);
+        copy_studio_libs(&studio_dir, &lib_dir)?;
+        if compatible(&lib_dir) {
+            return Ok(make(
+                lib_dir,
+                format!("Elgato Studio {version} (installed)"),
+                None,
+            ));
+        }
+        problems.push(format!(
+            "the installed Elgato Studio {version} isn't compatible with this TackleCast"
+        ));
+    } else {
+        problems.push("Elgato Studio isn't installed".to_string());
+    }
+
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| format!("Cannot create {}: {e}", data_dir.display()))?;
+    let consent = data_dir.join(LIBRARY_CONSENT);
+    if download_now {
+        std::fs::write(&consent, b"")
+            .map_err(|e| format!("Cannot write {}: {e}", consent.display()))?;
+    }
+    let downloaded = |dir: PathBuf, version: &str, problems: &[String]| {
+        make(
+            dir,
+            format!("Elgato's device library {version} (downloaded from Elgato)"),
+            Some(format!(
+                "Using Elgato's device library {version} from Elgato because {}.",
+                problems.join(" and ")
+            )),
+        )
+    };
+    let existing = library::installed(&lib_root).filter(|(_, dir)| compatible(dir));
+    if !consent.is_file() {
+        if let Some((version, dir)) = existing {
+            return Ok(downloaded(dir, &version, &problems));
+        }
+        return Err(format!(
+            "{}{}.",
+            super::LIBRARY_MISSING,
+            capitalize(&problems.join(" and "))
+        ));
+    }
+
+    // With consent: keep a downloaded library current, at most once a day.
+    let stamp = data_dir.join(LIBRARY_CHECKED);
+    let due = std::fs::metadata(&stamp)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+        .is_none_or(|age| age > LIBRARY_CHECK_INTERVAL);
+    if existing.is_none() || due || download_now {
+        let _ = std::fs::write(&stamp, b"");
+        match library::latest_package() {
+            Ok((version, url))
+                if existing
+                    .as_ref()
+                    .is_none_or(|(have, _)| library::is_newer(&version, have)) =>
+            {
+                match library::download(&lib_root, &version, &url) {
+                    Ok(dir) if compatible(&dir) => return Ok(downloaded(dir, &version, &problems)),
+                    Ok(_) => problems.push(format!(
+                        "Elgato's newest library ({version}) isn't compatible with this TackleCast"
+                    )),
+                    Err(error) => problems.push(error),
+                }
+            }
+            Ok(_) => {}
+            Err(error) => problems.push(error),
+        }
+    }
+    if let Some((version, dir)) = existing {
+        return Ok(downloaded(dir, &version, &problems));
+    }
+    let (version, url) = library::pinned_package();
+    match library::download(&lib_root, &version, &url) {
+        Ok(dir) if compatible(&dir) => return Ok(downloaded(dir, &version, &problems)),
+        Ok(_) => problems.push(format!("the known-good library {version} isn't compatible")),
+        Err(error) => problems.push(error),
+    }
+    Err(format!(
+        "Couldn't get a compatible copy of Elgato's device library: {}.",
+        problems.join("; ")
+    ))
+}
+
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 fn studio_temp_dir() -> PathBuf {
@@ -220,7 +351,13 @@ fn studio_temp_dir() -> PathBuf {
 }
 
 fn run(device_path: &str, job: Option<Job>) -> Result<Status, String> {
-    let (_, paths) = prepare()?;
+    // Downloading the library only fetches files; then report the card.
+    let (job, download_now) = match job {
+        Some(Job::DownloadLibrary) => (None, true),
+        other => (other, false),
+    };
+    let prepared = prepare(download_now)?;
+    let paths = prepared.paths;
     let studio_running = studio_running();
     if job.is_some() && studio_running {
         return Err(
@@ -243,7 +380,11 @@ fn run(device_path: &str, job: Option<Job>) -> Result<Status, String> {
         }
     };
     run_on_card(device_path, job, &paths, &assets.manifest, studio_running).map(|mut status| {
-        status.asset_note = assets.note;
+        status.asset_note = match (prepared.note, assets.note) {
+            (Some(a), Some(b)) => Some(format!("{a} {b}")),
+            (a, b) => a.or(b),
+        };
+        status.library = Some(prepared.library);
         status
     })
 }
@@ -264,7 +405,8 @@ fn run_on_card(
         let mut all = vec![dev.default_edid()?];
         all.extend(dev.custom_edids()?);
         let file = match job {
-            None => return status(&dev, &all, paths, studio_running),
+            // `run` turns a library download into a plain status read.
+            None | Some(Job::DownloadLibrary) => return status(&dev, &all, paths, studio_running),
             Some(Job::Setting(change)) => {
                 dev.apply(&change)?;
                 return status(&dev, &all, paths, false);
@@ -327,6 +469,7 @@ fn status(
         settings: dev.settings(),
         signal: dev.signal(),
         asset_note: None,
+        library: None,
         studio_running,
     })
 }
@@ -466,78 +609,112 @@ fn copy_studio_libs(studio_dir: &Path, lib_dir: &Path) -> Result<(), String> {
 }
 
 /// `TackleCast.exe --elgato-edid selftest`: check, without touching any card,
-/// that the installed Elgato Studio's library still has every function
-/// TackleCast calls and that Elgato's EDID list and files are available.
-/// Prints a report (pipe it, e.g. `| Out-String`, since TackleCast is a GUI
-/// app), saves it as `selftest.txt`, and returns the exit code.
+/// whether the installed Elgato Studio's library still has every function
+/// TackleCast calls, which library TackleCast will use, and that Elgato's EDID
+/// list and files are available. Prints a report (pipe it, e.g. `| Out-String`,
+/// since TackleCast is a GUI app), saves it as `selftest.txt`, and returns the
+/// exit code: 0 when TackleCast can work with the card.
 fn selftest() -> i32 {
-    let mut lines = Vec::new();
-    let mut ok = true;
-    let mut check = |passed: bool, text: String| {
-        ok &= passed;
-        lines.push(format!("{} {text}", if passed { "OK  " } else { "FAIL" }));
-    };
-    match prepare() {
-        Err(error) => check(false, error),
-        Ok((studio_dir, paths)) => {
-            check(
-                true,
-                format!(
-                    "Elgato Studio found: {}",
-                    studio_dir.file_name().unwrap_or_default().to_string_lossy()
-                ),
-            );
-            match super::egavds::missing_exports(&paths.lib_dir) {
-                Ok(missing) if missing.is_empty() => check(
-                    true,
-                    "EGAVDeviceSupport.dll has every function TackleCast uses".into(),
-                ),
-                Ok(missing) => check(
-                    false,
+    #[derive(PartialEq)]
+    enum Line {
+        Ok,
+        Fail,
+        Note,
+    }
+    let mut lines: Vec<(Line, String)> = Vec::new();
+
+    // The installed Studio, reported on its own: a problem here is what a
+    // breaking Studio update looks like, even when a fallback covers it.
+    match installed_studio() {
+        None => lines.push((Line::Note, "Elgato Studio isn't installed".into())),
+        Some(studio_dir) => {
+            let name = studio_dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            match super::egavds::missing_exports(&studio_dir) {
+                Ok(missing) if missing.is_empty() => lines.push((
+                    Line::Ok,
+                    format!("Elgato Studio {name} has every function TackleCast uses"),
+                )),
+                Ok(missing) => lines.push((
+                    Line::Note,
                     format!(
-                        "EGAVDeviceSupport.dll is missing {} function(s) TackleCast uses: {}",
+                        "Elgato Studio {name} is missing {} function(s) TackleCast uses: {}",
                         missing.len(),
                         missing.join(", ")
                     ),
+                )),
+                Err(error) => lines.push((Line::Note, error)),
+            }
+        }
+    }
+
+    let mut data_dir = None;
+    match prepare(false) {
+        Err(error) => lines.push((
+            Line::Fail,
+            match error.strip_prefix(super::LIBRARY_MISSING) {
+                Some(reason) => format!(
+                    "{reason} Open TackleCast's Video menu with the 4K X selected and choose \
+                     Download Elgato's device library."
                 ),
-                Err(error) => check(false, error),
+                None => error,
+            },
+        )),
+        Ok(prepared) => {
+            let paths = prepared.paths;
+            lines.push((Line::Ok, format!("Library in use: {}", prepared.library)));
+            if let Some(note) = prepared.note {
+                lines.push((Line::Note, note));
             }
             match assets::sync(&paths.data_dir, &paths.edid_dir, &studio_temp_dir(), true) {
                 Ok(found) => {
-                    check(true, format!("Elgato's EDID list: {}", found.source));
-                    check(
-                        found.edids_needed > 0 && found.edids_ok == found.edids_needed,
+                    lines.push((Line::Ok, format!("Elgato's EDID list: {}", found.source)));
+                    let all = found.edids_needed > 0 && found.edids_ok == found.edids_needed;
+                    lines.push((
+                        if all { Line::Ok } else { Line::Fail },
                         format!(
                             "4K X EDID files present and verified: {} of {}",
                             found.edids_ok, found.edids_needed
                         ),
-                    );
+                    ));
                     if let Some(note) = found.note {
-                        lines.push(format!("NOTE {note}"));
+                        lines.push((Line::Note, note));
                     }
                 }
-                Err(error) => check(false, error),
+                Err(error) => lines.push((Line::Fail, error)),
             }
-            let report = lines.join("\r\n") + "\r\n";
-            let _ = std::fs::write(paths.data_dir.join("selftest.txt"), &report);
+            data_dir = Some(paths.data_dir);
         }
+    }
+
+    let passed = !lines.iter().any(|(kind, _)| *kind == Line::Fail);
+    let mut report: String = lines
+        .iter()
+        .map(|(kind, text)| {
+            let tag = match kind {
+                Line::Ok => "OK  ",
+                Line::Fail => "FAIL",
+                Line::Note => "NOTE",
+            };
+            format!("{tag} {text}\r\n")
+        })
+        .collect();
+    report.push_str(if passed {
+        "Self-test passed.\r\n"
+    } else {
+        "Self-test FAILED.\r\n"
+    });
+    if let Some(dir) = data_dir {
+        let _ = std::fs::write(dir.join("selftest.txt"), &report);
     }
     use std::io::Write;
     let mut out = std::io::stdout().lock();
-    for line in &lines {
-        let _ = writeln!(out, "{line}");
-    }
-    let _ = writeln!(
-        out,
-        "{}",
-        if ok {
-            "Self-test passed."
-        } else {
-            "Self-test FAILED."
-        }
-    );
+    let _ = out.write_all(report.as_bytes());
     let _ = out.flush();
-    if ok {
+    if passed {
         0
     } else {
         1

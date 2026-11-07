@@ -29,6 +29,19 @@ mod win;
 #[cfg(all(target_os = "windows", feature = "elgato-edid"))]
 #[path = "elgato_edid/assets.rs"]
 mod assets;
+#[cfg(all(target_os = "windows", feature = "elgato-edid"))]
+#[path = "elgato_edid/library.rs"]
+mod library;
+
+/// Prefix of the error the helper returns when Elgato's device library isn't
+/// on this PC and the user hasn't yet agreed to download it. The menu then
+/// offers the download.
+pub const LIBRARY_MISSING: &str = "[elgato-library-missing] ";
+
+/// The reason Elgato's library is missing, if `message` is that error.
+pub fn library_missing(message: &str) -> Option<&str> {
+    message.strip_prefix(LIBRARY_MISSING)
+}
 
 pub const ELGATO_VENDOR_ID: u16 = 0x0FD9;
 /// The 4K X enumerates with a different product ID per USB link speed. These
@@ -222,6 +235,9 @@ pub struct Status {
     /// A problem keeping Elgato's EDID list current, e.g. Elgato unreachable.
     #[serde(default)]
     pub asset_note: Option<String>,
+    /// Which Elgato library is in use, e.g. "Elgato Studio 2.0.0.3364 (installed)".
+    #[serde(default)]
+    pub library: Option<String>,
     /// Elgato Studio is running, so changes are refused.
     pub studio_running: bool,
 }
@@ -235,12 +251,15 @@ pub enum Job {
     File(PathBuf),
     /// Change a setting. Takes a second or two; the card stays connected.
     Setting(SettingChange),
+    /// Download Elgato's device library from Elgato (the user agreed to it),
+    /// then read the card.
+    DownloadLibrary,
 }
 
 impl Job {
     /// EDID writes re-flash the card, which disconnects it.
     pub fn pauses_capture(&self) -> bool {
-        !matches!(self, Job::Setting(_))
+        matches!(self, Job::Profile(_) | Job::File(_))
     }
 
     pub fn describe(&self) -> String {
@@ -251,6 +270,7 @@ impl Job {
                 path.file_name().unwrap_or_default().to_string_lossy()
             ),
             Job::Setting(change) => change.summary(),
+            Job::DownloadLibrary => "Elgato's device library".to_string(),
         }
     }
 }
@@ -476,6 +496,13 @@ pub fn take_finished_job() -> Option<FinishedJob> {
             Ok(format!("Switched to \"{}\".", status.active.name))
         }
         (Ok(_), Job::Setting(change)) => Ok(format!("Set {}.", change.summary())),
+        (Ok(status), Job::DownloadLibrary) => Ok(format!(
+            "Ready: using {}.",
+            status
+                .library
+                .as_deref()
+                .unwrap_or("Elgato's device library")
+        )),
         (Err(message), _) => Err(message.clone()),
     };
     match &result {
@@ -665,6 +692,17 @@ mod tests {
         assert!(Job::Profile("Game Capture 4K X".into()).pauses_capture());
         assert!(Job::File("custom.bin".into()).pauses_capture());
         assert!(!Job::Setting(SettingChange::ColorRange(1)).pauses_capture());
+        assert!(!Job::DownloadLibrary.pauses_capture());
+    }
+
+    #[test]
+    fn recognizes_the_library_missing_error() {
+        let message = format!("{LIBRARY_MISSING}Elgato Studio isn't installed.");
+        assert_eq!(
+            library_missing(&message),
+            Some("Elgato Studio isn't installed.")
+        );
+        assert_eq!(library_missing("OpenDevice failed"), None);
     }
 
     #[test]

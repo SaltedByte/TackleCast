@@ -809,17 +809,41 @@ fn elgato_sections(
                     );
                     ctx.request_repaint_after(Duration::from_millis(250));
                 }
+                View::Busy(busy) if busy.label == Job::DownloadLibrary.describe() => {
+                    muted_text(
+                        ui,
+                        &format!(
+                            "Downloading Elgato's device library from Elgato ({}s)…",
+                            busy.elapsed.as_secs()
+                        ),
+                        text_scale,
+                    );
+                    ctx.request_repaint_after(Duration::from_millis(250));
+                }
                 View::Busy(busy) => {
                     muted_text(ui, &format!("Applying {}…", busy.label), text_scale);
                     ctx.request_repaint_after(Duration::from_millis(100));
                 }
-                View::Error(message) => {
-                    warning_text(ui, &message, text_scale);
-                    if ui.small_button("Retry").clicked() {
-                        elgato::refresh(device);
-                        ctx.request_repaint();
+                View::Error(message) => match elgato::library_missing(&message) {
+                    Some(reason) => {
+                        warning_text(ui, reason, text_scale);
+                        muted_text(
+                            ui,
+                            "TackleCast changes the 4K X through Elgato's own device library, which comes with Elgato Studio. It can download just that library from Elgato instead (about 5 MB, signed by Corsair). Nothing is installed, and it updates itself afterwards.",
+                            text_scale,
+                        );
+                        if styled_button(ui, "Download Elgato's device library").clicked() {
+                            output.elgato_job = Some((device.to_string(), Job::DownloadLibrary));
+                        }
                     }
-                }
+                    None => {
+                        warning_text(ui, &message, text_scale);
+                        if ui.small_button("Retry").clicked() {
+                            elgato::refresh(device);
+                            ctx.request_repaint();
+                        }
+                    }
+                },
                 View::Ready(_) => {}
             });
             return;
@@ -949,6 +973,9 @@ fn elgato_sections(
         });
         if let Some(note) = &status.asset_note {
             muted_text(ui, note, text_scale);
+        }
+        if let Some(library) = &status.library {
+            muted_text(ui, &format!("Elgato library: {library}"), text_scale);
         }
         if settings
             .edid_mode
