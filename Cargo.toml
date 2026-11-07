@@ -52,8 +52,10 @@ windows = { version = "0.58", features = [
 ] }
 
 [features]
-default = ["gpu-decode"]
+default = ["gpu-decode", "elgato-edid"]
 gpu-decode = ["dep:libloading"]
+# Switch an Elgato 4K X's EDID from the Video tab (Windows, needs Elgato Studio installed).
+elgato-edid = []
 
 [profile.release]
 opt-level = 3
