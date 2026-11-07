@@ -131,6 +131,18 @@ impl SettingChange {
             Self::HdrTonemapping(_) => "HDR tone mapping",
         }
     }
+
+    /// The setting and its new value, e.g. "Input EDID mode: Internal (the card's EDID)".
+    pub fn summary(&self) -> String {
+        let value = match *self {
+            Self::ColorRange(v) => label_for(&COLOR_RANGES, v),
+            Self::EdidMode(v) => label_for(&EDID_MODES, v),
+            Self::AudioInput(v) => label_for(&AUDIO_INPUTS, v),
+            Self::LineInGain(v) => v.to_string(),
+            Self::HdrTonemapping(on) => if on { "on" } else { "off" }.to_string(),
+        };
+        format!("{}: {value}", self.label())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -169,7 +181,7 @@ impl Job {
                 "\"{}\"",
                 path.file_name().unwrap_or_default().to_string_lossy()
             ),
-            Job::Setting(change) => change.label().to_string(),
+            Job::Setting(change) => change.summary(),
         }
     }
 }
@@ -388,7 +400,7 @@ pub fn take_finished_job() -> Option<FinishedJob> {
         (Ok(status), Job::Profile(_) | Job::File(_)) => {
             Ok(format!("Switched to \"{}\".", status.active.name))
         }
-        (Ok(_), Job::Setting(change)) => Ok(format!("{} updated.", change.label())),
+        (Ok(_), Job::Setting(change)) => Ok(format!("Set {}.", change.summary())),
         (Err(message), _) => Err(message.clone()),
     };
     match &result {
@@ -555,6 +567,18 @@ mod tests {
         assert!(Job::Profile("Game Capture 4K X".into()).pauses_capture());
         assert!(Job::File("custom.bin".into()).pauses_capture());
         assert!(!Job::Setting(SettingChange::ColorRange(1)).pauses_capture());
+    }
+
+    #[test]
+    fn setting_summaries_name_the_new_value() {
+        assert_eq!(
+            SettingChange::EdidMode(0).summary(),
+            "Input EDID mode: Internal (the card's EDID)"
+        );
+        assert_eq!(
+            SettingChange::HdrTonemapping(false).summary(),
+            "HDR tone mapping: off"
+        );
     }
 
     #[test]

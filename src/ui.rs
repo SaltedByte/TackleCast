@@ -62,6 +62,9 @@ struct EdidUi {
     file_error: Option<String>,
     /// Line-in gain while the slider is being dragged.
     gain_draft: Option<i64>,
+    /// An Input EDID mode waiting for confirmation: changing it makes the
+    /// console renegotiate HDMI, which can blank the picture.
+    pending_edid_mode: Option<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -861,7 +864,28 @@ fn elgato_sections(
                 if let Some(v) =
                     card_setting_combo(ui, "Input EDID mode", choice, &elgato::EDID_MODES)
                 {
-                    job = Some(Job::Setting(SettingChange::EdidMode(v)));
+                    edid.pending_edid_mode = Some(v);
+                }
+                if let Some(v) = edid.pending_edid_mode.filter(|v| *v != choice.value) {
+                    warning_text(
+                        ui,
+                        &format!(
+                            "Switch to {}? The console renegotiates HDMI, and the picture on TackleCast and the pass-through monitor can go black. If it does, undock and redock the console (or replug its HDMI cable).",
+                            elgato::label_for(&elgato::EDID_MODES, v)
+                        ),
+                        text_scale,
+                    );
+                    ui.horizontal(|ui| {
+                        if styled_button(ui, "Change mode").clicked() {
+                            job = Some(Job::Setting(SettingChange::EdidMode(v)));
+                            edid.pending_edid_mode = None;
+                        }
+                        if styled_button(ui, "Cancel").clicked() {
+                            edid.pending_edid_mode = None;
+                        }
+                    });
+                } else {
+                    edid.pending_edid_mode = None;
                 }
             }
             if let Some(choice) = settings.audio_input {
@@ -975,7 +999,7 @@ fn elgato_sections(
         if edid.confirming && can_write {
             warning_text(
                 ui,
-                "The card is re-flashed and disconnects for about 20 s, so video and audio stop. Don't unplug it until video returns.",
+                "The card is re-flashed and disconnects for about 20 s, so video and audio stop. Don't unplug it until video returns. If the picture stays black afterwards, undock and redock the console.",
                 text_scale,
             );
             ui.horizontal(|ui| {

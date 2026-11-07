@@ -60,7 +60,7 @@ When an **Elgato 4K X** is selected, the Video tab adds two sections with the ca
 | Setting | Options |
 |---|---|
 | HDMI color range | Auto, Expand (limited to full), Shrink (full to limited). This is the card's own conversion, separate from TackleCast's **Color Range**, which only sets how the picture is interpreted. |
-| Input EDID mode | Internal (the card's EDID), Display (the pass-through monitor's EDID), Merged |
+| Input EDID mode | Internal (the card's EDID), Display (the pass-through monitor's EDID), Merged. Asks for confirmation: the console renegotiates HDMI, and the picture on TackleCast and a pass-through monitor can stay black until you undock and redock the console (or replug its HDMI cable). |
 | Audio input | HDMI audio, Analog line in, plus line-in gain |
 | HDR tone mapping | Convert HDR input to SDR on the card |
 
