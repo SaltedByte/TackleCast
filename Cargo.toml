@@ -39,6 +39,7 @@ windows = { version = "0.58", features = [
   "Win32_System_Com_StructuredStorage",
   "Win32_System_Diagnostics_Debug",
   "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
   "Win32_System_Power",
   "Win32_System_Variant",
   "Win32_Devices_FunctionDiscovery",

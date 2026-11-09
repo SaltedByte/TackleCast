@@ -118,6 +118,9 @@ impl Renderer {
         gamma: f32,
     ) -> Result<Self, RenderError> {
         let size = window.inner_size();
+        #[cfg(target_os = "windows")]
+        crate::dxgi_compat::ensure_dxgi_compatibility();
+
         // Prefer DX12 on Windows so that CUDA ↔ DX12 zero-copy interop works.
         // Fall back to all backends if DX12 isn't available.
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {

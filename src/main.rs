@@ -7,6 +7,8 @@ mod color;
 mod devices;
 #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
 mod dx12_interop;
+#[cfg(target_os = "windows")]
+mod dxgi_compat;
 mod frame_rate;
 #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
 mod gpu_decode;
