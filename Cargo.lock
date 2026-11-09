@@ -3025,7 +3025,7 @@ dependencies = [
 
 [[package]]
 name = "tacklecast"
-version = "2.2.1"
+version = "2.2.2"
 dependencies = [
  "bytemuck",
  "cc",
