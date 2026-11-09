@@ -17,6 +17,8 @@ mod render;
 mod settings;
 mod triple_buffer;
 mod ui;
+#[cfg(target_os = "windows")]
+mod vsr_interop;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

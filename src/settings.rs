@@ -126,6 +126,8 @@ pub enum ScaleFilter {
     Bicubic,
     Lanczos,
     Fsr1,
+    #[serde(rename = "rtx_vsr", alias = "vsr")]
+    RtxVsr,
 }
 
 impl ScaleFilter {
@@ -137,11 +139,18 @@ impl ScaleFilter {
             Self::Bicubic => 1,
             Self::Lanczos => 2,
             Self::Fsr1 => 3,
+            Self::RtxVsr => 4,
         }
     }
 
     /// Every variant, in menu order.
-    pub const ALL: [Self; 4] = [Self::Bilinear, Self::Bicubic, Self::Lanczos, Self::Fsr1];
+    pub const ALL: [Self; 5] = [
+        Self::Bilinear,
+        Self::Bicubic,
+        Self::Lanczos,
+        Self::Fsr1,
+        Self::RtxVsr,
+    ];
 }
 
 impl Display for ScaleFilter {
@@ -151,6 +160,7 @@ impl Display for ScaleFilter {
             Self::Bicubic => f.write_str("Bicubic"),
             Self::Lanczos => f.write_str("Lanczos"),
             Self::Fsr1 => f.write_str("FSR 1.0"),
+            Self::RtxVsr => f.write_str("RTX VSR"),
         }
     }
 }
@@ -576,5 +586,11 @@ mod tests {
         assert_eq!(restored.scaling_filter, ScaleFilter::Fsr1);
         assert_eq!(restored.brightness, 0.1);
         assert_eq!(restored.sharpness, 1.0);
+
+        for alias in ["rtx_vsr", "vsr"] {
+            let s: Settings =
+                serde_json::from_str(&format!(r#"{{"scaling_filter":"{alias}"}}"#)).unwrap();
+            assert_eq!(s.scaling_filter, ScaleFilter::RtxVsr);
+        }
     }
 }

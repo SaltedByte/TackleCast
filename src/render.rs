@@ -33,17 +33,31 @@ pub enum ActiveScaleFilter {
     Fsr1,
     Fsr1FallbackBilinear,
     Fsr1FallbackDirect,
+    RtxVsr,
+    RtxVsrFallbackFsr1,
+    RtxVsrFallbackBilinear,
+    RtxVsrFallbackDirect,
 }
 
 impl Display for ActiveScaleFilter {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl ActiveScaleFilter {
+    pub const fn label(self) -> &'static str {
         match self {
-            Self::Bilinear => f.write_str("Bilinear"),
-            Self::Bicubic => f.write_str("Bicubic"),
-            Self::Lanczos => f.write_str("Lanczos"),
-            Self::Fsr1 => f.write_str("FSR 1.0"),
-            Self::Fsr1FallbackBilinear => f.write_str("Bilinear (FSR fallback: <1x)"),
-            Self::Fsr1FallbackDirect => f.write_str("Direct 1:1 (FSR fallback)"),
+            Self::Bilinear => "Bilinear",
+            Self::Bicubic => "Bicubic",
+            Self::Lanczos => "Lanczos",
+            Self::Fsr1 => "FSR 1.0",
+            Self::Fsr1FallbackBilinear => "Bilinear (FSR fallback: <1x)",
+            Self::Fsr1FallbackDirect => "Direct 1:1 (FSR fallback)",
+            Self::RtxVsr => "RTX VSR",
+            Self::RtxVsrFallbackFsr1 => "FSR 1.0 (RTX VSR fallback)",
+            Self::RtxVsrFallbackBilinear => "Bilinear (RTX VSR fallback: <1x)",
+            Self::RtxVsrFallbackDirect => "Direct 1:1 (RTX VSR fallback)",
         }
     }
 }
@@ -74,6 +88,10 @@ pub struct Renderer {
     egui_renderer: EguiRenderer,
     upscale_pipelines: Option<UpscalePipelines>,
     upscale_textures: Option<UpscaleTextures>,
+    #[cfg(target_os = "windows")]
+    vsr_context: Option<crate::vsr_interop::VsrContext>,
+    #[cfg(target_os = "windows")]
+    vsr_init_attempted: bool,
     // Reusable scratch buffers to avoid per-frame allocations
     pad_scratch: Vec<u8>,
     nv12_u_scratch: Vec<u8>,
@@ -279,6 +297,7 @@ impl Renderer {
             ScaleFilter::Bicubic => ActiveScaleFilter::Bicubic,
             ScaleFilter::Lanczos => ActiveScaleFilter::Lanczos,
             ScaleFilter::Fsr1 => ActiveScaleFilter::Fsr1,
+            ScaleFilter::RtxVsr => ActiveScaleFilter::RtxVsr,
         };
 
         Ok(Self {
@@ -310,6 +329,10 @@ impl Renderer {
             egui_renderer,
             upscale_pipelines: None,
             upscale_textures: None,
+            #[cfg(target_os = "windows")]
+            vsr_context: None,
+            #[cfg(target_os = "windows")]
+            vsr_init_attempted: false,
             pad_scratch: Vec::new(),
             nv12_u_scratch: Vec::new(),
             nv12_v_scratch: Vec::new(),
@@ -331,13 +354,32 @@ impl Renderer {
         self.size = size;
         self.config.width = size.width;
         self.config.height = size.height;
+
+        // Drain in-flight GPU work and release shared upscale textures before
+        // DXGI swapchain buffer resizing to prevent NvPresent64 presentation faults.
+        self.device.poll(wgpu::Maintain::Wait);
+        self.upscale_textures = None;
+        #[cfg(target_os = "windows")]
+        if let Some(vsr) = &mut self.vsr_context {
+            vsr.resources = None;
+        }
+
         self.surface.configure(&self.device, &self.config);
     }
 
     pub fn set_scale_filter(&mut self, filter: ScaleFilter) {
         self.scale_filter = filter;
-        if filter != ScaleFilter::Fsr1 {
+        if !matches!(filter, ScaleFilter::Fsr1 | ScaleFilter::RtxVsr) {
             self.upscale_textures = None;
+        }
+        #[cfg(target_os = "windows")]
+        if filter != ScaleFilter::RtxVsr {
+            if let Some(vsr) = &mut self.vsr_context {
+                if vsr.resources.is_some() {
+                    self.device.poll(wgpu::Maintain::Wait);
+                    vsr.resources = None;
+                }
+            }
         }
     }
 
@@ -351,14 +393,7 @@ impl Renderer {
     }
 
     pub fn active_scale_filter_label(&self) -> &'static str {
-        match self.active_scale_filter {
-            ActiveScaleFilter::Bilinear => "Bilinear",
-            ActiveScaleFilter::Bicubic => "Bicubic",
-            ActiveScaleFilter::Lanczos => "Lanczos",
-            ActiveScaleFilter::Fsr1 => "FSR 1.0",
-            ActiveScaleFilter::Fsr1FallbackBilinear => "Bilinear (FSR fallback: <1x)",
-            ActiveScaleFilter::Fsr1FallbackDirect => "Direct 1:1 (FSR fallback)",
-        }
+        self.active_scale_filter.label()
     }
 
     pub fn set_picture_settings(
@@ -644,6 +679,12 @@ impl Renderer {
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                self.device.poll(wgpu::Maintain::Wait);
+                self.upscale_textures = None;
+                #[cfg(target_os = "windows")]
+                if let Some(vsr) = &mut self.vsr_context {
+                    vsr.resources = None;
+                }
                 self.surface.configure(&self.device, &self.config);
                 // Flush any staged write_texture/write_buffer calls so they
                 // don't accumulate when we can't present.
@@ -714,25 +755,18 @@ impl Renderer {
                 .resolve_space(self.color_space, video_frame.height);
             let resolved_range = self.source_color.resolve_range(self.color_range);
 
-            if self.scale_filter == ScaleFilter::Fsr1 && is_upscaling {
-                self.active_scale_filter = ActiveScaleFilter::Fsr1;
-
+            if matches!(self.scale_filter, ScaleFilter::Fsr1 | ScaleFilter::RtxVsr) && is_upscaling
+            {
                 let out_w = viewport.width.round().max(1.0) as u32;
                 let out_h = viewport.height.round().max(1.0) as u32;
 
-                Self::ensure_upscale_resources(
-                    &self.device,
-                    &self.video_bind_group_layout,
-                    self.surface_format,
-                    &mut self.upscale_pipelines,
-                    &mut self.upscale_textures,
-                    video_frame.width,
-                    video_frame.height,
-                    out_w,
-                    out_h,
-                );
-                let pipelines = self.upscale_pipelines.as_ref().unwrap();
-                let textures = self.upscale_textures.as_ref().unwrap();
+                if self.upscale_pipelines.is_none() {
+                    self.upscale_pipelines = Some(Self::create_upscale_pipelines(
+                        &self.device,
+                        &self.video_bind_group_layout,
+                        self.surface_format,
+                    ));
+                }
 
                 // Pass 1: YUV -> RGB native resolution texture with picture adjustments
                 let yuv_uniforms = VideoUniforms {
@@ -750,97 +784,223 @@ impl Renderer {
                 self.queue
                     .write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&yuv_uniforms));
 
-                let easu_con = calculate_easu_constants(
-                    video_frame.width as f32,
-                    video_frame.height as f32,
-                    out_w as f32,
-                    out_h as f32,
-                );
-                self.queue
-                    .write_buffer(&pipelines.easu_uniforms, 0, bytemuck::bytes_of(&easu_con));
-
                 let rcas_con = RcasConstants::new(self.sharpness, out_w as f32, out_h as f32);
-                self.queue
-                    .write_buffer(&pipelines.rcas_uniforms, 0, bytemuck::bytes_of(&rcas_con));
+                self.queue.write_buffer(
+                    &self.upscale_pipelines.as_ref().unwrap().rcas_uniforms,
+                    0,
+                    bytemuck::bytes_of(&rcas_con),
+                );
 
-                // Pass 1: YUV -> RGB native resolution texture
-                {
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("tacklecast-fsr-yuv-to-rgb-pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &textures.native_rgb_view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(CLEAR_COLOR),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                    });
-                    pass.set_pipeline(&pipelines.yuv_to_rgb_pipeline);
-                    pass.set_bind_group(0, &video_frame.bind_group, &[]);
-                    pass.set_viewport(
-                        0.0,
-                        0.0,
+                let mut vsr_ran = false;
+                #[cfg(target_os = "windows")]
+                if self.scale_filter == ScaleFilter::RtxVsr {
+                    if !self.vsr_init_attempted {
+                        self.vsr_init_attempted = true;
+                        self.vsr_context = crate::vsr_interop::VsrContext::try_new(&self.device);
+                    }
+
+                    let pipelines = self.upscale_pipelines.as_ref().unwrap();
+                    if let Some(vsr_ctx) = &mut self.vsr_context {
+                        if vsr_ctx
+                            .ensure_resources(
+                                &self.device,
+                                &pipelines.rcas_bind_group_layout,
+                                &pipelines.rcas_uniforms,
+                                video_frame.width,
+                                video_frame.height,
+                                out_w,
+                                out_h,
+                            )
+                            .is_some()
+                        {
+                            let mut pass1_encoder = self.device.create_command_encoder(
+                                &wgpu::CommandEncoderDescriptor {
+                                    label: Some("tacklecast-vsr-yuv-to-rgb-encoder"),
+                                },
+                            );
+                            {
+                                let vsr_res = vsr_ctx.resources.as_ref().unwrap();
+                                let mut pass =
+                                    pass1_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                        label: Some("tacklecast-vsr-yuv-to-rgb-pass"),
+                                        color_attachments: &[Some(
+                                            wgpu::RenderPassColorAttachment {
+                                                view: &vsr_res.input_view,
+                                                resolve_target: None,
+                                                ops: wgpu::Operations {
+                                                    load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                                                    store: wgpu::StoreOp::Store,
+                                                },
+                                            },
+                                        )],
+                                        depth_stencil_attachment: None,
+                                        timestamp_writes: None,
+                                        occlusion_query_set: None,
+                                    });
+                                pass.set_pipeline(&pipelines.yuv_to_rgb_pipeline);
+                                pass.set_bind_group(0, &video_frame.bind_group, &[]);
+                                pass.set_viewport(
+                                    0.0,
+                                    0.0,
+                                    video_frame.width as f32,
+                                    video_frame.height as f32,
+                                    0.0,
+                                    1.0,
+                                );
+                                pass.draw(0..6, 0..1);
+                            }
+                            // Submit Pass 1 before signaling the DX12->D3D11 fence.
+                            self.queue.submit(std::iter::once(pass1_encoder.finish()));
+
+                            if vsr_ctx.execute_upscale() {
+                                let vsr_res = vsr_ctx.resources.as_ref().unwrap();
+                                let mut pass =
+                                    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                        label: Some("tacklecast-vsr-rcas-surface-pass"),
+                                        color_attachments: &[Some(
+                                            wgpu::RenderPassColorAttachment {
+                                                view: &view,
+                                                resolve_target: None,
+                                                ops: wgpu::Operations {
+                                                    load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                                                    store: wgpu::StoreOp::Store,
+                                                },
+                                            },
+                                        )],
+                                        depth_stencil_attachment: None,
+                                        timestamp_writes: None,
+                                        occlusion_query_set: None,
+                                    });
+                                pass.set_pipeline(&pipelines.rcas_pipeline);
+                                pass.set_bind_group(0, &vsr_res.rcas_bind_group, &[]);
+                                pass.set_viewport(
+                                    viewport.x,
+                                    viewport.y,
+                                    viewport.width.max(1.0),
+                                    viewport.height.max(1.0),
+                                    0.0,
+                                    1.0,
+                                );
+                                pass.draw(0..6, 0..1);
+                                self.active_scale_filter = ActiveScaleFilter::RtxVsr;
+                                vsr_ran = true;
+                            }
+                        }
+                    }
+                }
+
+                if !vsr_ran {
+                    self.active_scale_filter = if self.scale_filter == ScaleFilter::RtxVsr {
+                        ActiveScaleFilter::RtxVsrFallbackFsr1
+                    } else {
+                        ActiveScaleFilter::Fsr1
+                    };
+
+                    Self::ensure_upscale_resources(
+                        &self.device,
+                        &self.video_bind_group_layout,
+                        self.surface_format,
+                        &mut self.upscale_pipelines,
+                        &mut self.upscale_textures,
+                        video_frame.width,
+                        video_frame.height,
+                        out_w,
+                        out_h,
+                    );
+                    let pipelines = self.upscale_pipelines.as_ref().unwrap();
+                    let textures = self.upscale_textures.as_ref().unwrap();
+
+                    let easu_con = calculate_easu_constants(
                         video_frame.width as f32,
                         video_frame.height as f32,
-                        0.0,
-                        1.0,
+                        out_w as f32,
+                        out_h as f32,
                     );
-                    pass.draw(0..6, 0..1);
-                }
-
-                // Pass 2: EASU upscale pass
-                {
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("tacklecast-fsr-easu-pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &textures.easu_output_view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(CLEAR_COLOR),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                    });
-                    pass.set_pipeline(&pipelines.easu_pipeline);
-                    pass.set_bind_group(0, &textures.easu_bind_group, &[]);
-                    pass.set_viewport(0.0, 0.0, out_w as f32, out_h as f32, 0.0, 1.0);
-                    pass.draw(0..6, 0..1);
-                }
-
-                // Pass 3: RCAS sharpening pass onto surface view with letterbox clear
-                {
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("tacklecast-fsr-rcas-surface-pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(CLEAR_COLOR),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                    });
-                    pass.set_pipeline(&pipelines.rcas_pipeline);
-                    pass.set_bind_group(0, &textures.rcas_bind_group, &[]);
-                    pass.set_viewport(
-                        viewport.x,
-                        viewport.y,
-                        viewport.width.max(1.0),
-                        viewport.height.max(1.0),
-                        0.0,
-                        1.0,
+                    self.queue.write_buffer(
+                        &pipelines.easu_uniforms,
+                        0,
+                        bytemuck::bytes_of(&easu_con),
                     );
-                    pass.draw(0..6, 0..1);
+
+                    // Pass 1: YUV -> RGB native resolution texture
+                    {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("tacklecast-fsr-yuv-to-rgb-pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &textures.native_rgb_view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                        });
+                        pass.set_pipeline(&pipelines.yuv_to_rgb_pipeline);
+                        pass.set_bind_group(0, &video_frame.bind_group, &[]);
+                        pass.set_viewport(
+                            0.0,
+                            0.0,
+                            video_frame.width as f32,
+                            video_frame.height as f32,
+                            0.0,
+                            1.0,
+                        );
+                        pass.draw(0..6, 0..1);
+                    }
+
+                    // Pass 2: EASU upscale pass
+                    {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("tacklecast-fsr-easu-pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &textures.easu_output_view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                        });
+                        pass.set_pipeline(&pipelines.easu_pipeline);
+                        pass.set_bind_group(0, &textures.easu_bind_group, &[]);
+                        pass.set_viewport(0.0, 0.0, out_w as f32, out_h as f32, 0.0, 1.0);
+                        pass.draw(0..6, 0..1);
+                    }
+
+                    // Pass 3: RCAS sharpening pass onto surface view with letterbox clear
+                    {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("tacklecast-fsr-rcas-surface-pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                        });
+                        pass.set_pipeline(&pipelines.rcas_pipeline);
+                        pass.set_bind_group(0, &textures.rcas_bind_group, &[]);
+                        pass.set_viewport(
+                            viewport.x,
+                            viewport.y,
+                            viewport.width.max(1.0),
+                            viewport.height.max(1.0),
+                            0.0,
+                            1.0,
+                        );
+                        pass.draw(0..6, 0..1);
+                    }
                 }
             } else {
                 self.active_scale_filter = match self.scale_filter {
@@ -854,10 +1014,17 @@ impl Renderer {
                             ActiveScaleFilter::Fsr1FallbackBilinear
                         }
                     }
+                    ScaleFilter::RtxVsr => {
+                        if is_equal {
+                            ActiveScaleFilter::RtxVsrFallbackDirect
+                        } else {
+                            ActiveScaleFilter::RtxVsrFallbackBilinear
+                        }
+                    }
                 };
 
                 let filter_mode = match self.scale_filter {
-                    ScaleFilter::Fsr1 => 0,
+                    ScaleFilter::Fsr1 | ScaleFilter::RtxVsr => 0,
                     other => other.as_u32(),
                 };
 
@@ -910,6 +1077,7 @@ impl Renderer {
                 ScaleFilter::Bicubic => ActiveScaleFilter::Bicubic,
                 ScaleFilter::Lanczos => ActiveScaleFilter::Lanczos,
                 ScaleFilter::Fsr1 => ActiveScaleFilter::Fsr1,
+                ScaleFilter::RtxVsr => ActiveScaleFilter::RtxVsr,
             };
 
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1959,7 +2127,7 @@ fn decode_yuv_to_rgb(uv: vec2<f32>) -> vec3<f32> {
 
     var rgb: vec3<f32>;
 
-    // Color space matrix
+    // Color space matrix and gamut conversion
     // uniforms.color_space: 0u = Rec.709, 1u = BT.601, 2u = BT.2020
     if uniforms.color_space == 0u {
         // Rec. 709 (BT.709)

@@ -45,7 +45,10 @@ windows = { version = "0.58", features = [
   "Win32_System_Threading",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D11",
   "Win32_Graphics_Direct3D12",
+  "Win32_Graphics_Dxgi",
   "Win32_Graphics_Dxgi_Common",
   "Win32_Graphics_Gdi",
   "Win32_Security",
@@ -58,3 +61,4 @@ gpu-decode = ["dep:libloading"]
 [profile.release]
 opt-level = 3
 lto = "thin"
+

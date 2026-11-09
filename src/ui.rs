@@ -407,7 +407,10 @@ fn draw_menu(
                                                     &mut draft.scaling_filter,
                                                 );
                                             });
-                                            if draft.scaling_filter == ScaleFilter::Fsr1 {
+                                            if matches!(
+                                                draft.scaling_filter,
+                                                ScaleFilter::Fsr1 | ScaleFilter::RtxVsr
+                                            ) {
                                                 output.slider_active |= picture_slider(
                                                     ui,
                                                     "Sharpness",
