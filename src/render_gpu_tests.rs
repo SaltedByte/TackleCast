@@ -81,15 +81,17 @@ fn gpu_shader_color_and_picture_reference() {
         filtering: device.create_sampler(&wgpu::SamplerDescriptor::default()),
         nearest: device.create_sampler(&wgpu::SamplerDescriptor::default()),
     };
-    // Golden values: limited black/white, full black/white, BT.709 red and
-    // BT.601 red, plus isolated neutral/default and picture-adjustment checks.
+    // Golden values: limited black/white, full black/white, BT.709 red, BT.601 red
+    // (converted to Rec. 709 primaries), BT.2020 white, plus isolated neutral/default
+    // and picture-adjustment checks.
     let cases = [
         ([16, 128, 128], 0, 0, [0.0, 1.0, 1.0, 1.0], [0, 0, 0]),
         ([235, 128, 128], 0, 0, [0.0, 1.0, 1.0, 1.0], [255, 255, 255]),
         ([0, 128, 128], 1, 0, [0.0, 1.0, 1.0, 1.0], [0, 0, 0]),
         ([255, 128, 128], 1, 0, [0.0, 1.0, 1.0, 1.0], [255, 255, 255]),
         ([63, 102, 240], 0, 0, [0.0, 1.0, 1.0, 1.0], [255, 0, 0]),
-        ([81, 90, 240], 0, 1, [0.0, 1.0, 1.0, 1.0], [254, 0, 0]),
+        ([81, 90, 240], 0, 1, [0.0, 1.0, 1.0, 1.0], [247, 41, 0]),
+        ([235, 128, 128], 0, 2, [0.0, 1.0, 1.0, 1.0], [255, 255, 255]),
         ([128, 128, 128], 1, 0, [0.0, 1.0, 1.0, 1.0], [128, 128, 128]),
         ([128, 128, 128], 1, 0, [0.1, 1.0, 1.0, 1.0], [154, 154, 154]),
         ([63, 102, 240], 0, 0, [0.0, 1.0, 0.0, 1.0], [54, 54, 54]),
@@ -523,4 +525,160 @@ fn gpu_fsr_rcas_neutral_and_strong_reference() {
         );
     }
     readback_buffer.unmap();
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "requires an NVIDIA RTX GPU with DX12/D3D11 VSR support"]
+fn gpu_rtx_vsr_interop_upscale_reference() {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::DX12,
+        ..Default::default()
+    });
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    }))
+    .expect("A DX12 adapter is required for this test");
+    let (device, queue) =
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+            .unwrap();
+
+    let mut vsr = crate::vsr_interop::VsrContext::try_new(&device)
+        .expect("NVIDIA RTX VSR should initialize on an RTX GPU");
+
+    let video_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("vsr-test-video-layout"),
+            entries: &[
+                texture_layout_entry(0),
+                texture_layout_entry(1),
+                texture_layout_entry(2),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+    let pipelines = Renderer::create_upscale_pipelines(
+        &device,
+        &video_bind_group_layout,
+        wgpu::TextureFormat::Bgra8Unorm,
+    );
+
+    let in_w = 128u32;
+    let in_h = 128u32;
+    let out_w = 256u32;
+    let out_h = 256u32;
+
+    assert!(vsr
+        .ensure_resources(
+            &device,
+            &pipelines.rcas_bind_group_layout,
+            &pipelines.rcas_uniforms,
+            in_w,
+            in_h,
+            out_w,
+            out_h,
+        )
+        .is_some());
+
+    // Render a bright green clear into input_view via wgpu (DX12)
+    let mut pass1 = device.create_command_encoder(&Default::default());
+    {
+        let res = vsr.resources.as_ref().unwrap();
+        let _pass = pass1.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("vsr-test-clear-input"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &res.input_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.0,
+                        g: 1.0,
+                        b: 0.0,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+    }
+    queue.submit([pass1.finish()]);
+
+    assert!(
+        vsr.execute_upscale(),
+        "RTX VSR execute_upscale must succeed"
+    );
+
+    let res = vsr.resources.as_ref().unwrap();
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("vsr-test-readback"),
+        size: (out_w * 4 * out_h) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut copy_enc = device.create_command_encoder(&Default::default());
+    copy_enc.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &res.output_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(out_w * 4),
+                rows_per_image: Some(out_h),
+            },
+        },
+        wgpu::Extent3d {
+            width: out_w,
+            height: out_h,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit([copy_enc.finish()]);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    readback
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+    device.poll(wgpu::Maintain::Wait);
+    rx.recv().unwrap().unwrap();
+    let data = readback.slice(..).get_mapped_range();
+    // Center pixel of the 256x256 output should be bright green ([0, ~255, 0])
+    let center = ((out_h / 2) * (out_w * 4) + (out_w / 2) * 4) as usize;
+    let r = data[center];
+    let g = data[center + 1];
+    let b = data[center + 2];
+    assert!(
+        g > 240 && r < 15 && b < 15,
+        "Upscaled output pixel should be bright green, got RGB=({r}, {g}, {b})"
+    );
 }

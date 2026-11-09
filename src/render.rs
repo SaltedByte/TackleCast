@@ -1969,19 +1969,33 @@ fn decode_yuv_to_rgb(uv: vec2<f32>) -> vec3<f32> {
             y + 1.8556 * cb,
         );
     } else if uniforms.color_space == 1u {
-        // BT.601
+        // BT.601 (SMPTE-C primaries converted to display Rec. 709 / sRGB)
         rgb = vec3<f32>(
             y + 1.402 * cr,
             y - 0.344136 * cb - 0.714136 * cr,
             y + 1.772 * cb,
         );
+        let lin = pow(max(rgb, vec3<f32>(0.0)), vec3<f32>(2.2));
+        let lin_709 = vec3<f32>(
+            0.939542 * lin.r + 0.050181 * lin.g + 0.010277 * lin.b,
+            0.017772 * lin.r + 0.965793 * lin.g + 0.016435 * lin.b,
+            -0.001622 * lin.r - 0.004370 * lin.g + 1.005992 * lin.b,
+        );
+        rgb = pow(max(lin_709, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
     } else {
-        // BT.2020
+        // BT.2020 (Wide Color Gamut primaries converted to display Rec. 709 / sRGB)
         rgb = vec3<f32>(
             y + 1.4746 * cr,
             y - 0.164553 * cb - 0.571353 * cr,
             y + 1.8814 * cb,
         );
+        let lin = pow(max(rgb, vec3<f32>(0.0)), vec3<f32>(2.2));
+        let lin_709 = vec3<f32>(
+            1.660491 * lin.r - 0.587641 * lin.g - 0.072850 * lin.b,
+            -0.124550 * lin.r + 1.132900 * lin.g - 0.008349 * lin.b,
+            -0.018151 * lin.r - 0.100579 * lin.g + 1.118730 * lin.b,
+        );
+        rgb = pow(max(lin_709, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
     }
 
     return rgb;
