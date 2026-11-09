@@ -794,6 +794,7 @@ impl Renderer {
                     bytemuck::bytes_of(&rcas_con),
                 );
 
+                #[allow(unused_mut)]
                 let mut vsr_ran = false;
                 #[cfg(target_os = "windows")]
                 if self.scale_filter == ScaleFilter::RtxVsr {

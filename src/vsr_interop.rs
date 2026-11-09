@@ -8,8 +8,6 @@
 //! Zero external DLLs are required, zero CPU copies occur per frame, and no
 //! resources are allocated until the user selects `ScaleFilter::RtxVsr`.
 
-#![cfg(target_os = "windows")]
-
 use std::ffi::c_void;
 use tracing::{debug, info, warn};
 use wgpu::hal::api::Dx12;

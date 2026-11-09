@@ -1,5 +1,3 @@
-#![cfg(target_os = "windows")]
-
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::info;
 use windows::core::{s, w, GUID, HRESULT};
@@ -75,7 +73,10 @@ fn compute_prologue_len(code: &[u8]) -> Option<usize> {
                 offset += 6;
             }
             // mov [rsp + imm8], reg (0x89 0x5C 0x24 imm8 or 0x89 modrm with SIB)
-            0x89 if offset + 3 < code.len() && code[offset + 1] == 0x5C && code[offset + 2] == 0x24 => {
+            0x89 if offset + 3 < code.len()
+                && code[offset + 1] == 0x5C
+                && code[offset + 2] == 0x24 =>
+            {
                 offset += 4;
             }
             // mov reg, reg or mov reg, [reg] (0x8B modrm)
@@ -168,11 +169,7 @@ pub fn ensure_dxgi_compatibility() {
         *tramp_jmp.add(4) = 0x00;
         *tramp_jmp.add(5) = 0x00;
         let ret_addr = (p_func as usize + orig_len) as u64;
-        std::ptr::copy_nonoverlapping(
-            &ret_addr as *const u64 as *const u8,
-            tramp_jmp.add(6),
-            8,
-        );
+        std::ptr::copy_nonoverlapping(&ret_addr as *const u64 as *const u8, tramp_jmp.add(6), 8);
 
         TRAMPOLINE.store(p_tramp as usize, Ordering::Release);
 
@@ -216,4 +213,3 @@ pub fn ensure_dxgi_compatibility() {
         }
     });
 }
-
