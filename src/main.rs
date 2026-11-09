@@ -7,6 +7,8 @@ mod color;
 mod devices;
 #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
 mod dx12_interop;
+#[cfg(target_os = "windows")]
+mod dxgi_compat;
 mod frame_rate;
 #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
 mod gpu_decode;
@@ -17,6 +19,8 @@ mod render;
 mod settings;
 mod triple_buffer;
 mod ui;
+#[cfg(target_os = "windows")]
+mod vsr_interop;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -407,6 +411,7 @@ impl ApplicationHandler<AppEvent> for App {
         let renderer = match pollster::block_on(Renderer::new(
             window.clone(),
             self.settings.scaling_filter,
+            self.settings.sharpness,
             self.settings.color_space,
             self.settings.color_range,
             self.settings.brightness,
@@ -428,8 +433,8 @@ impl ApplicationHandler<AppEvent> for App {
         self.ui = Some(ui);
         self.window = Some(window);
 
-        self.start_capture();
         self.start_audio();
+        self.start_capture();
 
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -551,6 +556,7 @@ impl ApplicationHandler<AppEvent> for App {
                         );
                         renderer.set_color_settings(live.color_space, live.color_range);
                         renderer.set_scale_filter(live.scaling_filter);
+                        renderer.set_sharpness(live.sharpness);
                     }
                     self.next_ui_redraw =
                         Instant::now().checked_add(prepared_ui.output.repaint_after);
@@ -722,14 +728,13 @@ impl App {
 
         let mute_changed = old_settings.audio_muted != self.settings.audio_muted;
 
-        if video_changed {
-            if let Some(capture) = &mut self.capture {
-                capture.stop();
-            }
-            self.start_capture();
-        }
-
+        let was_dshow = self.audio.directshow_sink().is_some();
         if audio_device_changed {
+            if was_dshow {
+                if let Some(mut capture) = self.capture.take() {
+                    capture.stop();
+                }
+            }
             self.audio.stop();
             self.start_audio();
         } else {
@@ -740,9 +745,18 @@ impl App {
                 self.audio.set_muted(self.settings.audio_muted);
             }
         }
+        let now_dshow = self.audio.directshow_sink().is_some();
+
+        if video_changed || (audio_device_changed && (was_dshow || now_dshow)) {
+            if let Some(mut capture) = self.capture.take() {
+                capture.stop();
+            }
+            self.start_capture();
+        }
 
         if let Some(renderer) = &mut self.renderer {
             renderer.set_scale_filter(self.settings.scaling_filter);
+            renderer.set_sharpness(self.settings.sharpness);
             renderer.set_color_settings(self.settings.color_space, self.settings.color_range);
             renderer.set_picture_settings(
                 self.settings.brightness,
@@ -775,6 +789,12 @@ impl App {
                 .as_ref()
                 .map(Renderer::scale_filter)
                 .unwrap_or(self.settings.scaling_filter),
+            filter_label: self
+                .renderer
+                .as_ref()
+                .map(Renderer::active_scale_filter_label)
+                .map(str::to_string)
+                .unwrap_or_else(|| self.settings.scaling_filter.to_string()),
             color_space: self.settings.color_space,
             color_range: self.settings.color_range,
             color_info: self
@@ -871,6 +891,7 @@ impl App {
                     #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
                     shared_gpu_handles,
                 },
+                audio_sink: self.audio.directshow_sink(),
             },
             self.event_proxy.clone(),
         ));
@@ -902,6 +923,7 @@ impl App {
                     alternate_formats,
                     force_format,
                 },
+                audio_sink: None,
             },
             self.event_proxy.clone(),
         ));

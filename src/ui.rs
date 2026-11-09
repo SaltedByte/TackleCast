@@ -56,6 +56,7 @@ pub struct OverlayInfo {
     pub height: Option<u32>,
     pub fps: Option<f32>,
     pub filter: ScaleFilter,
+    pub filter_label: String,
     pub color_space: ColorSpace,
     pub color_range: ColorRange,
     pub active_format: Option<String>,
@@ -165,6 +166,7 @@ impl UiState {
                 overlay.color_space = self.draft_settings.color_space;
                 overlay.color_range = self.draft_settings.color_range;
                 overlay.filter = self.draft_settings.scaling_filter;
+                overlay.filter_label = self.draft_settings.scaling_filter.to_string();
             }
             draw_overlay(ctx, &overlay);
         });
@@ -295,7 +297,7 @@ fn draw_menu(
         .show(ctx, |ui| {
             Frame::new()
                 .fill(menu_background())
-                .stroke(Stroke::new(1.0, COLOR_MENU_BORDER))
+                .stroke(Stroke::new(1.0_f32, COLOR_MENU_BORDER))
                 .corner_radius(CornerRadius::same(12))
                 .inner_margin(Margin::same(18))
                 .show(ui, |ui| {
@@ -405,6 +407,19 @@ fn draw_menu(
                                                     &mut draft.scaling_filter,
                                                 );
                                             });
+                                            if matches!(
+                                                draft.scaling_filter,
+                                                ScaleFilter::Fsr1 | ScaleFilter::RtxVsr
+                                            ) {
+                                                output.slider_active |= picture_slider(
+                                                    ui,
+                                                    "Sharpness",
+                                                    &mut draft.sharpness,
+                                                    0.0..=2.0,
+                                                    0.05,
+                                                    text_scale,
+                                                );
+                                            }
                                             // Color overrides affect the active picture immediately.
                                             color_space_combo(
                                                 ui,
@@ -467,17 +482,31 @@ fn draw_menu(
                                     }
                                     MenuTab::Audio => {
                                         card_section(ui, "DEVICE ROUTING", text_scale, |ui| {
+                                            let dshow_option = if cfg!(target_os = "windows")
+                                                && !draft.video_device.is_empty()
+                                            {
+                                                Some(format!(
+                                                    "DirectShow: {}",
+                                                    crate::devices::video_device_label(
+                                                        &draft.video_device
+                                                    )
+                                                ))
+                                            } else {
+                                                None
+                                            };
                                             labeled_audio_combo(
                                                 ui,
                                                 "Input Device",
                                                 &mut draft.audio_input,
                                                 frame.audio_inputs,
+                                                dshow_option.as_deref(),
                                             );
                                             labeled_audio_combo(
                                                 ui,
                                                 "Output Device",
                                                 &mut draft.audio_output,
                                                 frame.audio_outputs,
+                                                None,
                                             );
                                         });
                                         card_section(ui, "PLAYBACK VOLUME", text_scale, |ui| {
@@ -770,13 +799,21 @@ fn labeled_audio_combo(
     label: &str,
     selected: &mut i32,
     devices: &[AudioDevice],
+    dshow_option: Option<&str>,
 ) {
     ui.label(RichText::new(label).color(COLOR_TEXT_SECONDARY));
     ComboBox::from_id_salt(label)
         .width(ui.available_width())
-        .selected_text(audio_device_name(*selected, devices))
+        .selected_text(audio_device_name(*selected, devices, dshow_option))
         .show_ui(ui, |ui| {
             ui.selectable_value(selected, -1, "Default");
+            if let Some(dshow_label) = dshow_option {
+                ui.selectable_value(
+                    selected,
+                    crate::devices::DIRECTSHOW_AUDIO_INDEX,
+                    dshow_label,
+                );
+            }
             for device in devices {
                 ui.selectable_value(selected, device.index, device.name.clone());
             }
@@ -902,7 +939,12 @@ fn display_or_default(value: &str) -> String {
     }
 }
 
-fn audio_device_name(index: i32, devices: &[AudioDevice]) -> String {
+fn audio_device_name(index: i32, devices: &[AudioDevice], dshow_option: Option<&str>) -> String {
+    if index == crate::devices::DIRECTSHOW_AUDIO_INDEX {
+        return dshow_option
+            .unwrap_or("DirectShow: Capture Device")
+            .to_string();
+    }
     if index < 0 {
         return "Default".to_string();
     }
@@ -939,7 +981,7 @@ fn overlay_text(overlay: &OverlayInfo) -> Option<String> {
             if overlay.detailed {
                 format!(
                     "{width}x{height}{fmt_suffix}\n{} | {} {}\n{fps:.1} delivered FPS",
-                    overlay.filter,
+                    overlay.filter_label,
                     overlay.color_info.space_label(overlay.color_space, height),
                     overlay.color_info.range_label(overlay.color_range)
                 )

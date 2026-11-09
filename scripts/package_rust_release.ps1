@@ -101,6 +101,16 @@ try {
         }
     }
 
+    # Ensure postproc-*.dll is always bundled when available in the FFmpeg installation
+    # (required on Windows when avcodec or avfilter dynamically link against it)
+    $postprocMatches = Get-ChildItem -Path $ffmpegBin -Filter "postproc-*.dll" -File
+    if (-not $postprocMatches -and (Test-Path "C:\ffmpeg\bin\postproc-*.dll")) {
+        $postprocMatches = Get-ChildItem -Path "C:\ffmpeg\bin" -Filter "postproc-*.dll" -File
+    }
+    foreach ($dll in $postprocMatches) {
+        Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $outDir $dll.Name)
+    }
+
     # nvJPEG + CUDA runtime, so GPU decode works on a machine without the CUDA
     # Toolkit installed. Without these the app still runs, but silently falls
     # back to software decode - which defeats the point of testing the GPU path.
@@ -115,6 +125,15 @@ try {
         $searchDirs = New-Object System.Collections.Generic.List[string]
         if ($CudaDllDir) { $searchDirs.Add($CudaDllDir) }
         if ($env:GPU_RUNTIME_DIR) { $searchDirs.Add($env:GPU_RUNTIME_DIR) }
+        if (Test-Path -LiteralPath (Join-Path $root ".deps\gpu-runtime")) {
+            $searchDirs.Add((Join-Path $root ".deps\gpu-runtime"))
+        }
+        if (Test-Path -LiteralPath (Join-Path $distRoot "TackleCast-v2.2.1")) {
+            $searchDirs.Add((Join-Path $distRoot "TackleCast-v2.2.1"))
+        }
+        if (Test-Path -LiteralPath (Join-Path $distRoot "TackleCast-Windows-x86_64")) {
+            $searchDirs.Add((Join-Path $distRoot "TackleCast-Windows-x86_64"))
+        }
         if ($env:CUDA_PATH) {
             $searchDirs.Add((Join-Path $env:CUDA_PATH "bin\x64"))
             $searchDirs.Add((Join-Path $env:CUDA_PATH "bin"))

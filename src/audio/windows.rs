@@ -2,7 +2,8 @@ use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{Device, Host, StreamConfig, SupportedStreamConfig};
 use tracing::{info, warn};
 
-use crate::devices::AudioDevice;
+use crate::audio::common::ResolvedInput;
+use crate::devices::{AudioDevice, DIRECTSHOW_AUDIO_INDEX};
 
 const CAPTURE_KEYWORDS: &[&str] = &[
     "capture",
@@ -33,16 +34,29 @@ pub fn preferred_audio_host() -> Host {
 }
 
 /// Resolves the audio input device for capture, with multi-stage fallback:
-/// 1. If explicit input_index is provided and valid, use that device.
-/// 2. If matching video device name finds a capture audio endpoint, use that.
-/// 3. If any audio input matches known capture keywords ("Digital Audio", "USB Audio", etc.), use that.
-/// 4. Fall back to host default input device.
+/// 1. If DIRECTSHOW_AUDIO_INDEX is selected, use DirectShow audio from the active video device.
+/// 2. If explicit input_index is provided and valid, use that device.
+/// 3. If matching video device name finds a capture audio endpoint, use that.
+/// 4. If any audio input matches known capture keywords ("Digital Audio", "USB Audio", etc.), use that.
+/// 5. If a video capture device is active, try DirectShow audio from that device.
+/// 6. Fall back to host default input device.
 pub fn resolve_input_device(
     host: &Host,
     input_index: i32,
     video_device_name: &str,
     inputs: &[AudioDevice],
-) -> Result<Device, String> {
+) -> Result<ResolvedInput, String> {
+    if input_index == DIRECTSHOW_AUDIO_INDEX {
+        if video_device_name.is_empty() {
+            return Err("no video capture device selected for DirectShow audio".to_string());
+        }
+        info!(
+            "selected DirectShow audio input from video device '{}'",
+            video_device_name
+        );
+        return Ok(ResolvedInput::DirectShow(video_device_name.to_string()));
+    }
+
     // 1. Try explicit index
     if input_index >= 0 {
         if let Some(device) = resolve_device_by_index(host, input_index, Direction::Input) {
@@ -51,7 +65,7 @@ pub fn resolve_input_device(
                 "resolved audio input by saved index {}: '{}'",
                 input_index, name
             );
-            return Ok(device);
+            return Ok(ResolvedInput::Device(device));
         }
         warn!(
             "saved audio input index {} is no longer available; searching for capture device",
@@ -67,7 +81,7 @@ pub fn resolve_input_device(
                 "auto-detected capture card audio input {} ('{}') matching video '{}'",
                 index, name, video_device_name
             );
-            return Ok(device);
+            return Ok(ResolvedInput::Device(device));
         }
     }
 
@@ -81,14 +95,24 @@ pub fn resolve_input_device(
                     "matched generic capture card audio input {} ('{}')",
                     device_info.index, device_info.name
                 );
-                return Ok(device);
+                return Ok(ResolvedInput::Device(device));
             }
         }
     }
 
-    // 4. Fall back to default input
+    // 4. Try DirectShow audio from the active video capture device
+    if !video_device_name.is_empty() {
+        info!(
+            "no WASAPI capture input matched '{}'; using DirectShow audio from video device",
+            video_device_name
+        );
+        return Ok(ResolvedInput::DirectShow(video_device_name.to_string()));
+    }
+
+    // 5. Fall back to default input
     warn!("no capture-card audio device auto-detected; falling back to default system input");
     host.default_input_device()
+        .map(ResolvedInput::Device)
         .ok_or_else(|| "no default audio input device found on the system".to_string())
 }
 

@@ -2,6 +2,7 @@ use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{Device, Host, StreamConfig, SupportedStreamConfig};
 use tracing::{info, warn};
 
+use crate::audio::common::ResolvedInput;
 use crate::devices::AudioDevice;
 
 const CAPTURE_KEYWORDS: &[&str] = &[
@@ -35,7 +36,7 @@ pub fn resolve_input_device(
     input_index: i32,
     video_device_name: &str,
     inputs: &[AudioDevice],
-) -> Result<Device, String> {
+) -> Result<ResolvedInput, String> {
     if input_index >= 0 {
         if let Some(device) = resolve_device_by_index(host, input_index, Direction::Input) {
             let name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
@@ -43,7 +44,7 @@ pub fn resolve_input_device(
                 "resolved audio input by saved index {}: '{}'",
                 input_index, name
             );
-            return Ok(device);
+            return Ok(ResolvedInput::Device(device));
         }
         warn!(
             "saved audio input index {} is no longer available; searching for capture device",
@@ -58,7 +59,7 @@ pub fn resolve_input_device(
                 "auto-detected capture card audio input {} ('{}') matching video '{}'",
                 index, name, video_device_name
             );
-            return Ok(device);
+            return Ok(ResolvedInput::Device(device));
         }
     }
 
@@ -71,13 +72,14 @@ pub fn resolve_input_device(
                     "matched generic capture card audio input {} ('{}')",
                     device_info.index, device_info.name
                 );
-                return Ok(device);
+                return Ok(ResolvedInput::Device(device));
             }
         }
     }
 
     warn!("no capture-card audio device auto-detected; falling back to default system input");
     host.default_input_device()
+        .map(ResolvedInput::Device)
         .ok_or_else(|| "no default audio input device found on the system".to_string())
 }
 
