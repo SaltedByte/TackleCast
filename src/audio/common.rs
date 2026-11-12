@@ -2,7 +2,7 @@ use cpal::{FromSample, Sample, SampleFormat, SizedSample};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Real-time audio connection status reported to the UI and logger.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +55,7 @@ pub struct AudioDiagnostics {
     overrun_counter: AtomicUsize,
     last_underrun_log: Mutex<Option<Instant>>,
     last_overrun_log: Mutex<Option<Instant>>,
+    resync_counter: AtomicUsize,
 }
 
 impl AudioDiagnostics {
@@ -68,6 +69,7 @@ impl AudioDiagnostics {
             overrun_counter: AtomicUsize::new(0),
             last_underrun_log: Mutex::new(None),
             last_overrun_log: Mutex::new(None),
+            resync_counter: AtomicUsize::new(0),
         }
     }
 
@@ -146,6 +148,25 @@ impl AudioDiagnostics {
                 *last_log = Some(now);
             }
         }
+    }
+
+    /// Resyncs are rare (only after a stall), so each one is logged.
+    pub fn record_resync(&self, dropped_ms: f64) {
+        let count = self.resync_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        warn!(
+            "audio resync: dropped {:.0} ms of backlog to restore sync (total: {} occurrences)",
+            dropped_ms, count
+        );
+    }
+
+    #[allow(dead_code)]
+    pub fn resync_count(&self) -> usize {
+        self.resync_counter.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn underrun_count(&self) -> usize {
+        self.underrun_counter.load(Ordering::Relaxed)
     }
 
     pub fn record_overrun(&self) {
@@ -287,14 +308,24 @@ fn downmix_stereo(frame: &[f32]) -> [f32; 2] {
     [mix[0] / weight[0], mix[1] / weight[1]]
 }
 
+/// Sub-frame resolution of the resampler's read position. A finer grid than
+/// `1 / out_rate` lets the step be nudged by a few parts per million.
+const RESAMPLER_PRECISION: u64 = 1 << 20;
+
 /// Streaming Catmull-Rom interpolation with two frames of lookahead.
-/// Integer positions preserve the timeline across arbitrary callback boundaries.
+/// Fixed-point positions preserve the timeline across arbitrary callback boundaries.
 /// The four-frame history is allocated once, rather than on every callback.
 pub struct AudioResampler {
     in_rate: u32,
     out_rate: u32,
     channels: usize,
-    next_position: u64, // input-frame position in units of 1 / out_rate
+    /// Interpolate even when the nominal rates match, so the step can be adjusted.
+    adaptive: bool,
+    /// Input frames advanced per output frame, in units of 1 / `denominator`.
+    step: u64,
+    denominator: u64,
+    next_frame: u64,
+    next_fraction: u64, // always < denominator
     frames_seen: u64,
     history: Vec<f32>,
 }
@@ -310,10 +341,31 @@ impl AudioResampler {
             in_rate,
             out_rate,
             channels,
-            next_position: 0,
+            adaptive: false,
+            step: in_rate as u64 * RESAMPLER_PRECISION,
+            denominator: out_rate as u64 * RESAMPLER_PRECISION,
+            next_frame: 0,
+            next_fraction: 0,
             frames_seen: 0,
             history: vec![0.0; channels * 4],
         }
+    }
+
+    /// A resampler whose ratio can be trimmed with [`Self::set_rate_adjustment`] to
+    /// follow the real clocks of two devices, including at equal nominal rates.
+    pub fn adaptive(in_rate: u32, out_rate: u32, channels: usize) -> Self {
+        Self {
+            adaptive: true,
+            ..Self::new(in_rate, out_rate, channels)
+        }
+    }
+
+    /// Consume input `1 + adjustment` times faster than nominal. A positive value
+    /// yields fewer output frames, draining a buffer that is filling up.
+    pub fn set_rate_adjustment(&mut self, adjustment: f64) {
+        debug_assert!(self.adaptive, "only adaptive resamplers can be adjusted");
+        let nominal = (self.in_rate as u64 * RESAMPLER_PRECISION) as f64;
+        self.step = (nominal * (1.0 + adjustment)).round().max(1.0) as u64;
     }
 
     #[allow(dead_code)]
@@ -333,14 +385,15 @@ impl AudioResampler {
 
     #[allow(dead_code)]
     pub fn reset(&mut self) {
-        self.next_position = 0;
+        self.next_frame = 0;
+        self.next_fraction = 0;
         self.frames_seen = 0;
         self.history.fill(0.0);
     }
 
     /// Resample interleaved multi-channel input samples into the output buffer.
     pub fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
-        if self.in_rate == self.out_rate {
+        if self.in_rate == self.out_rate && !self.adaptive {
             // Identity: zero resampling required!
             output.extend_from_slice(input);
             return;
@@ -356,8 +409,8 @@ impl AudioResampler {
                 self.history.copy_within(channels.., 0);
                 self.history[3 * channels..].copy_from_slice(frame);
             }
-            while self.next_position / self.out_rate as u64 + 2 <= self.frames_seen {
-                let t = (self.next_position % self.out_rate as u64) as f32 / self.out_rate as f32;
+            while self.next_frame + 2 <= self.frames_seen {
+                let t = (self.next_fraction as f64 / self.denominator as f64) as f32;
                 for ch in 0..channels {
                     let y0 = self.history[ch];
                     let y1 = self.history[channels + ch];
@@ -368,7 +421,9 @@ impl AudioResampler {
                     let c = -0.5 * y0 + 0.5 * y2;
                     output.push(((a * t + b) * t + c) * t + y1);
                 }
-                self.next_position += self.in_rate as u64;
+                self.next_fraction += self.step;
+                self.next_frame += self.next_fraction / self.denominator;
+                self.next_fraction %= self.denominator;
             }
             self.frames_seen += 1;
         }
@@ -377,25 +432,193 @@ impl AudioResampler {
 
 /// A thread-safe, lock-free ring buffer for real-time audio sample streaming.
 /// Samples are stored as bitwise f32 in AtomicU32.
+/// Audio buffered between capture and playback in steady state.
+pub const PLAYBACK_TARGET_SECONDS: f64 = 0.040;
+/// A backlog beyond this (a stalled device, say) is dropped back to the target.
+pub const PLAYBACK_RESYNC_SECONDS: f64 = 0.150;
+
+/// Playback buffer thresholds in interleaved samples of the output format.
+#[derive(Debug, Clone, Copy)]
+pub struct PlaybackLatency {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub target_samples: usize,
+    pub resync_samples: usize,
+    pub samples_per_second: f64,
+}
+
+impl PlaybackLatency {
+    pub fn new(sample_rate: u32, channels: u16) -> Self {
+        let channels = channels.max(1) as usize;
+        let samples = |seconds: f64| (sample_rate as f64 * seconds).round() as usize * channels;
+        Self {
+            target_samples: samples(PLAYBACK_TARGET_SECONDS),
+            resync_samples: samples(PLAYBACK_RESYNC_SECONDS),
+            sample_rate,
+            channels: channels as u16,
+            samples_per_second: sample_rate as f64 * channels as f64,
+        }
+    }
+
+    pub fn seconds(&self, samples: usize) -> f64 {
+        samples as f64 / self.samples_per_second
+    }
+}
+
+const DRIFT_SMOOTHING_SECONDS: f64 = 1.0;
+/// Rate correction per second of buffer error. With the integral gain this
+/// gives a critically damped loop that settles in a few minutes.
+const DRIFT_PROPORTIONAL_GAIN: f64 = 0.05;
+const DRIFT_INTEGRAL_GAIN: f64 = 6e-4;
+/// ±0.2% (about 3.5 cents) is inaudible and covers any sane pair of clocks.
+const MAX_RATE_ADJUSTMENT: f64 = 0.002;
+const DRIFT_REPORT_SECONDS: f64 = 30.0;
+
+/// Keeps the playback buffer at its target by trimming the capture resampler.
+/// The capture and playback devices run on separate crystals, so a fixed
+/// ratio lets the buffer grow or shrink without bound over a long session.
+pub struct DriftController {
+    target_seconds: f64,
+    smoothed: Option<f64>,
+    integral: f64,
+    adjustment: f64,
+    report_elapsed: f64,
+    report_min: f64,
+    report_max: f64,
+}
+
+impl DriftController {
+    pub fn new(target_seconds: f64) -> Self {
+        Self {
+            target_seconds,
+            smoothed: None,
+            integral: 0.0,
+            adjustment: 0.0,
+            report_elapsed: 0.0,
+            report_min: f64::INFINITY,
+            report_max: 0.0,
+        }
+    }
+
+    /// Feed the buffer level after a capture callback covering `elapsed_seconds`.
+    /// Returns the rate adjustment for [`AudioResampler::set_rate_adjustment`].
+    pub fn update(&mut self, buffered_seconds: f64, elapsed_seconds: f64) -> f64 {
+        let smoothed = match self.smoothed {
+            None => buffered_seconds,
+            Some(previous) => {
+                let alpha = 1.0 - (-elapsed_seconds / DRIFT_SMOOTHING_SECONDS).exp();
+                previous + (buffered_seconds - previous) * alpha
+            }
+        };
+        self.smoothed = Some(smoothed);
+
+        let error = smoothed - self.target_seconds;
+        self.integral = (self.integral + DRIFT_INTEGRAL_GAIN * error * elapsed_seconds)
+            .clamp(-MAX_RATE_ADJUSTMENT, MAX_RATE_ADJUSTMENT);
+        self.adjustment = (DRIFT_PROPORTIONAL_GAIN * error + self.integral)
+            .clamp(-MAX_RATE_ADJUSTMENT, MAX_RATE_ADJUSTMENT);
+
+        self.report_min = self.report_min.min(buffered_seconds);
+        self.report_max = self.report_max.max(buffered_seconds);
+        self.report_elapsed += elapsed_seconds;
+        if self.report_elapsed >= DRIFT_REPORT_SECONDS {
+            info!(
+                "audio sync: buffer {:.1} ms (range {:.1}-{:.1}, target {:.0}), clock correction {:+.0} ppm",
+                smoothed * 1000.0,
+                self.report_min * 1000.0,
+                self.report_max * 1000.0,
+                self.target_seconds * 1000.0,
+                self.adjustment * 1e6,
+            );
+            self.report_elapsed = 0.0;
+            self.report_min = f64::INFINITY;
+            self.report_max = 0.0;
+        }
+        self.adjustment
+    }
+
+    /// Playback is waiting for audio; keep the learned clock offset but
+    /// restart smoothing once it resumes.
+    pub fn pause(&mut self) {
+        self.smoothed = None;
+    }
+
+    #[allow(dead_code)]
+    pub fn adjustment(&self) -> f64 {
+        self.adjustment
+    }
+}
+
+/// Pushes and discards whole interleaved frames, so channels never swap.
 pub struct AudioRingBuffer {
     data: Box<[AtomicU32]>,
     capacity: usize,
+    channels: usize,
     read_index: AtomicUsize,
     write_index: AtomicUsize,
+    /// Set by the consumer once enough audio is buffered to start playback.
+    primed: AtomicBool,
     diagnostics: Arc<AudioDiagnostics>,
 }
 
 impl AudioRingBuffer {
-    pub fn new(capacity: usize, diagnostics: Arc<AudioDiagnostics>) -> Self {
+    pub fn new(capacity: usize, channels: usize, diagnostics: Arc<AudioDiagnostics>) -> Self {
+        let channels = channels.max(1);
+        let capacity = (capacity / channels).max(1) * channels;
         let mut values = Vec::with_capacity(capacity);
         values.resize_with(capacity, || AtomicU32::new(0));
         Self {
             data: values.into_boxed_slice(),
             capacity,
+            channels,
             read_index: AtomicUsize::new(0),
             write_index: AtomicUsize::new(0),
+            primed: AtomicBool::new(false),
             diagnostics,
         }
+    }
+
+    pub fn is_primed(&self) -> bool {
+        self.primed.load(Ordering::Acquire)
+    }
+
+    /// Drop the oldest samples so at most `keep` remain. Consumer side only.
+    pub fn discard_to(&self, keep: usize) -> usize {
+        let read = self.read_index.load(Ordering::Relaxed);
+        let write = self.write_index.load(Ordering::Acquire);
+        let available = write.wrapping_sub(read);
+        if available <= keep {
+            return 0;
+        }
+        let dropped = (available - keep) / self.channels * self.channels;
+        if dropped > 0 {
+            self.read_index
+                .store(read.wrapping_add(dropped), Ordering::Release);
+        }
+        dropped
+    }
+
+    /// Fill `output` for playback. Consumer side only. Holds silence until the
+    /// target latency is buffered, trims a backlog beyond the resync limit back
+    /// to the target, and re-primes after the buffer runs dry.
+    pub fn pull_playback(&self, output: &mut [f32], latency: &PlaybackLatency) -> usize {
+        if !self.is_primed() {
+            if self.available() < latency.target_samples {
+                output.fill(0.0);
+                return 0;
+            }
+            self.primed.store(true, Ordering::Release);
+        }
+        if self.available() > latency.resync_samples {
+            let dropped = self.discard_to(latency.target_samples);
+            self.diagnostics
+                .record_resync(dropped as f64 / latency.samples_per_second * 1000.0);
+        }
+        let filled = self.pop_samples(output);
+        if filled < output.len() {
+            self.primed.store(false, Ordering::Release);
+        }
+        filled
     }
 
     #[allow(dead_code)]
@@ -423,7 +646,7 @@ impl AudioRingBuffer {
         }
 
         let space = self.capacity - occupied;
-        let to_write = samples.len().min(space);
+        let to_write = samples.len().min(space) / self.channels * self.channels;
 
         if to_write < samples.len() {
             self.diagnostics.record_overrun();
@@ -690,7 +913,7 @@ mod tests {
     #[test]
     fn ring_buffer_push_pop_order() {
         let diag = Arc::new(AudioDiagnostics::new());
-        let ring = AudioRingBuffer::new(16, diag);
+        let ring = AudioRingBuffer::new(16, 1, diag);
         assert_eq!(ring.push_samples(&[1.0, 2.0, 3.0, 4.0]), 4);
         assert_eq!(ring.available(), 4);
 
@@ -703,7 +926,7 @@ mod tests {
     #[test]
     fn ring_buffer_underrun_zero_fills() {
         let diag = Arc::new(AudioDiagnostics::new());
-        let ring = AudioRingBuffer::new(8, diag.clone());
+        let ring = AudioRingBuffer::new(8, 1, diag.clone());
         assert_eq!(ring.push_samples(&[0.5, 0.6]), 2);
 
         let mut out = [1.0f32; 4];
@@ -718,9 +941,126 @@ mod tests {
     #[test]
     fn ring_buffer_overrun_limits_to_capacity() {
         let diag = Arc::new(AudioDiagnostics::new());
-        let ring = AudioRingBuffer::new(4, diag.clone());
+        let ring = AudioRingBuffer::new(4, 1, diag.clone());
         assert_eq!(ring.push_samples(&[0.1, 0.2, 0.3, 0.4, 0.5]), 4);
         assert_eq!(ring.available(), 4);
+    }
+
+    #[test]
+    fn ring_buffer_overrun_keeps_whole_frames() {
+        let diag = Arc::new(AudioDiagnostics::new());
+        let ring = AudioRingBuffer::new(5, 2, diag);
+        // Capacity rounds down to 2 frames; a third frame must not be split.
+        assert_eq!(ring.push_samples(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), 4);
+        assert_eq!(ring.discard_to(1), 2, "discard drops whole frames only");
+        let mut out = [0.0; 2];
+        ring.pop_samples(&mut out);
+        assert_eq!(out, [3.0, 4.0]);
+    }
+
+    #[test]
+    fn adaptive_resampler_trims_output_rate() {
+        let input = vec![0.25f32; 48_000 * 2];
+        for (adjustment, expected) in [(0.0, 48_000.0), (0.001, 47_952.0), (-0.001, 48_048.0)] {
+            let mut resampler = AudioResampler::adaptive(48_000, 48_000, 2);
+            resampler.set_rate_adjustment(adjustment);
+            let mut output = Vec::new();
+            resampler.process(&input, &mut output);
+            let frames = (output.len() / 2) as f64;
+            assert!(
+                (frames - expected).abs() <= 3.0,
+                "adjustment {adjustment}: expected ~{expected} frames, got {frames}"
+            );
+            assert!(output.iter().all(|s| (s - 0.25).abs() < 1e-6));
+        }
+    }
+
+    #[test]
+    fn playback_waits_for_target_then_resyncs_backlog() {
+        let diag = Arc::new(AudioDiagnostics::new());
+        let latency = PlaybackLatency::new(48_000, 2);
+        let ring = AudioRingBuffer::new(48_000 * 2 * 2, 2, diag.clone());
+        let mut out = vec![1.0f32; 960];
+
+        ring.push_samples(&vec![0.5; latency.target_samples / 2]);
+        assert_eq!(ring.pull_playback(&mut out, &latency), 0);
+        assert!(out.iter().all(|s| *s == 0.0), "silence while priming");
+        assert_eq!(diag.underrun_count(), 0);
+
+        ring.push_samples(&vec![0.5; latency.target_samples]);
+        assert_eq!(ring.pull_playback(&mut out, &latency), 960);
+        assert!(ring.is_primed());
+
+        // A stall leaves a 300 ms backlog; playback snaps back to the target.
+        ring.push_samples(&vec![0.5; 48_000 * 2 * 3 / 10]);
+        ring.pull_playback(&mut out, &latency);
+        assert_eq!(diag.resync_count(), 1);
+        assert_eq!(ring.available(), latency.target_samples - 960);
+    }
+
+    /// Runs capture and playback on independent clocks, as a capture card and
+    /// an audio interface do, and returns the worst buffer error once settled.
+    fn simulate_clock_mismatch(capture_rate: f64, compensate: bool) -> (f64, usize) {
+        const BLOCK: usize = 480; // 10 ms callbacks
+        const MINUTES: usize = 12;
+        let diag = Arc::new(AudioDiagnostics::new());
+        let latency = PlaybackLatency::new(48_000, 2);
+        let ring = AudioRingBuffer::new(48_000 * 2 * 2, 2, diag.clone());
+        let mut resampler = AudioResampler::adaptive(48_000, 48_000, 2);
+        let mut drift = DriftController::new(PLAYBACK_TARGET_SECONDS);
+        let input = vec![0.1f32; BLOCK * 2];
+        let mut resampled = Vec::new();
+        let mut output = vec![0.0f32; BLOCK * 2];
+        let (mut capture_clock, mut playback_clock) = (0.0, 0.0);
+        let mut worst: f64 = 0.0;
+
+        for ms in 0..MINUTES * 60_000 {
+            capture_clock += capture_rate / 1000.0;
+            while capture_clock >= BLOCK as f64 {
+                capture_clock -= BLOCK as f64;
+                resampled.clear();
+                resampler.process(&input, &mut resampled);
+                ring.push_samples(&resampled);
+                if !ring.is_primed() {
+                    drift.pause();
+                    continue;
+                }
+                let buffered = latency.seconds(ring.available());
+                if compensate {
+                    resampler.set_rate_adjustment(drift.update(buffered, BLOCK as f64 / 48_000.0));
+                }
+                if ms > 4 * 60_000 {
+                    worst = worst.max((buffered - PLAYBACK_TARGET_SECONDS).abs());
+                }
+            }
+            playback_clock += 48.0;
+            while playback_clock >= BLOCK as f64 {
+                playback_clock -= BLOCK as f64;
+                ring.pull_playback(&mut output, &latency);
+            }
+        }
+        (worst, diag.resync_count() + diag.underrun_count())
+    }
+
+    #[test]
+    fn drift_control_holds_latency_across_clock_mismatch() {
+        // ±300 ppm is well beyond typical USB audio crystals.
+        for ppm in [-300.0, -50.0, 50.0, 300.0] {
+            let (worst, glitches) = simulate_clock_mismatch(48_000.0 * (1.0 + ppm * 1e-6), true);
+            assert!(
+                worst < 0.012,
+                "{ppm} ppm: buffer strayed {:.1} ms from target",
+                worst * 1000.0
+            );
+            assert_eq!(glitches, 0, "{ppm} ppm: unexpected resync or underrun");
+        }
+    }
+
+    #[test]
+    fn uncompensated_clock_mismatch_drifts() {
+        // Guards the simulation itself: without control, 300 ppm piles up audio.
+        let (worst, _) = simulate_clock_mismatch(48_000.0 * 1.0003, false);
+        assert!(worst > 0.05, "expected drift, got {:.1} ms", worst * 1000.0);
     }
 
     #[test]

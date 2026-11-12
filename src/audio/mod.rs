@@ -18,10 +18,12 @@ use tracing::{error, info, warn};
 use crate::devices;
 pub use common::{
     convert_channels, AudioDiagnostics, AudioResampler, AudioRingBuffer, AudioStatus,
-    AudioStreamInfo, VolumeController,
+    AudioStreamInfo, DriftController, PlaybackLatency, VolumeController,
 };
 
-const RING_BUFFER_CAPACITY: usize = 48_000 * 2 * 2; // ~2 seconds of stereo audio headroom
+/// Hard ceiling on buffered audio. Drift control keeps it near the playback
+/// target, so this only matters if both streams stall for a long time.
+const RING_BUFFER_SECONDS: usize = 2;
 
 pub struct AudioPassthrough {
     input_stream: Option<Stream>,
@@ -136,8 +138,10 @@ impl AudioPassthrough {
         self.diagnostics.set_input_info(Some(in_info));
         self.diagnostics.set_output_info(Some(out_info));
 
+        let latency = PlaybackLatency::new(out_rate, out_channels);
         let ring = Arc::new(AudioRingBuffer::new(
-            RING_BUFFER_CAPACITY,
+            out_rate as usize * out_channels as usize * RING_BUFFER_SECONDS,
+            out_channels as usize,
             self.diagnostics.clone(),
         ));
 
@@ -145,8 +149,7 @@ impl AudioPassthrough {
             &input_device,
             &in_config,
             in_format,
-            out_rate,
-            out_channels,
+            latency,
             ring.clone(),
             self.diagnostics.clone(),
         ) {
@@ -163,6 +166,7 @@ impl AudioPassthrough {
             &output_device,
             &out_config,
             out_format,
+            latency,
             ring,
             self.volume_ctrl.clone(),
             self.diagnostics.clone(),
@@ -228,60 +232,29 @@ fn build_input_stream(
     device: &cpal::Device,
     config: &StreamConfig,
     sample_format: SampleFormat,
-    target_sample_rate: u32,
-    target_channels: u16,
+    latency: PlaybackLatency,
     ring: Arc<AudioRingBuffer>,
     diagnostics: Arc<AudioDiagnostics>,
 ) -> Result<Stream, cpal::BuildStreamError> {
     match sample_format {
-        SampleFormat::F32 => build_input_stream_typed::<f32>(
-            device,
-            config,
-            target_sample_rate,
-            target_channels,
-            ring,
-            diagnostics,
-        ),
-        SampleFormat::I16 => build_input_stream_typed::<i16>(
-            device,
-            config,
-            target_sample_rate,
-            target_channels,
-            ring,
-            diagnostics,
-        ),
-        SampleFormat::U16 => build_input_stream_typed::<u16>(
-            device,
-            config,
-            target_sample_rate,
-            target_channels,
-            ring,
-            diagnostics,
-        ),
-        SampleFormat::I8 => build_input_stream_typed::<i8>(
-            device,
-            config,
-            target_sample_rate,
-            target_channels,
-            ring,
-            diagnostics,
-        ),
-        SampleFormat::U8 => build_input_stream_typed::<u8>(
-            device,
-            config,
-            target_sample_rate,
-            target_channels,
-            ring,
-            diagnostics,
-        ),
-        SampleFormat::I32 => build_input_stream_typed::<i32>(
-            device,
-            config,
-            target_sample_rate,
-            target_channels,
-            ring,
-            diagnostics,
-        ),
+        SampleFormat::F32 => {
+            build_input_stream_typed::<f32>(device, config, latency, ring, diagnostics)
+        }
+        SampleFormat::I16 => {
+            build_input_stream_typed::<i16>(device, config, latency, ring, diagnostics)
+        }
+        SampleFormat::U16 => {
+            build_input_stream_typed::<u16>(device, config, latency, ring, diagnostics)
+        }
+        SampleFormat::I8 => {
+            build_input_stream_typed::<i8>(device, config, latency, ring, diagnostics)
+        }
+        SampleFormat::U8 => {
+            build_input_stream_typed::<u8>(device, config, latency, ring, diagnostics)
+        }
+        SampleFormat::I32 => {
+            build_input_stream_typed::<i32>(device, config, latency, ring, diagnostics)
+        }
         other => {
             warn!("unsupported input sample format: {:?}", other);
             Err(cpal::BuildStreamError::StreamConfigNotSupported)
@@ -293,29 +266,50 @@ fn build_output_stream(
     device: &cpal::Device,
     config: &StreamConfig,
     sample_format: SampleFormat,
+    latency: PlaybackLatency,
     ring: Arc<AudioRingBuffer>,
     volume_ctrl: VolumeController,
     diagnostics: Arc<AudioDiagnostics>,
 ) -> Result<Stream, cpal::BuildStreamError> {
     match sample_format {
-        SampleFormat::F32 => {
-            build_output_stream_typed::<f32>(device, config, ring, volume_ctrl, diagnostics)
-        }
-        SampleFormat::I16 => {
-            build_output_stream_typed::<i16>(device, config, ring, volume_ctrl, diagnostics)
-        }
-        SampleFormat::U16 => {
-            build_output_stream_typed::<u16>(device, config, ring, volume_ctrl, diagnostics)
-        }
+        SampleFormat::F32 => build_output_stream_typed::<f32>(
+            device,
+            config,
+            latency,
+            ring,
+            volume_ctrl,
+            diagnostics,
+        ),
+        SampleFormat::I16 => build_output_stream_typed::<i16>(
+            device,
+            config,
+            latency,
+            ring,
+            volume_ctrl,
+            diagnostics,
+        ),
+        SampleFormat::U16 => build_output_stream_typed::<u16>(
+            device,
+            config,
+            latency,
+            ring,
+            volume_ctrl,
+            diagnostics,
+        ),
         SampleFormat::I8 => {
-            build_output_stream_typed::<i8>(device, config, ring, volume_ctrl, diagnostics)
+            build_output_stream_typed::<i8>(device, config, latency, ring, volume_ctrl, diagnostics)
         }
         SampleFormat::U8 => {
-            build_output_stream_typed::<u8>(device, config, ring, volume_ctrl, diagnostics)
+            build_output_stream_typed::<u8>(device, config, latency, ring, volume_ctrl, diagnostics)
         }
-        SampleFormat::I32 => {
-            build_output_stream_typed::<i32>(device, config, ring, volume_ctrl, diagnostics)
-        }
+        SampleFormat::I32 => build_output_stream_typed::<i32>(
+            device,
+            config,
+            latency,
+            ring,
+            volume_ctrl,
+            diagnostics,
+        ),
         other => {
             warn!("unsupported output sample format: {:?}", other);
             Err(cpal::BuildStreamError::StreamConfigNotSupported)
@@ -326,8 +320,7 @@ fn build_output_stream(
 fn build_input_stream_typed<T>(
     device: &cpal::Device,
     config: &StreamConfig,
-    target_sample_rate: u32,
-    target_channels: u16,
+    latency: PlaybackLatency,
     ring: Arc<AudioRingBuffer>,
     diagnostics: Arc<AudioDiagnostics>,
 ) -> Result<Stream, cpal::BuildStreamError>
@@ -336,10 +329,11 @@ where
     f32: FromSample<T>,
 {
     let in_channels = config.channels as usize;
-    let target_channels = target_channels as usize;
+    let target_channels = latency.channels as usize;
     let in_rate = config.sample_rate.0;
 
-    let mut resampler = AudioResampler::new(in_rate, target_sample_rate, target_channels);
+    let mut resampler = AudioResampler::adaptive(in_rate, latency.sample_rate, target_channels);
+    let mut drift = DriftController::new(common::PLAYBACK_TARGET_SECONDS);
 
     // Pre-allocated buffers to prevent allocation in callback
     let mut scratch_f32 = Vec::with_capacity(4096);
@@ -368,6 +362,14 @@ where
             resampler.process(&channels_converted, &mut resampled);
 
             ring.push_samples(&resampled);
+
+            if ring.is_primed() {
+                let buffered = latency.seconds(ring.available());
+                let elapsed = (data.len() / in_channels.max(1)) as f64 / in_rate as f64;
+                resampler.set_rate_adjustment(drift.update(buffered, elapsed));
+            } else {
+                drift.pause();
+            }
         },
         move |error| {
             error!("audio input stream error: {error}");
@@ -380,6 +382,7 @@ where
 fn build_output_stream_typed<T>(
     device: &cpal::Device,
     config: &StreamConfig,
+    latency: PlaybackLatency,
     ring: Arc<AudioRingBuffer>,
     volume_ctrl: VolumeController,
     diagnostics: Arc<AudioDiagnostics>,
@@ -399,7 +402,7 @@ where
             while offset < data.len() {
                 let chunk_len = (data.len() - offset).min(scratch.len());
                 let scratch_slice = &mut scratch[..chunk_len];
-                let filled = ring.pop_samples(scratch_slice);
+                let filled = ring.pull_playback(scratch_slice, &latency);
 
                 for i in 0..chunk_len {
                     let sample = if i < filled {
