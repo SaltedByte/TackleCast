@@ -1,5 +1,10 @@
 # Experimental MF GPU settings audit
 
+> **Note (2026-11):** The native bridge is now compiled into TackleCast.exe, so
+> `tacklecast_mf_gpu.dll`, `scripts/build_mf_bridge.ps1` and
+> `scripts/run_mf_gpu_viewer.ps1` no longer exist. The steps that use them below
+> are kept as a record of how the investigation was done.
+
 2026-10-31. This records source-path inspection and automated checks, not a
 claim that every menu control has been physically exercised on every device.
 

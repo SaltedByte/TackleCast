@@ -1,0 +1,8 @@
+# Link the C runtime into TackleCast.exe, so it runs on a clean Windows install
+# without the Visual C++ Redistributable (MSVC) or MinGW runtime DLLs (GNU).
+# A static FFmpeg for MSVC is built with -MT to match (build_static_ffmpeg.sh).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-feature=+crt-static"]

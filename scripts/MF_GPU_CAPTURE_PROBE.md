@@ -1,5 +1,10 @@
 # Native NV12 GPU capture investigation
 
+> **Note (2026-11):** The native bridge is now compiled into TackleCast.exe, so
+> `tacklecast_mf_gpu.dll`, `scripts/build_mf_bridge.ps1` and
+> `scripts/run_mf_gpu_viewer.ps1` no longer exist. The steps that use them below
+> are kept as a record of how the investigation was done.
+
 This standalone Media Foundation probe does not change TackleCast. Its default
 mode enumerates device names without activating a source. That mode found
 `Elgato 4K X` on this computer on 2026-10-31.

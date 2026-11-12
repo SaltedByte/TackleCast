@@ -69,31 +69,33 @@ type Next = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut Output) -> i32;
 type Close = unsafe extern "C" fn(*mut c_void);
 type Metadata = unsafe extern "C" fn(*mut c_void, *mut u32, *mut u32, *mut u32, *mut u32) -> i32;
 
-fn resolve_bridge_path(
-    executable: &std::path::Path,
-    override_path: Option<std::ffi::OsString>,
-) -> Result<std::path::PathBuf, String> {
-    let path = match override_path {
-        Some(path) => std::path::PathBuf::from(path),
-        None => executable
-            .parent()
-            .ok_or("Cannot locate executable directory")?
-            .join("tacklecast_mf_gpu.dll"),
-    };
-    if !path.is_absolute() {
-        return Err("Native bridge DLL path must be absolute".into());
-    }
-    Ok(path)
+// The native bridge (src/mf_gpu_native.cpp) is compiled into the executable
+// by build.rs, so there is no separate DLL to ship or locate.
+extern "C" {
+    fn tc_mf_open(
+        device: *mut c_void,
+        name: *const u16,
+        width: u32,
+        height: u32,
+        numerator: u32,
+        denominator: u32,
+        session: *mut *mut c_void,
+    ) -> i32;
+    fn tc_mf_allocate(session: *mut c_void, out: *mut Output) -> i32;
+    fn tc_mf_next_reuse(session: *mut c_void, resource: *mut c_void, out: *mut Output) -> i32;
+    fn tc_mf_close(session: *mut c_void);
+    fn tc_mf_metadata(
+        session: *mut c_void,
+        matrix: *mut u32,
+        range: *mut u32,
+        numerator: *mut u32,
+        denominator: *mut u32,
+    ) -> i32;
 }
 
-fn bridge_path() -> Result<std::path::PathBuf, String> {
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    resolve_bridge_path(&executable, std::env::var_os("TACKLECAST_MF_GPU_DLL"))
-}
-
+/// `TACKLECAST_MF_GPU=0` turns the native path off for troubleshooting.
 pub fn available() -> bool {
     std::env::var_os("TACKLECAST_MF_GPU").as_deref() != Some(std::ffi::OsStr::new("0"))
-        && bridge_path().is_ok_and(|path| path.is_file())
 }
 
 pub fn eligible(format: crate::settings::VideoFormat, nv12_advertised: bool) -> bool {
@@ -141,26 +143,11 @@ pub fn run(
     events: winit::event_loop::EventLoopProxy<AppEvent>,
 ) {
     let result = (|| -> Result<(), String> {
-        let path = bridge_path()?;
-        // SAFETY: load the matching native bridge beside the executable, or an
-        // explicit absolute development override, and validate its ABI below.
-        let lib = unsafe { libloading::Library::new(path) }.map_err(|e| e.to_string())?;
-        let version: unsafe extern "C" fn() -> u32 = unsafe {
-            *lib.get(b"tc_mf_abi_version\0")
-                .map_err(|_| "Rebuild the native GPU bridge (ABI 2 required)")?
-        };
-        if unsafe { version() } != 2 {
-            return Err("Native GPU bridge ABI mismatch".into());
-        }
-        let open: Open = unsafe { *lib.get(b"tc_mf_open\0").map_err(|e| e.to_string())? };
-        let allocate: Allocate =
-            unsafe { *lib.get(b"tc_mf_allocate\0").map_err(|e| e.to_string())? };
-        let next: Next = unsafe { *lib.get(b"tc_mf_next_reuse\0").map_err(|e| e.to_string())? };
-        let close: Close = unsafe { *lib.get(b"tc_mf_close\0").map_err(|e| e.to_string())? };
-        let metadata: Metadata = unsafe {
-            *lib.get(b"tc_mf_metadata\0")
-                .map_err(|_| "Rebuild the native GPU bridge for color metadata support")?
-        };
+        let open: Open = tc_mf_open;
+        let allocate: Allocate = tc_mf_allocate;
+        let next: Next = tc_mf_next_reuse;
+        let close: Close = tc_mf_close;
+        let metadata: Metadata = tc_mf_metadata;
         let raw = unsafe {
             device.as_hal::<wgpu::hal::api::Dx12, _, _>(|d| d.map(|d| d.raw_device().clone()))
         }
@@ -319,19 +306,6 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn bridge_lookup_is_relative_to_executable_not_working_directory() {
-        let executable = std::path::Path::new(r"C:\portable\TackleCast.exe");
-        assert_eq!(
-            resolve_bridge_path(executable, None).unwrap(),
-            std::path::PathBuf::from(r"C:\portable\tacklecast_mf_gpu.dll")
-        );
-        assert_eq!(
-            resolve_bridge_path(executable, Some(r"D:\dev\bridge.dll".into())).unwrap(),
-            std::path::PathBuf::from(r"D:\dev\bridge.dll")
-        );
-        assert!(resolve_bridge_path(executable, Some("bridge.dll".into())).is_err());
-    }
     #[test]
     fn backend_selection_respects_explicit_pixel_formats() {
         use crate::settings::VideoFormat;

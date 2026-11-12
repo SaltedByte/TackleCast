@@ -34,12 +34,40 @@ Built for capture cards like the Genki ShadowCast, Elgato, AVerMedia, and other 
 ## Quick Start
 
 1. Download the latest release from [Releases](../../releases/latest).
-   - **Windows**: Download `TackleCast-Windows-x86_64.zip`, extract anywhere, and double-click `TackleCast.exe`.
+   - **Windows**: Download `TackleCast-Windows-x86_64.exe`, put it in any folder, and double-click it. It is the whole app: there is nothing to extract or install, and no other files to keep beside it. Windows SmartScreen may warn the first time, because the EXE is not code-signed; choose **More info > Run anyway**.
    - **Linux**: Download `TackleCast-Linux-x86_64.tar.gz`, extract (`tar -xzvf TackleCast-Linux-x86_64.tar.gz`), and run `./run.sh`.
 2. Press **Escape** and choose your capture card under **Video**. Select a supported resolution and frame rate; leave Pixel Format on Auto or choose a supported format manually.
 3. Close the menu with **Escape** to apply capture changes. Auto then shows the opened format, such as `Auto (NV12)`. Press **F11** for fullscreen.
 
-FFmpeg is bundled on both platforms. Windows packages also include the CUDA/nvJPEG runtime; GPU decoding needs a compatible NVIDIA GPU and driver. Official Linux archives target x86_64 Ubuntu 24.04 or newer and use your desktop's ALSA and Vulkan/OpenGL drivers.
+FFmpeg is included on both platforms. On Windows it, and the NVIDIA runtime for GPU decoding, are inside the EXE (see [What's inside the Windows EXE](#whats-inside-the-windows-exe)); GPU decoding needs a compatible NVIDIA GPU and driver. Official Linux archives target x86_64 Ubuntu 24.04 or newer and use your desktop's ALSA and Vulkan/OpenGL drivers.
+
+### What's inside the Windows EXE
+
+Earlier releases were a zip of about 180 MB in 15 or more files. The Windows release is now one file of about 30 MB:
+
+| Part | How it's included | Purpose |
+|---|---|---|
+| TackleCast | The program itself | Viewer, settings, audio passthrough |
+| FFmpeg 8.1.3 (`avdevice`, `avformat`, `avcodec`, `swscale`, `avutil`) | Linked in statically. Built from the official source with only what TackleCast uses: DirectShow capture; MJPEG, raw video, H.264 and HEVC decoders; and colour conversion. No network code and no GPL components. | DirectShow capture and software decoding |
+| Media Foundation GPU bridge (`src/mf_gpu_native.cpp`) | Compiled in | Native NV12 GPU capture; it used to ship as `tacklecast_mf_gpu.dll` |
+| NVIDIA CUDA runtime 13 and nvJPEG 13 (`cudart64_13.dll`, `nvjpeg64_13.dll`, about 4.8 MB) | Stored inside, then unpacked the first time TackleCast tries NVIDIA decoding (see below) | GPU MJPEG decoding on NVIDIA cards |
+| C and C++ runtimes | Linked in statically | So no Visual C++ Redistributable is needed |
+| License notices | Built in; shown in **Settings > Display > About > Licenses** | TackleCast (MIT), FFmpeg (LGPL 2.1+), NVIDIA CUDA EULA |
+| App icon | Built in | |
+
+**What it uses from Windows.** Only DLLs that come with Windows 10 and 11: Direct3D 11/12, DXGI, `d3dcompiler_47`, Media Foundation, DirectShow, WASAPI, COM and the usual system libraries. For NVIDIA decoding it also needs `nvcuda.dll`, which comes with the NVIDIA display driver. TackleCast never ships that DLL, because it must match your driver. Without it, MJPEG decodes on the CPU instead.
+
+**What it writes to disk.**
+
+| Location | What | When |
+|---|---|---|
+| Beside the EXE | `tacklecast_settings.json` and `logs\` | Settings when you exit; a log for each run (older logs are pruned). Put the EXE in a folder you can write to, not `Program Files`. |
+| `%LOCALAPPDATA%\TackleCast\runtime\<version>-<id>\` | `cudart64_13.dll`, `nvjpeg64_13.dll` | Once, the first time TackleCast tries NVIDIA decoding (MJPEG with an NVIDIA GPU). Windows can only load a DLL from a file, so the embedded copies are written here. The folder name changes with the runtime, so versions never mix. Deleting it is safe; it's recreated when needed. |
+| `%LOCALAPPDATA%\TackleCast\elgato-edid\` | Elgato's device library, EDID list and files, user EDIDs | Only when an Elgato 4K X is used (see below) |
+
+To remove TackleCast, delete the EXE, its `logs` folder and settings file, and `%LOCALAPPDATA%\TackleCast`.
+
+**FFmpeg licensing.** FFmpeg is LGPL 2.1 or later and is linked statically. Its source is at <https://ffmpeg.org/releases/ffmpeg-8.1.3.tar.xz>, and the exact configuration is in [`scripts/build_static_ffmpeg.sh`](scripts/build_static_ffmpeg.sh). TackleCast is open source, so you can relink it against your own FFmpeg build by following [BUILD.md](BUILD.md).
 
 On Linux/X11, your desktop must also provide the X11 keyboard runtime. On Ubuntu/Debian, install it if needed with `sudo apt install libxkbcommon-x11-0`.
 
@@ -115,7 +143,7 @@ Press **Escape** to open the four-tab menu. Shorter tabs keep the same menu size
 | Video | Capture device, supported resolution/FPS/format combinations, scaling filter, color space, and color range; Elgato 4K X settings and EDID on Windows |
 | Picture | Live brightness, contrast, saturation, and gamma adjustments, plus Reset Picture to Defaults |
 | Audio | Input/output devices, mute, volume, and connection status |
-| Display | Fullscreen, performance overlay, detailed scaling/color information, and Exit |
+| Display | Fullscreen, performance overlay, detailed scaling/color information, Exit, and About (version and licenses) |
 
 Picture, scaling, and color adjustments preview immediately. The backdrop clears while editing sliders or their numeric values so you can judge the live picture. Closing the menu saves the settings and applies capture/audio device changes.
 
@@ -143,11 +171,12 @@ The experimental MF GPU backend receives GPU-backed NV12 surfaces and
 uses a bounded GPU-buffer pool. Auto color follows the negotiated native YUV
 matrix and full/limited range when provided; missing metadata remains labeled
 as a default, and manual color controls override it. Explicit non-NV12 format
-selections use the existing capture path. When the native bridge DLL is bundled
-beside TackleCast.exe, this backend is selected automatically for eligible modes.
+selections use the existing capture path. The native bridge is compiled into
+TackleCast.exe, so this backend is selected automatically for eligible modes
+(set `TACKLECAST_MF_GPU=0` to turn it off for troubleshooting).
 If it fails, or delivers no frames within five seconds of opening, capture
-retries through DirectShow. No wrapper script is required;
-see `scripts/MF_GPU_SETTINGS_AUDIT.md` for its controls and limitations.
+retries through DirectShow. See `scripts/MF_GPU_SETTINGS_AUDIT.md` for its
+controls and limitations.
 
 Color Auto follows stream/frame metadata. When metadata is missing, the UI labels the fallback as a default rather than presenting it as detected information. BT.2020 selects a conversion matrix; it does not implement HDR tone mapping.
 
@@ -163,7 +192,7 @@ src/
   gpu_decode.rs    - NVIDIA nvJPEG GPU MJPEG decode (feature-gated: gpu-decode)
   dx12_interop.rs  - DX12 shared buffers for CUDA/wgpu zero-copy (feature-gated: gpu-decode)
   mf_gpu.rs        - Native Media Foundation GPU capture client (feature-gated: gpu-decode)
-  mf_gpu_native.cpp - Media Foundation to DX12 bridge, built as tacklecast_mf_gpu.dll
+  mf_gpu_native.cpp - Media Foundation to DX12 bridge, compiled into the EXE by build.rs
   triple_buffer.rs - Lock-free latest-frame handoff from capture to renderer
   render.rs        - wgpu DX12/Vulkan renderer, YUV->RGB WGSL shader
   audio/           - Audio passthrough via cpal (WASAPI on Windows, PipeWire/ALSA on Linux)
@@ -182,6 +211,7 @@ src/
 - **Linux physical capture needs broader hardware validation.** Native V4L2 discovery is implemented, and Linux tests, shader checks, and packaged synthetic rendering have passed. The latest ShadowCast hardware checks were performed on Windows.
 - **FSR and HDR tone mapping are not included.** Scaling options are Bilinear, Bicubic, and Lanczos; BT.2020 is a color conversion matrix. Saved `fsr1` selections load as Bilinear while preserving other settings.
 - Webcams may partially work but are not officially supported.
+- **The Windows EXE decodes only MJPEG, raw YUV (NV12, YUY2, UYVY, I420), H.264 and HEVC.** Its FFmpeg is trimmed to what capture cards deliver. A card that offers only another compressed format will not open; please report it.
 
 ## Acknowledgments
 

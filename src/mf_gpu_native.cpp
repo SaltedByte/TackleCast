@@ -1,4 +1,5 @@
 // Experimental Media Foundation -> DX12 buffer bridge. No pixel mappings.
+// Compiled into TackleCast.exe by build.rs and called from src/mf_gpu.rs.
 #define NOMINMAX
 #define _WIN32_WINNT 0x0A00
 #define WINVER 0x0A00
@@ -254,32 +255,32 @@ static HRESULT next_frame(Session& s, GpuOutput& out, ID3D12Resource* reuse = nu
     out={destination.Detach(),total,layout[1].Offset,layout[0].Footprint.RowPitch,layout[1].Footprint.RowPitch};
     return S_OK;
 }
-extern "C" __declspec(dllexport) HRESULT tc_mf_open(void* device,const wchar_t* name,UINT w,UINT h,UINT n,UINT d,void** out) {
+extern "C" HRESULT tc_mf_open(void* device,const wchar_t* name,UINT w,UINT h,UINT n,UINT d,void** out) {
     try { auto s = std::make_unique<Session>(); HRESULT hr=open_session(*s,device,name,w,h,n,d);
         if (FAILED(hr)) return hr;
         *out=s.release();
         return S_OK;
     } catch (...) { return E_FAIL; }
 }
-extern "C" __declspec(dllexport) HRESULT tc_mf_next(void* session,GpuOutput* out) {
+extern "C" HRESULT tc_mf_next(void* session,GpuOutput* out) {
     try { return next_frame(*static_cast<Session*>(session),*out); } catch (...) { return E_FAIL; }
 }
-extern "C" __declspec(dllexport) void tc_mf_close(void* session) { delete static_cast<Session*>(session); }
+extern "C" void tc_mf_close(void* session) { delete static_cast<Session*>(session); }
 
-extern "C" __declspec(dllexport) UINT tc_mf_abi_version() { return 2; }
-extern "C" __declspec(dllexport) HRESULT tc_mf_metadata(void* session, UINT* matrix, UINT* range, UINT* n, UINT* d) {
+extern "C" UINT tc_mf_abi_version() { return 2; }
+extern "C" HRESULT tc_mf_metadata(void* session, UINT* matrix, UINT* range, UINT* n, UINT* d) {
     if (!session || !matrix || !range || !n || !d) return E_POINTER;
     const auto& s = *static_cast<Session*>(session);
     *matrix = s.matrix; *range = s.nominalRange; *n = s.rateN; *d = s.rateD;
     return S_OK;
 }
-extern "C" __declspec(dllexport) HRESULT tc_mf_next_reuse(void* session, void* resource, GpuOutput* out) {
+extern "C" HRESULT tc_mf_next_reuse(void* session, void* resource, GpuOutput* out) {
     try {
         if (!session || !resource || !out) return E_POINTER;
         return next_frame(*static_cast<Session*>(session), *out, static_cast<ID3D12Resource*>(resource));
     } catch (...) { return E_FAIL; }
 }
-extern "C" __declspec(dllexport) HRESULT tc_mf_allocate(void* session, GpuOutput* out) {
+extern "C" HRESULT tc_mf_allocate(void* session, GpuOutput* out) {
     try {
         if (!session || !out) return E_POINTER;
         auto& s = *static_cast<Session*>(session);

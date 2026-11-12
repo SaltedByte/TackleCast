@@ -59,6 +59,12 @@ default = ["gpu-decode", "elgato-edid"]
 gpu-decode = ["dep:libloading"]
 # Switch an Elgato 4K X's EDID from the Video tab (Windows, needs Elgato Studio installed).
 elgato-edid = ["dep:miniz_oxide"]
+# Single-file Windows release: everything below is linked or embedded into TackleCast.exe.
+standalone = ["static-ffmpeg", "embed-gpu-runtime"]
+# Link FFMPEG_DIR statically. It must be a build from scripts/build_static_ffmpeg.sh.
+static-ffmpeg = ["ffmpeg-next/static"]
+# Store the nvJPEG/CUDA runtime from GPU_RUNTIME_DIR in the EXE; unpacked on first use.
+embed-gpu-runtime = ["gpu-decode"]
 
 [profile.release]
 opt-level = 3

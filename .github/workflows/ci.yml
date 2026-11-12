@@ -92,7 +92,36 @@ jobs:
           flags=()
           if [[ "$FEATURES" == software ]]; then flags+=(--no-default-features); fi
           cargo build --release --locked "${flags[@]}"
-      - name: Windows native GPU bridge
-        if: runner.os == 'Windows' && matrix.features == 'default'
+
+  # The single-file Windows release: static FFmpeg plus the embedded GPU
+  # runtime. The release workflow builds this itself, so skip it there.
+  windows-standalone:
+    name: windows-2022 / standalone
+    if: inputs.ref == ''
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
+        with:
+          toolchain: 1.93.1
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          key: standalone-${{ hashFiles('scripts/setup_*_dependencies.*', 'scripts/windows-dependencies.json', 'scripts/build_static_ffmpeg.sh') }}
+          env-vars: FFMPEG_DIR PKG_CONFIG_PATH GPU_RUNTIME_DIR
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .deps
+          key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/setup_*_dependencies.*', 'scripts/windows-dependencies.json', 'scripts/build_static_ffmpeg.sh') }}
+      - name: Static FFmpeg and GPU runtime
         shell: powershell
-        run: .\scripts\build_mf_bridge.ps1 -Output target\mf-bridge\tacklecast_mf_gpu.dll
+        run: .\scripts\setup_windows_dependencies.ps1 -IncludeGpuRuntime -StaticFfmpeg
+      - name: Standalone executable
+        shell: powershell
+        run: |
+          .\scripts\package_rust_release.ps1 -PackageName TackleCast-Windows-x86_64
+          New-Item -ItemType Directory -Force dist/standalone-check | Out-Null
+          Copy-Item dist/TackleCast-Windows-x86_64.exe dist/standalone-check/TackleCast.exe
+          python scripts/smoke_test.py --binary dist/standalone-check/TackleCast.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Synthetic rendering failed' }

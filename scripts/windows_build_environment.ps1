@@ -20,11 +20,11 @@ if ([string]::IsNullOrWhiteSpace($env:FFMPEG_DIR)) {
         }
     }
 }
+# A static build (build_static_ffmpeg.sh) has no bin/, because it has no DLLs.
 if ([string]::IsNullOrWhiteSpace($env:FFMPEG_DIR) -or
     -not (Test-Path -LiteralPath (Join-Path $env:FFMPEG_DIR 'include')) -or
-    -not (Test-Path -LiteralPath (Join-Path $env:FFMPEG_DIR 'lib')) -or
-    -not (Test-Path -LiteralPath (Join-Path $env:FFMPEG_DIR 'bin'))) {
-    throw 'Set FFMPEG_DIR to an FFmpeg development build containing bin/, include/, and lib/, or run scripts/setup_windows_dependencies.ps1.'
+    -not (Test-Path -LiteralPath (Join-Path $env:FFMPEG_DIR 'lib'))) {
+    throw 'Set FFMPEG_DIR to an FFmpeg build containing include/ and lib/ (plus bin/ when shared), or run scripts/setup_windows_dependencies.ps1.'
 }
 if ([string]::IsNullOrWhiteSpace($env:LIBCLANG_PATH)) { $env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin' }
 if (-not (Test-Path -LiteralPath (Join-Path $env:LIBCLANG_PATH 'libclang.dll'))) {

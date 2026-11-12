@@ -11,6 +11,9 @@ use egui_wgpu::ScreenDescriptor;
 use egui_winit::State;
 use std::time::Duration;
 use winit::event::WindowEvent;
+
+/// TackleCast license plus those of anything linked or embedded (build.rs).
+const LICENSE_NOTICE: &str = include_str!(concat!(env!("OUT_DIR"), "/third_party_licenses.txt"));
 use winit::window::Window;
 
 const COLOR_TEXT_PRIMARY: Color32 = Color32::from_rgb(0xE0, 0xE0, 0xE0);
@@ -570,6 +573,24 @@ fn draw_menu(
                                             if exit_button(ui).clicked() {
                                                 output.exit_requested = true;
                                             }
+                                        });
+                                        card_section(ui, "ABOUT", text_scale, |ui| {
+                                            ui.label(concat!(
+                                                "TackleCast ",
+                                                env!("CARGO_PKG_VERSION")
+                                            ));
+                                            ui.collapsing("Licenses", |ui| {
+                                                egui::ScrollArea::vertical()
+                                                    .id_salt("licenses")
+                                                    .max_height(260.0 * text_scale)
+                                                    .show(ui, |ui| {
+                                                        ui.label(
+                                                            RichText::new(LICENSE_NOTICE)
+                                                                .monospace()
+                                                                .size(11.0 * text_scale),
+                                                        );
+                                                    });
+                                            });
                                         });
                                     }
                                 }

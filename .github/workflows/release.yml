@@ -81,28 +81,28 @@ jobs:
           toolchain: 1.93.1
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
-          key: default-${{ hashFiles('scripts/setup_*_dependencies.*', 'scripts/windows-dependencies.json') }}
-          env-vars: FFMPEG_DIR PKG_CONFIG_PATH
+          key: standalone-${{ hashFiles('scripts/setup_*_dependencies.*', 'scripts/windows-dependencies.json', 'scripts/build_static_ffmpeg.sh') }}
+          env-vars: FFMPEG_DIR PKG_CONFIG_PATH GPU_RUNTIME_DIR
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: .deps
-          key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/setup_*_dependencies.*', 'scripts/windows-dependencies.json') }}
+          key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/setup_*_dependencies.*', 'scripts/windows-dependencies.json', 'scripts/build_static_ffmpeg.sh') }}
       - name: Linux system dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y build-essential nasm libasound2-dev libclang-dev pkg-config xvfb libxkbcommon-x11-0 libgl1-mesa-dri mesa-vulkan-drivers
-      - name: Windows runtime dependencies
+      - name: Windows static FFmpeg and GPU runtime
         if: runner.os == 'Windows'
         shell: powershell
-        run: .\scripts\setup_windows_dependencies.ps1 -IncludeGpuRuntime
-      - name: Windows package
+        run: .\scripts\setup_windows_dependencies.ps1 -IncludeGpuRuntime -StaticFfmpeg
+      - name: Windows standalone executable
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          .\scripts\package_rust_release.ps1 -PackageName TackleCast-Windows-x86_64 -RequireGpuDlls -MfGpu -Zip
-          Expand-Archive dist/TackleCast-Windows-x86_64.zip -DestinationPath dist/extracted-windows
-          python scripts/verify_package.py --package dist/extracted-windows --require-gpu --require-mf-gpu --commit '${{ needs.resolve.outputs.commit }}'
-          if ($LASTEXITCODE -ne 0) { throw 'Package verification failed' }
-          python scripts/smoke_test.py --binary dist/extracted-windows/TackleCast.exe
+          .\scripts\package_rust_release.ps1 -PackageName TackleCast-Windows-x86_64
+          # Run the EXE alone in an empty folder, as a user would.
+          New-Item -ItemType Directory -Force dist/standalone-check | Out-Null
+          Copy-Item dist/TackleCast-Windows-x86_64.exe dist/standalone-check/TackleCast.exe
+          python scripts/smoke_test.py --binary dist/standalone-check/TackleCast.exe
           if ($LASTEXITCODE -ne 0) { throw 'Synthetic rendering failed' }
       - name: Linux package
         if: runner.os == 'Linux'
@@ -132,8 +132,8 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: |
-            dist/${{ matrix.artifact }}.zip
-            dist/${{ matrix.artifact }}.zip.sha256
+            dist/${{ matrix.artifact }}.exe
+            dist/${{ matrix.artifact }}.exe.sha256
             dist/${{ matrix.artifact }}.tar.gz
             dist/${{ matrix.artifact }}.tar.gz.sha256
           if-no-files-found: error

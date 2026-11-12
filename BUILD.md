@@ -13,16 +13,37 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --no-default-features
 cargo clippy --locked --all-targets --no-default-features -- -D warnings
-.\scripts\package_rust_release.ps1 -PackageName TackleCast-Windows-x86_64 -RequireGpuDlls -MfGpu -Zip
 ```
 
-The setup downloads an exact FFmpeg 8.1.3 LGPL build and NVIDIA redistributables, verifies their SHA256 hashes, and extracts them into `.deps/`. Pins are in `scripts/windows-dependencies.json`. The FFmpeg monthly archive is retained by its publisher for two years; update that pin deliberately when upgrading dependencies. `LIBCLANG_PATH` defaults to `C:\Program Files\LLVM\bin`.
+The setup downloads an exact FFmpeg 8.1.3 LGPL shared build and NVIDIA redistributables, verifies their SHA256 hashes, and extracts them into `.deps/`. Pins are in `scripts/windows-dependencies.json`. The FFmpeg monthly archive is retained by its publisher for two years; update that pin deliberately when upgrading dependencies. `LIBCLANG_PATH` defaults to `C:\Program Files\LLVM\bin`. Development builds link the shared FFmpeg, so `cargo run` finds its DLLs on the PATH that the setup script sets.
 
-You can instead set `FFMPEG_DIR` to an existing shared development build with `bin/`, `lib/`, and `include/`. The Windows environment helper preserves explicit settings, then searches `.deps/ffmpeg` and `C:\ffmpeg`; changes apply only to the current PowerShell session. `scripts/build_windows.ps1 -Command test` also loads this helper. These defaults do not inject Windows paths into Linux builds.
+You can instead set `FFMPEG_DIR` to an existing FFmpeg development build with `lib/` and `include/` (and `bin/` for a shared build). The Windows environment helper preserves explicit settings, then searches `.deps/ffmpeg` and `C:\ffmpeg`; changes apply only to the current PowerShell session. `scripts/build_windows.ps1 -Command test` also loads this helper. These defaults do not inject Windows paths into Linux builds.
 
-`GPU_RUNTIME_DIR` can point to already-extracted NVIDIA runtime DLLs. Packaging's `-CudaDllDir` takes priority, followed by `GPU_RUNTIME_DIR` and installed CUDA toolkits. Both nvJPEG and cudart must come from one directory with compatible runtime versions (11, 12, or 13). Packaging does not search old distribution folders. Automated releases use pinned runtime files. `-SkipGpuDlls` produces a software-only runtime bundle. FFmpeg's unused `postproc` library is not required.
+The Media Foundation GPU bridge (`src/mf_gpu_native.cpp`) is compiled into every Windows build by `build.rs`, using the same C++ compiler as Rust. Set `TACKLECAST_MF_GPU=0` to turn off native GPU capture when troubleshooting.
 
-GPU decoding requires a compatible NVIDIA GPU and driver. The package includes nvJPEG and cudart, but never the NVIDIA driver DLL `nvcuda.dll`. Machines without compatible hardware automatically use software decoding.
+GPU decoding requires a compatible NVIDIA GPU and driver. Releases carry nvJPEG and cudart, but never the NVIDIA driver DLL `nvcuda.dll`. Machines without compatible hardware automatically use software decoding.
+
+### Standalone release executable
+
+The Windows release is a single `TackleCast.exe` with nothing beside it. The README's [What's inside the Windows EXE](README.md#whats-inside-the-windows-exe) describes it for users. To build it:
+
+```powershell
+.\scripts\setup_windows_dependencies.ps1 -IncludeGpuRuntime -StaticFfmpeg
+.\scripts\package_rust_release.ps1
+```
+
+That produces `dist\TackleCast-Windows-x86_64.exe` and its `.sha256`. It works like this:
+
+- **Static FFmpeg.** `-StaticFfmpeg` downloads the pinned FFmpeg 8.1.3 source (`ffmpeg_source` in `windows-dependencies.json`) and builds it with [`scripts/build_static_ffmpeg.sh`](scripts/build_static_ffmpeg.sh) into `.deps\ffmpeg-static-msvc`. It is trimmed to DirectShow capture; the MJPEG, raw video, H.264 and HEVC decoders; and swscale, with no network code or external libraries, under the LGPL. The build needs MSYS2 at `C:\msys64`, and it installs `make`, `diffutils` and `nasm` with pacman. For MSVC it enters the Visual Studio developer environment. It is rebuilt only when the source pin or the build script changes. It then sets `FFMPEG_DIR` to the static build.
+- **Cargo features.** `package_rust_release.ps1` builds with `--features standalone`:
+  - `static-ffmpeg` links FFmpeg statically. `build.rs` adds the Windows libraries FFmpeg needs, from its pkg-config files.
+  - `embed-gpu-runtime` stores the nvJPEG and CUDA runtime from `GPU_RUNTIME_DIR` inside the EXE. On first use they are unpacked to `%LOCALAPPDATA%\TackleCast\runtime\<version>-<content hash>\`, written to a temporary name and renamed into place, then loaded from there.
+- **Static C runtime.** `.cargo/config.toml` sets `+crt-static` for Windows targets, so the EXE needs no Visual C++ Redistributable. The MSVC FFmpeg build uses `-MT` to match.
+- **License notices.** `build.rs` assembles them from the FFmpeg and NVIDIA licenses actually linked or embedded. The app shows them under Settings > Display > About > Licenses.
+- **Verification.** The packaging script runs `scripts/verify_package.py --exe`. It reads the EXE's import and delay-import tables and fails if any DLL isn't part of Windows. Release CI also runs the synthetic smoke test on the EXE copied alone into an empty folder.
+- **Separate build folder.** The standalone build uses `target\standalone`, so switching between it and shared-FFmpeg development builds doesn't rebuild everything.
+
+Pass `-NoGpuRuntime` to leave out the NVIDIA runtime; the EXE is about 5 MB smaller and MJPEG always decodes on the CPU. To relink against a different FFmpeg, point `FFMPEG_DIR` at your own static build and run the packaging script; `lib\pkgconfig` must list its link dependencies.
 
 ### Windows GNU fallback
 
@@ -38,20 +59,12 @@ cargo +stable-x86_64-pc-windows-gnu test --locked
 cargo +stable-x86_64-pc-windows-gnu test --locked gpu_shader_color_and_picture_reference -- --ignored --nocapture
 ```
 
-To package the experimental native NV12 GPU backend on this GNU setup:
+The standalone executable builds the same way with `-Gnu` on both scripts. The C++ runtime (`libstdc++`, `libgcc`, `winpthread`) is linked statically, so the EXE needs no MinGW DLLs:
 
 ```powershell
-.\scripts\package_rust_release.ps1 -PackageName TackleCast-Windows-x86_64-MF-GPU -Gnu -MfGpu -Zip
+.\scripts\setup_windows_dependencies.ps1 -IncludeGpuRuntime -StaticFfmpeg -Gnu
+.\scripts\package_rust_release.ps1 -Gnu
 ```
-
-The archive includes the freshly compiled native bridge, required FFmpeg
-runtime DLLs, and runtime licenses. Launch `TackleCast.exe` directly; it finds
-the bundled bridge and automatically selects eligible GPU capture modes. No
-development PATH is needed. MF GPU applies to native NV12 modes, with GPU
-copies and CPU coordination; this is an experimental release, not a claim of
-zero-copy USB transport or measured latency improvement. MSVC packaging also
-uses `-MfGpu` (omit `-Gnu`); `scripts/build_mf_bridge.ps1` enters the Visual
-Studio developer environment when `cl.exe` is not already on PATH.
 
 ## Linux
 
