@@ -31,6 +31,12 @@ pub fn preferred_audio_host() -> Host {
     cpal::default_host()
 }
 
+pub fn refresh_recovery_device(previous: &Device, _input: bool) -> Result<Device, String> {
+    // Retain the same ALSA logical device rather than resolving a saved index
+    // or following a changed system default during recovery.
+    Ok(previous.clone())
+}
+
 pub fn resolve_input_device(
     host: &Host,
     input_index: i32,

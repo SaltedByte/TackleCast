@@ -89,6 +89,8 @@ pub struct PreparedUi {
 #[derive(Default)]
 pub struct UiOutput {
     pub apply_settings: Option<Settings>,
+    pub restart_capture: bool,
+    pub restart_audio: bool,
     pub live_video: Option<Settings>,
     pub slider_active: bool,
     pub toggle_fullscreen: bool,
@@ -321,6 +323,9 @@ fn draw_menu(
                                 match *tab {
                                     MenuTab::Video => {
                                         card_section(ui, "CAPTURE SOURCE", text_scale, |ui| {
+                                            if styled_button(ui, "Reconnect capture").clicked() {
+                                                output.restart_capture = true;
+                                            }
                                             let old = draft.video_device.clone();
                                             labeled_combo_string(
                                                 ui,
@@ -518,6 +523,9 @@ fn draw_menu(
                                                     .size(12.0 * text_scale)
                                                     .color(COLOR_TEXT_SECONDARY),
                                             );
+                                            if styled_button(ui, "Restart audio").clicked() {
+                                                output.restart_audio = true;
+                                            }
                                         });
                                     }
                                     MenuTab::Display => {

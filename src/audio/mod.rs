@@ -13,6 +13,7 @@ use linux as platform;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 use crate::devices;
@@ -23,12 +24,22 @@ pub use common::{
 
 const RING_BUFFER_CAPACITY: usize = 48_000 * 2 * 2; // ~2 seconds of stereo audio headroom
 
+#[derive(Clone)]
+struct AudioRoute {
+    input: ResolvedInput,
+    output: cpal::Device,
+}
+
 pub struct AudioPassthrough {
     input_stream: Option<Stream>,
     output_stream: Option<Stream>,
     directshow_sink: Option<DirectShowAudioSink>,
     volume_ctrl: VolumeController,
     diagnostics: Arc<AudioDiagnostics>,
+    route: Option<AudioRoute>,
+    recovery: crate::recovery::RecoveryBackoff,
+    last_activity_log: Instant,
+    recovery_exhaustion_logged: bool,
 }
 
 impl AudioPassthrough {
@@ -39,11 +50,115 @@ impl AudioPassthrough {
             directshow_sink: None,
             volume_ctrl: VolumeController::new(1.0, false),
             diagnostics: Arc::new(AudioDiagnostics::new()),
+            route: None,
+            recovery: crate::recovery::RecoveryBackoff::default(),
+            last_activity_log: Instant::now(),
+            recovery_exhaustion_logged: false,
         }
     }
 
     pub fn status(&self) -> AudioStatus {
-        self.diagnostics.status()
+        let status = self.diagnostics.status();
+        if self.recovery.exhausted()
+            && matches!(
+                status,
+                AudioStatus::Error(_) | AudioStatus::NoInput | AudioStatus::NoOutput
+            )
+        {
+            return AudioStatus::Error(format!(
+                "{status}. Automatic recovery stopped; try Restart audio or reconnect the device"
+            ));
+        }
+        status
+    }
+
+    pub fn has_route(&self) -> bool {
+        self.route.is_some()
+    }
+
+    pub fn uses_directshow(&self) -> bool {
+        self.route
+            .as_ref()
+            .is_some_and(|route| matches!(route.input, ResolvedInput::DirectShow(_)))
+    }
+
+    pub fn reset_recovery(&mut self) {
+        self.recovery.reset();
+        self.recovery_exhaustion_logged = false;
+    }
+
+    /// Preserve endpoint identity. Re-enumerated numeric indexes or default
+    /// devices can identify a microphone/other output after USB removal.
+    pub fn restart_previous(&mut self) {
+        let Some(route) = self.route.clone() else {
+            return;
+        };
+        self.stop();
+        let refreshed = (|| {
+            let input = match route.input {
+                ResolvedInput::Device(device) => {
+                    ResolvedInput::Device(platform::refresh_recovery_device(&device, true)?)
+                }
+                directshow => directshow,
+            };
+            let output = platform::refresh_recovery_device(&route.output, false)?;
+            Ok::<_, String>((input, output))
+        })();
+        match refreshed {
+            Ok((input, output)) => self.start_resolved(input, output),
+            Err(message) => {
+                warn!("audio recovery could not reopen the same devices: {message}");
+                self.diagnostics = Arc::new(AudioDiagnostics::new());
+                self.diagnostics.set_status(AudioStatus::Error(message));
+            }
+        }
+    }
+
+    /// Returns true when DirectShow recovery requires the capture worker to be
+    /// stopped first. CPAL streams are rebuilt here on their owning UI thread.
+    pub fn poll_health(&mut self) -> bool {
+        let now = Instant::now();
+        if self.diagnostics.status() == AudioStatus::Connected {
+            if let Some(message) = self.diagnostics.callback_stall() {
+                warn!("audio stalled: {message}");
+                self.diagnostics.log_activity();
+                self.diagnostics
+                    .set_status(AudioStatus::Error(message.into()));
+            } else {
+                self.recovery.healthy(now);
+                self.recovery_exhaustion_logged = false;
+            }
+        }
+        let status = self.diagnostics.status();
+        if status != AudioStatus::Stopped
+            && now.duration_since(self.last_activity_log) >= Duration::from_secs(30)
+        {
+            self.diagnostics.log_activity();
+            self.last_activity_log = now;
+        }
+        if self.has_route()
+            && matches!(
+                status,
+                AudioStatus::Error(_) | AudioStatus::NoInput | AudioStatus::NoOutput
+            )
+        {
+            self.recovery.failed(now);
+            if self.recovery.exhausted() && !self.recovery_exhaustion_logged {
+                warn!("audio automatic recovery exhausted after 3 attempts; use Restart audio or reconnect the device");
+                self.recovery_exhaustion_logged = true;
+            }
+            if self.recovery.take_ready(now) {
+                info!(
+                    "audio recovery attempt {}/3 using the previous devices",
+                    self.recovery.attempts()
+                );
+                if self.uses_directshow() {
+                    return true;
+                }
+                self.restart_previous();
+            }
+        }
+        false
     }
 
     pub fn directshow_sink(&self) -> Option<DirectShowAudioSink> {
@@ -64,6 +179,9 @@ impl AudioPassthrough {
         muted: bool,
     ) {
         self.stop();
+        self.route = None;
+        self.reset_recovery();
+        self.diagnostics = Arc::new(AudioDiagnostics::new());
         self.volume_ctrl.set_volume(volume);
         self.volume_ctrl.set_muted(muted);
 
@@ -97,6 +215,18 @@ impl AudioPassthrough {
             }
         };
 
+        self.start_resolved(resolved_input, output_device);
+    }
+
+    fn start_resolved(&mut self, resolved_input: ResolvedInput, output_device: cpal::Device) {
+        // Retired DirectShow sinks/callbacks keep their own diagnostics. Late
+        // callbacks from an old session cannot overwrite this session's status.
+        self.diagnostics = Arc::new(AudioDiagnostics::new());
+        self.last_activity_log = Instant::now();
+        self.route = Some(AudioRoute {
+            input: resolved_input.clone(),
+            output: output_device.clone(),
+        });
         let output_name = output_device
             .name()
             .unwrap_or_else(|_| "<unknown output>".to_string());
@@ -268,7 +398,7 @@ impl AudioPassthrough {
         }
         info!("Audio output started successfully");
 
-        self.diagnostics.set_status(AudioStatus::Connected);
+        self.diagnostics.mark_connected();
         self.input_stream = Some(input_stream);
         self.output_stream = Some(output_stream);
     }
@@ -423,7 +553,7 @@ where
     let mut channels_converted = Vec::with_capacity(4096);
     let mut resampled = Vec::with_capacity(4096);
 
-    let err_diag = diagnostics;
+    let err_diag = diagnostics.clone();
     device.build_input_stream(
         config,
         move |data: &[T], _| {
@@ -432,6 +562,7 @@ where
             for &sample in data {
                 scratch_f32.push(f32::from_sample(sample));
             }
+            diagnostics.record_input_callback(&scratch_f32);
 
             channels_converted.clear();
             convert_channels(
@@ -465,11 +596,12 @@ where
     T: Sample + SizedSample + FromSample<f32>,
 {
     let mut scratch = [0.0f32; 2048];
-    let err_diag = diagnostics;
+    let err_diag = diagnostics.clone();
 
     device.build_output_stream(
         config,
         move |data: &mut [T], _| {
+            diagnostics.record_output_callback(data.len());
             let mut offset = 0;
             let gain = volume_ctrl.gain();
 

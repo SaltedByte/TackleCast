@@ -15,6 +15,7 @@ mod gpu_decode;
 #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
 mod gpu_monitor;
 mod logger;
+mod recovery;
 mod render;
 mod settings;
 mod triple_buffer;
@@ -59,6 +60,12 @@ const HOUSEKEEPING_TICK: Duration = Duration::from_millis(100);
 /// A capture counts as live while frames have arrived this recently. Used to
 /// decide whether to hold the display awake.
 const CAPTURE_LIVE_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AudioRestart {
+    Previous,
+    Selected,
+}
 
 /// Events sent from background threads to the winit event loop.
 #[derive(Debug, Clone)]
@@ -229,6 +236,9 @@ struct App {
     renderer: Option<Renderer>,
     ui: Option<UiState>,
     capture: Option<CaptureThread>,
+    capture_restart_pending: bool,
+    audio_restart_pending: Option<AudioRestart>,
+    capture_recovery: recovery::RecoveryBackoff,
     audio: AudioPassthrough,
     latest_stats: Option<CaptureStats>,
     latest_error: Option<String>,
@@ -268,6 +278,9 @@ impl App {
             renderer: None,
             ui: None,
             capture: None,
+            capture_restart_pending: false,
+            audio_restart_pending: None,
+            capture_recovery: recovery::RecoveryBackoff::default(),
             audio: AudioPassthrough::new(),
             latest_stats: None,
             latest_error: None,
@@ -547,6 +560,8 @@ impl ApplicationHandler<AppEvent> for App {
                     let toggle_fullscreen = prepared_ui.output.toggle_fullscreen;
                     let exit_requested = prepared_ui.output.exit_requested;
                     let apply_settings = prepared_ui.output.apply_settings.clone();
+                    let restart_capture = prepared_ui.output.restart_capture;
+                    let restart_audio = prepared_ui.output.restart_audio;
                     if let Some(live) = &prepared_ui.output.live_video {
                         renderer.set_picture_settings(
                             live.brightness,
@@ -570,6 +585,21 @@ impl ApplicationHandler<AppEvent> for App {
                     if let Some(settings) = apply_settings {
                         self.apply_settings(settings);
                     }
+                    if restart_capture {
+                        self.capture_recovery.reset();
+                        self.audio.reset_recovery();
+                        self.queue_capture_restart(Some(AudioRestart::Previous));
+                    } else if restart_audio {
+                        info!("audio restart requested from settings");
+                        self.audio.reset_recovery();
+                        if self.audio.uses_directshow() || self.capture_restart_pending {
+                            self.queue_capture_restart(Some(AudioRestart::Previous));
+                        } else if self.audio.has_route() {
+                            self.audio.restart_previous();
+                        } else {
+                            self.start_audio();
+                        }
+                    }
                     if exit_requested {
                         if let Some(capture) = &mut self.capture {
                             capture.stop();
@@ -589,13 +619,21 @@ impl ApplicationHandler<AppEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
             AppEvent::FrameReady => {
+                if self.capture_restart_pending
+                    || self.capture.is_none()
+                    || self.latest_error.is_some()
+                {
+                    return;
+                }
                 // Skip frame processing entirely when the window isn't visible.
                 // Without a render pass to drain them, queued write_texture calls
                 // accumulate in GPU memory indefinitely (display off, minimized, etc).
                 if self.is_minimized {
                     // Still drain the triple buffer so it doesn't hold stale frames
                     if let Some(capture) = &mut self.capture {
-                        let _ = capture.latest_frame();
+                        if capture.latest_frame().is_some() {
+                            self.last_frame_at = Some(Instant::now());
+                        }
                     }
                     return;
                 }
@@ -631,14 +669,20 @@ impl ApplicationHandler<AppEvent> for App {
 
         // Poll non-frame channels (stats, errors, negotiation).
         // These are low-frequency and don't need event-driven wakeup.
-        if let Some(capture) = &mut self.capture {
+        let restarting = self.capture_restart_pending;
+        if let Some(capture) = self.capture.as_mut().filter(|_| !restarting) {
             if let Some(stats) = capture.latest_stats() {
                 self.latest_stats = Some(stats);
             }
 
             if let Some(error_message) = capture.latest_error() {
                 self.latest_error = Some(error_message.clone());
+                self.latest_stats = None;
+                self.last_frame_at = None;
                 warn!("capture error: {error_message}");
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             }
 
             // If the capture thread fell back to a different resolution/fps,
@@ -653,6 +697,78 @@ impl ApplicationHandler<AppEvent> for App {
                 if let Err(error) = self.settings.save() {
                     error!("failed to save negotiated settings: {error}");
                 }
+            }
+        }
+
+        // Reap only completed workers. Driver teardown never runs on the UI
+        // thread, and sessions cannot overlap or reuse each other's GPU buffers.
+        if self
+            .capture
+            .as_ref()
+            .is_some_and(CaptureThread::is_finished)
+        {
+            let mut capture = self.capture.take().expect("finished capture exists");
+            if let Some(message) = capture.latest_error() {
+                self.latest_error = Some(message);
+            }
+            capture.stop();
+            if !self.capture_restart_pending {
+                self.latest_error
+                    .get_or_insert_with(|| "Capture stopped unexpectedly; reconnecting...".into());
+                self.capture_recovery.failed(Instant::now());
+                warn!(
+                    "capture stopped after {} recovery attempts: {:?}",
+                    self.capture_recovery.attempts(),
+                    self.latest_error
+                );
+                self.latest_stats = None;
+                self.last_frame_at = None;
+                self.audio.stop();
+                self.audio_restart_pending = Some(AudioRestart::Previous);
+                if self.capture_recovery.exhausted() {
+                    let message = self.latest_error.get_or_insert_default();
+                    message
+                        .push_str(". Automatic recovery stopped; use Reconnect capture to retry.");
+                }
+            }
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+        if self.capture.is_none()
+            && (self.capture_restart_pending || self.capture_recovery.take_ready(Instant::now()))
+        {
+            self.capture_restart_pending = false;
+            if let Some(restart) = self.audio_restart_pending.take() {
+                match restart {
+                    AudioRestart::Selected => self.start_audio(),
+                    AudioRestart::Previous => self.audio.restart_previous(),
+                }
+            }
+            self.start_capture();
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+        if self.capture.is_some()
+            && self.latest_error.is_none()
+            && self
+                .last_frame_at
+                .is_some_and(|at| at.elapsed() < CAPTURE_LIVE_TIMEOUT)
+            && !self.capture_restart_pending
+        {
+            self.capture_recovery.healthy(Instant::now());
+        }
+        let audio_status = self.audio.status();
+        if !self.capture_restart_pending
+            && self.audio_restart_pending.is_none()
+            && self.audio.poll_health()
+        {
+            self.queue_capture_restart(Some(AudioRestart::Previous));
+        }
+        if self.audio.status() != audio_status {
+            if let Some(window) = &self.window {
+                window.request_redraw();
             }
         }
 
@@ -707,6 +823,22 @@ impl ApplicationHandler<AppEvent> for App {
 }
 
 impl App {
+    fn queue_capture_restart(&mut self, restart_audio: Option<AudioRestart>) {
+        self.capture_restart_pending = true;
+        // A user-selected route takes priority over a queued recovery of the old route.
+        if self.audio_restart_pending != Some(AudioRestart::Selected) {
+            self.audio_restart_pending = restart_audio.or(self.audio_restart_pending);
+        }
+        self.last_frame_at = None;
+        self.latest_stats = None;
+        if let Some(capture) = &mut self.capture {
+            capture.stop();
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     fn apply_settings(&mut self, mut new_settings: Settings) {
         new_settings.sanitize();
         let old_settings = self.settings.clone();
@@ -728,30 +860,25 @@ impl App {
 
         let mute_changed = old_settings.audio_muted != self.settings.audio_muted;
 
-        let was_dshow = self.audio.directshow_sink().is_some();
-        if audio_device_changed {
-            if was_dshow {
-                if let Some(mut capture) = self.capture.take() {
-                    capture.stop();
-                }
-            }
-            self.audio.stop();
-            self.start_audio();
-        } else {
-            if (old_settings.volume - self.settings.volume).abs() > f64::EPSILON {
-                self.audio.set_volume(self.settings.volume);
-            }
-            if mute_changed {
-                self.audio.set_muted(self.settings.audio_muted);
-            }
+        if (old_settings.volume - self.settings.volume).abs() > f64::EPSILON {
+            self.audio.set_volume(self.settings.volume);
         }
-        let now_dshow = self.audio.directshow_sink().is_some();
-
-        if video_changed || (audio_device_changed && (was_dshow || now_dshow)) {
-            if let Some(mut capture) = self.capture.take() {
-                capture.stop();
+        if mute_changed {
+            self.audio.set_muted(self.settings.audio_muted);
+        }
+        if video_changed || audio_device_changed {
+            let independent_audio_change = audio_device_changed
+                && !video_changed
+                && !self.audio.uses_directshow()
+                && self.settings.audio_input != devices::DIRECTSHOW_AUDIO_INDEX
+                && self.capture.is_some()
+                && !self.capture_restart_pending;
+            if independent_audio_change {
+                self.start_audio();
+            } else {
+                self.capture_recovery.reset();
+                self.queue_capture_restart(audio_device_changed.then_some(AudioRestart::Selected));
             }
-            self.start_capture();
         }
 
         if let Some(renderer) = &mut self.renderer {
@@ -771,7 +898,9 @@ impl App {
     }
 
     fn overlay_info(&self) -> OverlayInfo {
-        let status_message = if let Some(error_message) = self.latest_error.as_ref() {
+        let status_message = if self.capture_restart_pending {
+            Some("Restarting capture...".into())
+        } else if let Some(error_message) = self.latest_error.as_ref() {
             Some(error_message.clone())
         } else if self.latest_stats.is_none() {
             Some("Connecting...".to_string())
@@ -830,6 +959,7 @@ impl App {
     fn start_capture(&mut self) {
         self.latest_stats = None;
         self.latest_error = None;
+        self.last_frame_at = None;
         let capture_config = get_capture_config(
             &self.settings.resolution,
             self.settings.get_fps(),

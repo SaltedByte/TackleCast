@@ -80,6 +80,34 @@ Input and output streams use their native configurations. Mono is duplicated to 
 
 Surround-to-stereo conversion retains center dialogue, LFE, and surround speakers with normalized gains. It assumes conventional interleaved order: FL, FR, FC, LFE, BL, BR, SL, SR. Quad omits FC/LFE, 5.0 omits LFE, and 6.1 uses BC/SL/SR after LFE. CPAL does not report speaker masks; configure a source with a different speaker order for stereo PCM or route it to this order.
 
+## Capture and audio recovery regression checks
+
+Unit tests cover permanent capture read errors/EOF, cancellation during empty
+reads, video-stall deadlines, nonblocking worker retirement, callback monitoring
+including legitimate silence, and bounded recovery budgets. On physical hardware:
+
+- Unplug USB during capture: the UI must remain responsive, display a capture
+  error, and stop showing stale delivered FPS. Reconnect during automatic retries
+  or use Video > Reconnect capture after retries are exhausted.
+- Change resolution/FPS while capture is stalled and while a restart is pending.
+  Only the newest applied settings should open; workers and shared GPU buffers
+  must not overlap. Close the app while the device is unavailable.
+- Repeat with NV12/software decode, MJPEG GPU decode, and explicit DirectShow
+  audio where available. An operating-system driver stuck in teardown can delay
+  reconnection; the app must remain usable while waiting.
+- Interrupt WASAPI input or output: verify recovery uses the same endpoint IDs
+  even if enumeration order or system defaults change. Recovery must not open
+  another microphone or output when an endpoint is missing.
+- Test PS5/ShadowCast 3 across console sleep/wake and HDMI mode changes. Use
+  Audio > Restart audio if necessary, and retain the log around onset/recovery.
+  Silence alone must not trigger restarts. A hardware reboot may still be needed.
+- Verify three failed automatic retries stop; a manual retry restores the budget.
+  Check audio-only recovery leaves WASAPI video capture running and that explicit
+  DirectShow audio retires/restarts its shared capture worker first.
+
+These checks do not establish the cause of issue #22's original freeze or of an
+intermittent PS5 audio loss; physical reporter retesting is still required.
+
 ## Validation without a capture card
 
 ```sh

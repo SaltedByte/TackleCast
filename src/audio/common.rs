@@ -1,5 +1,5 @@
 use cpal::{FromSample, Sample, SampleFormat, SizedSample};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use tracing::warn;
@@ -34,6 +34,7 @@ pub struct DirectShowAudioSink {
     pub diagnostics: Arc<AudioDiagnostics>,
 }
 
+#[derive(Clone)]
 pub enum ResolvedInput {
     Device(cpal::Device),
     #[allow(dead_code)]
@@ -61,6 +62,12 @@ impl std::fmt::Display for AudioStreamInfo {
 
 /// Diagnostic state for monitoring the audio pipeline.
 pub struct AudioDiagnostics {
+    started_at: Instant,
+    last_input_ms: AtomicU64,
+    last_output_ms: AtomicU64,
+    input_samples: AtomicU64,
+    nonzero_input_samples: AtomicU64,
+    output_samples: AtomicU64,
     status_code: AtomicU32, // 0: Stopped, 1: Connected, 2: NoInput, 3: NoOutput, 4: Error
     last_error: RwLock<Option<String>>,
     input_info: RwLock<Option<AudioStreamInfo>>,
@@ -74,6 +81,12 @@ pub struct AudioDiagnostics {
 impl AudioDiagnostics {
     pub fn new() -> Self {
         Self {
+            started_at: Instant::now(),
+            last_input_ms: AtomicU64::new(0),
+            last_output_ms: AtomicU64::new(0),
+            input_samples: AtomicU64::new(0),
+            nonzero_input_samples: AtomicU64::new(0),
+            output_samples: AtomicU64::new(0),
             status_code: AtomicU32::new(0),
             last_error: RwLock::new(None),
             input_info: RwLock::new(None),
@@ -106,6 +119,65 @@ impl AudioDiagnostics {
         self.status_code.store(code, Ordering::Release);
     }
 
+    pub fn record_input_callback(&self, samples: &[f32]) {
+        if samples.is_empty() {
+            return;
+        }
+        self.input_samples
+            .fetch_add(samples.len() as u64, Ordering::Relaxed);
+        self.nonzero_input_samples.fetch_add(
+            samples.iter().filter(|s| **s != 0.0).count() as u64,
+            Ordering::Relaxed,
+        );
+        self.last_input_ms
+            .store(self.elapsed_ms() + 1, Ordering::Relaxed);
+    }
+
+    pub fn record_output_callback(&self, samples: usize) {
+        if samples > 0 {
+            self.output_samples
+                .fetch_add(samples as u64, Ordering::Relaxed);
+            self.last_output_ms
+                .store(self.elapsed_ms() + 1, Ordering::Relaxed);
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
+    }
+
+    pub fn callback_stall(&self) -> Option<&'static str> {
+        self.callback_stall_at(self.elapsed_ms())
+    }
+
+    fn callback_stall_at(&self, elapsed_ms: u64) -> Option<&'static str> {
+        let input = self.last_input_ms.load(Ordering::Relaxed).saturating_sub(1);
+        let output = self
+            .last_output_ms
+            .load(Ordering::Relaxed)
+            .saturating_sub(1);
+        if elapsed_ms.saturating_sub(input) >= 5000 {
+            Some("No audio input callbacks for 5 seconds")
+        } else if elapsed_ms.saturating_sub(output) >= 5000 {
+            Some("No audio output callbacks for 5 seconds")
+        } else {
+            None
+        }
+    }
+
+    pub fn log_activity(&self) {
+        let elapsed = self.elapsed_ms();
+        tracing::info!(
+            "audio activity: input_samples={}, nonzero_input_samples={}, output_samples={}, input_callback_age_ms={}, output_callback_age_ms={}, status={}",
+            self.input_samples.load(Ordering::Relaxed),
+            self.nonzero_input_samples.load(Ordering::Relaxed),
+            self.output_samples.load(Ordering::Relaxed),
+            elapsed.saturating_sub(self.last_input_ms.load(Ordering::Relaxed).saturating_sub(1)),
+            elapsed.saturating_sub(self.last_output_ms.load(Ordering::Relaxed).saturating_sub(1)),
+            self.status(),
+        );
+    }
+
     pub fn status(&self) -> AudioStatus {
         match self.status_code.load(Ordering::Acquire) {
             1 => AudioStatus::Connected,
@@ -120,6 +192,14 @@ impl AudioDiagnostics {
             ),
             _ => AudioStatus::Stopped,
         }
+    }
+
+    pub fn mark_connected(&self) {
+        // An error callback may run immediately after play(), before startup
+        // finishes. Do not overwrite that error with a successful-start status.
+        let _ = self
+            .status_code
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
     }
 
     pub fn set_input_info(&self, info: Option<AudioStreamInfo>) {
@@ -536,6 +616,51 @@ impl VolumeController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silent_samples_are_activity_and_do_not_trigger_recovery() {
+        let diagnostics = AudioDiagnostics::new();
+        diagnostics.record_input_callback(&[0.0; 32]);
+        diagnostics.record_output_callback(32);
+        assert_eq!(diagnostics.input_samples.load(Ordering::Relaxed), 32);
+        assert_eq!(diagnostics.nonzero_input_samples.load(Ordering::Relaxed), 0);
+        // A steady stream of silence updates the same callback clock as sound.
+        diagnostics.last_input_ms.store(20_001, Ordering::Relaxed);
+        diagnostics.last_output_ms.store(20_001, Ordering::Relaxed);
+        assert_eq!(diagnostics.callback_stall_at(20_000), None);
+    }
+
+    #[test]
+    fn missing_callbacks_detect_input_and_output_stalls_independently() {
+        let diagnostics = AudioDiagnostics::new();
+        assert_eq!(diagnostics.callback_stall_at(4999), None);
+        assert_eq!(
+            diagnostics.callback_stall_at(5000),
+            Some("No audio input callbacks for 5 seconds")
+        );
+        diagnostics.last_input_ms.store(6001, Ordering::Relaxed);
+        assert_eq!(
+            diagnostics.callback_stall_at(6000),
+            Some("No audio output callbacks for 5 seconds")
+        );
+        diagnostics.last_output_ms.store(6001, Ordering::Relaxed);
+        assert_eq!(diagnostics.callback_stall_at(6000), None);
+        diagnostics.record_input_callback(&[0.0, 0.5, -0.25]);
+        assert_eq!(diagnostics.nonzero_input_samples.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn successful_start_does_not_overwrite_an_immediate_stream_error() {
+        let diagnostics = AudioDiagnostics::new();
+        diagnostics.set_status(AudioStatus::Error(
+            "device invalidated during startup".into(),
+        ));
+        diagnostics.mark_connected();
+        assert!(matches!(diagnostics.status(), AudioStatus::Error(_)));
+        let fresh = AudioDiagnostics::new();
+        fresh.mark_connected();
+        assert_eq!(fresh.status(), AudioStatus::Connected);
+    }
 
     #[test]
     fn channel_conversion_mono_to_stereo() {
