@@ -508,7 +508,13 @@ fn run_device_capture(
             },
         );
         match result {
-            Ok(()) => return,
+            Ok(()) => {
+                crate::drift::event(format_args!(
+                    "video_capture_returned stop_requested={}",
+                    stop_flag.load(Ordering::Relaxed)
+                ));
+                return;
+            }
             Err(error) => {
                 crate::drift::event(format_args!("video_open_attempt_failed"));
                 warn!("capture attempt failed: {error}");
@@ -854,6 +860,7 @@ fn run_device_capture_inner(
         // Software decode path (fallback or non-MJPEG formats)
         if let Err(error) = decoder.send_packet(&packet) {
             packet_errors += 1;
+            crate::drift::video_decode_error();
             if packet_errors <= 10 || packet_errors.is_multiple_of(50) {
                 warn!(
                     "capture packet decode submission failed for '{}': {} (count={})",

@@ -18,6 +18,8 @@ struct Monitor {
     origin: Instant,
     next_id: AtomicU64,
     video: [Marker; 4],
+    video_decode_errors: AtomicU64,
+    last_video_error_us: AtomicU64,
     tx: mpsc::Sender<Command>,
 }
 
@@ -181,6 +183,8 @@ pub fn init() {
         origin: Instant::now(),
         next_id: AtomicU64::new(1),
         video: std::array::from_fn(|_| Marker::default()),
+        video_decode_errors: AtomicU64::new(0),
+        last_video_error_us: AtomicU64::new(0),
         tx,
     });
     if MONITOR.set(monitor.clone()).is_err() {
@@ -249,6 +253,13 @@ pub fn video(stage: usize) {
     }
 }
 
+pub fn video_decode_error() {
+    if let Some(m) = MONITOR.get() {
+        m.video_decode_errors.fetch_add(1, Relaxed);
+        m.last_video_error_us.store(elapsed_us(), Relaxed);
+    }
+}
+
 fn worker(m: Arc<Monitor>, rx: mpsc::Receiver<Command>) {
     let mut active: Option<Arc<AudioRingBuffer>> = None;
     let mut previous = [0; 11];
@@ -287,7 +298,7 @@ fn worker(m: Arc<Monitor>, rx: mpsc::Receiver<Command>) {
                 summarize(ring, &mut previous, &mut last_audio, "interval");
             }
             let stages = m.video.each_ref().map(Marker::summary);
-            tracing::info!("drift video t_us={} clock=host_Instant stages=(total_frames,last_host_us,interval_max_gap_us) packet_return={:?} decoded_publish={:?} ui_upload={:?} present_return={:?}", elapsed_us(), stages[0], stages[1], stages[2], stages[3]);
+            tracing::info!("drift video t_us={} clock=host_Instant stages=(total_frames,last_host_us,interval_max_gap_us) packet_return={:?} decoded_publish={:?} ui_upload={:?} present_return={:?} decode_submission_errors_total={} last_error_host_us={}", elapsed_us(), stages[0], stages[1], stages[2], stages[3], m.video_decode_errors.load(Relaxed), m.last_video_error_us.load(Relaxed));
             deadline = Instant::now() + PERIOD;
         }
     }

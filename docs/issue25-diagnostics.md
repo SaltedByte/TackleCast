@@ -106,7 +106,9 @@ FFmpeg video packet returned, decoded frame published to the triple buffer,
 UI frame upload returned, and wgpu present call returned. These are independent
 counts, not paired frames. Synthetic video has no packet-return stage. Video
 open/negotiation/stop/error and settings-change events mark lifecycle boundaries.
-Video cumulative counts span resets; audio counts use stream IDs.
+Video cumulative counts span resets; audio counts use stream IDs. Video summaries
+also retain decode-submission error counts and their latest host timestamp.
+Capture-return events distinguish an explicit stop from an input ending itself.
 
 All timing markers are **host-side proxies**. There are no collected hardware
 audio timestamps or actual speaker/display presentation timestamps. CPAL's
@@ -132,7 +134,8 @@ On Ubuntu 24.04 x86_64 with Rust 1.93.1 and rustfmt/clippy:
 ```sh
 sudo apt-get update
 sudo apt-get install -y build-essential nasm libasound2-dev libclang-dev pkg-config \
-  curl ca-certificates git python3 xvfb xauth libxkbcommon-x11-0 libgl1-mesa-dri mesa-vulkan-drivers
+  curl ca-certificates git python3 xvfb xauth libxkbcommon-x11-0 \
+  libxcursor1 libxi6 libxinerama1 libgl1-mesa-dri mesa-vulkan-drivers
 bash scripts/setup_linux_dependencies.sh
 export PKG_CONFIG_PATH="$PWD/.deps/ffmpeg/lib/pkgconfig"
 export LD_LIBRARY_PATH="$PWD/.deps/ffmpeg/lib"
