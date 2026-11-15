@@ -77,6 +77,10 @@ Press **Escape** to open the four-tab menu. Shorter tabs keep the same menu size
 
 Picture, scaling, and color adjustments preview immediately. The backdrop clears while editing sliders or their numeric values so you can judge the live picture. Closing the menu saves the settings and applies capture/audio device changes.
 
+Capture errors and a 10-second absence of decoded frames trigger up to three recovery attempts, with delays of 3, 6, and 12 seconds. The interface remains responsive while the capture worker stops. Use **Video > Reconnect capture** to retry manually after reconnecting a card. A new capture session starts only after the previous worker finishes.
+
+Audio stream errors or five seconds without input/output callbacks also trigger up to three recovery attempts using the same audio endpoints. Silent samples count as normal activity. **Audio > Restart audio** retries the current routing without closing TackleCast; DirectShow audio also restarts its shared video capture session. Both recovery controls use the currently applied settings. A minute of stable operation restores the automatic retry budget. If recovery fails, a card/driver or HDMI-source reset may still be necessary. Logs include per-session sample activity, callback ages, and recovery attempts to help diagnose intermittent dropouts.
+
 The overlay separates the selected **nominal FPS** from **delivered FPS**. For example, a `59.94` nominal mode stays distinct from `60`, even when the short-term delivery counter is close to 60. Auto color labels include `default` when metadata is missing; manual overrides are available when the source's reported color information needs correcting.
 
 ## How It Works

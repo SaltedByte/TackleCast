@@ -33,6 +33,28 @@ pub fn preferred_audio_host() -> Host {
     cpal::default_host()
 }
 
+/// Refresh WASAPI's cached clients using the same endpoint ID, including after
+/// unplug/replug. CPAL's WASAPI equality compares IMMDevice::GetId, not names.
+pub fn refresh_recovery_device(previous: &Device, input: bool) -> Result<Device, String> {
+    let host = preferred_audio_host();
+    let devices = if input {
+        host.input_devices()
+    } else {
+        host.output_devices()
+    }
+    .map_err(|error| format!("Could not enumerate the previous audio endpoint: {error}"))?;
+    let cpal::platform::DeviceInner::Wasapi(previous) = previous.as_inner();
+    devices
+        .into_iter()
+        .find(|device| {
+            let cpal::platform::DeviceInner::Wasapi(candidate) = device.as_inner();
+            previous == candidate
+        })
+        .ok_or_else(|| {
+            "The previous audio endpoint is disconnected; no substitute device was selected".into()
+        })
+}
+
 /// Resolves the audio input device for capture, with multi-stage fallback:
 /// 1. If DIRECTSHOW_AUDIO_INDEX is selected, use DirectShow audio from the active video device.
 /// 2. If explicit input_index is provided and valid, use that device.

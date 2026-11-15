@@ -2,6 +2,8 @@ use crate::color::ColorInfo;
 use crate::frame_rate::FrameRate;
 use crate::settings::{ColorRange, ColorSpace, VideoFormat};
 use std::f32::consts::PI;
+use std::ffi::CString;
+use std::ops::{Deref, DerefMut};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -27,6 +29,136 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::triple_buffer::Producer;
 use crate::AppEvent;
+
+const CAPTURE_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+struct CaptureInterrupt {
+    stop: Arc<AtomicBool>,
+    probe_started: Instant,
+    probing: AtomicBool,
+}
+
+unsafe extern "C" fn interrupt_capture(opaque: *mut std::ffi::c_void) -> i32 {
+    // SAFETY: CaptureInput owns this stable allocation until after its context closes.
+    let state = unsafe { &*opaque.cast::<CaptureInterrupt>() };
+    i32::from(
+        state.stop.load(Ordering::Relaxed)
+            || (state.probing.load(Ordering::Relaxed)
+                && state.probe_started.elapsed() >= CAPTURE_STALL_TIMEOUT),
+    )
+}
+
+struct CaptureInput {
+    // Fields drop in declaration order: close FFmpeg before freeing callback state.
+    context: format::context::Input,
+    _interrupt: Box<CaptureInterrupt>,
+}
+
+impl Deref for CaptureInput {
+    type Target = format::context::Input;
+    fn deref(&self) -> &Self::Target {
+        &self.context
+    }
+}
+
+impl DerefMut for CaptureInput {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.context
+    }
+}
+
+fn open_capture_input(
+    url: &str,
+    input_format: &ffmpeg::Format,
+    options: Dictionary<'_>,
+    stop: Arc<AtomicBool>,
+) -> Result<CaptureInput, ffmpeg::Error> {
+    if stop.load(Ordering::Relaxed) {
+        return Err(ffmpeg::Error::Exit);
+    }
+    let ffmpeg::Format::Input(input_format) = input_format else {
+        return Err(ffmpeg::Error::InvalidData);
+    };
+    let url = CString::new(url).map_err(|_| ffmpeg::Error::InvalidData)?;
+    let mut interrupt = Box::new(CaptureInterrupt {
+        stop,
+        probe_started: Instant::now(),
+        probing: AtomicBool::new(true),
+    });
+    // DirectShow otherwise waits indefinitely for a sample. V4L2 needs NONBLOCK
+    // before open so its file descriptor is opened with O_NONBLOCK as well.
+    // SAFETY: pointers are valid for each call; context ownership transfers to
+    // Input on success. Both failure paths release context/options exactly once.
+    unsafe {
+        let mut context = ffmpeg::ffi::avformat_alloc_context();
+        if context.is_null() {
+            return Err(ffmpeg::Error::Bug);
+        }
+        (*context).flags |= ffmpeg::ffi::AVFMT_FLAG_NONBLOCK;
+        (*context).interrupt_callback = ffmpeg::ffi::AVIOInterruptCB {
+            callback: Some(interrupt_capture),
+            opaque: std::ptr::from_mut(interrupt.as_mut()).cast(),
+        };
+        let mut options = options.disown();
+        let result = ffmpeg::ffi::avformat_open_input(
+            &mut context,
+            url.as_ptr(),
+            input_format.as_ptr(),
+            &mut options,
+        );
+        drop(Dictionary::own(options));
+        if result < 0 {
+            // avformat_open_input frees its context and nulls the pointer on error.
+            return Err(ffmpeg::Error::from(result));
+        }
+        let context = format::context::Input::wrap(context);
+        let mut input = CaptureInput {
+            context,
+            _interrupt: interrupt,
+        };
+        let result = ffmpeg::ffi::avformat_find_stream_info(
+            input.context.as_mut_ptr(),
+            std::ptr::null_mut(),
+        );
+        if result < 0 {
+            return Err(ffmpeg::Error::from(result));
+        }
+        input._interrupt.probing.store(false, Ordering::Relaxed);
+        Ok(input)
+    }
+}
+
+// Do not use Input::packets(): it silently retries every error except EOF,
+// including DirectShow's permanent EIO after EC_DEVICE_LOST.
+fn read_capture_packet<T>(
+    stop: &AtomicBool,
+    frame_deadline: Instant,
+    mut read: impl FnMut() -> Result<T, ffmpeg::Error>,
+) -> Result<Option<T>, String> {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        if Instant::now() >= frame_deadline {
+            return Err(
+                "No decoded video frames for 10 seconds; capture may be disconnected or stalled"
+                    .into(),
+            );
+        }
+        let result = read();
+        if stop.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        match result {
+            Ok(packet) => return Ok(Some(packet)),
+            Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::error::EAGAIN => {
+                thread::sleep(CAPTURE_POLL_INTERVAL);
+            }
+            Err(error) => return Err(format!("Capture device read failed: {error}")),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
@@ -348,9 +480,21 @@ impl CaptureThread {
 
     pub fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
-        if let Some(join_handle) = self.join_handle.take() {
-            let _ = join_handle.join();
+        // Never block the UI on a driver's open/close call. The app retains a
+        // stopping worker until it finishes before starting another session.
+        if self.is_finished() {
+            if let Some(join_handle) = self.join_handle.take() {
+                if join_handle.join().is_err() {
+                    warn!("capture worker panicked");
+                }
+            }
         }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.join_handle
+            .as_ref()
+            .is_none_or(JoinHandle::is_finished)
     }
 }
 
@@ -479,6 +623,7 @@ fn run_device_capture(
             "capture attempt: device='{}' format='{}' {}x{} @ {} FPS",
             device_name, attempt, requested_width, requested_height, requested_fps
         );
+        let mut stream_started = false;
         let result = run_device_capture_inner(
             &device_name,
             requested_width,
@@ -492,6 +637,8 @@ fn run_device_capture(
             &negotiated_tx,
             event_proxy,
             audio_sink.clone(),
+            &mut stream_started,
+            &error_tx,
             #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
             if attempt == VideoFormat::Mjpeg {
                 shared_gpu_handles.take()
@@ -504,8 +651,15 @@ fn run_device_capture(
             Err(error) => {
                 warn!("capture attempt failed: {error}");
                 last_error = Some(error);
+                // Format fallback is for opening a device, never runtime loss.
+                if stream_started {
+                    break;
+                }
             }
         }
+    }
+    if stop_flag.load(Ordering::Relaxed) {
+        return;
     }
     let _ =
         error_tx.send(last_error.unwrap_or_else(|| "No supported capture mode was found".into()));
@@ -525,6 +679,8 @@ fn run_device_capture_inner(
     negotiated_tx: &Sender<NegotiatedConfig>,
     event_proxy: &EventLoopProxy<AppEvent>,
     audio_sink: Option<crate::audio::DirectShowAudioSink>,
+    stream_started: &mut bool,
+    error_tx: &Sender<String>,
     #[cfg(all(target_os = "windows", feature = "gpu-decode"))] shared_gpu_handles: Option<
         crate::dx12_interop::ImportHandles,
     >,
@@ -572,21 +728,25 @@ fn run_device_capture_inner(
         audio_opts.set("audio_buffer_size", "20");
         let combined_url = format!("video={device_name}:audio={device_name}");
         let friendly = crate::devices::video_device_label(device_name);
-        let opened = format::open_with(&combined_url, &input_format, audio_opts.clone()).or_else(
-            |first_err| {
-                if friendly != device_name && !friendly.contains(':') {
-                    let alt_url = format!("video={device_name}:audio={friendly}");
-                    format::open_with(&alt_url, &input_format, audio_opts)
-                } else {
-                    Err(first_err)
-                }
-            },
-        );
+        let opened = open_capture_input(
+            &combined_url,
+            &input_format,
+            audio_opts.clone(),
+            stop_flag.clone(),
+        )
+        .or_else(|first_err| {
+            if friendly != device_name && !friendly.contains(':') {
+                let alt_url = format!("video={device_name}:audio={friendly}");
+                open_capture_input(&alt_url, &input_format, audio_opts, stop_flag.clone())
+            } else {
+                Err(first_err)
+            }
+        });
         match opened {
-            Ok(ctx) => ctx.input(),
+            Ok(ctx) => ctx,
             Err(audio_err) => {
-                let video_ctx =
-                    format::open_with(&url, &input_format, options).map_err(|error| {
+                let video_ctx = open_capture_input(&url, &input_format, options, stop_flag.clone())
+                    .map_err(|error| {
                         format!(
                         "failed to open {format_label} input for '{device_name}' ({url}): {error}"
                     )
@@ -594,22 +754,19 @@ fn run_device_capture_inner(
                 warn!(
                     "DirectShow audio unavailable for '{device_name}' ({audio_err}); capturing video only"
                 );
-                video_ctx.input()
+                video_ctx
             }
         }
     } else {
-        format::open_with(&url, &input_format, options)
-            .map_err(|error| {
-                format!("failed to open {format_label} input for '{device_name}' ({url}): {error}")
-            })?
-            .input()
-    };
-    #[cfg(not(target_os = "windows"))]
-    let mut input = format::open_with(&url, &input_format, options)
-        .map_err(|error| {
+        open_capture_input(&url, &input_format, options, stop_flag.clone()).map_err(|error| {
             format!("failed to open {format_label} input for '{device_name}' ({url}): {error}")
         })?
-        .input();
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut input =
+        open_capture_input(&url, &input_format, options, stop_flag.clone()).map_err(|error| {
+            format!("failed to open {format_label} input for '{device_name}' ({url}): {error}")
+        })?;
 
     let input_stream = input
         .streams()
@@ -714,8 +871,7 @@ fn run_device_capture_inner(
                             channels: in_channels,
                             sample_format: cpal::SampleFormat::F32,
                         }));
-                    sink.diagnostics
-                        .set_status(crate::audio::AudioStatus::Connected);
+                    sink.diagnostics.mark_connected();
                     Some((
                         audio_stream_index,
                         dec,
@@ -811,12 +967,19 @@ fn run_device_capture_inner(
         is_zero_copy,
     );
 
-    for (stream, packet) in input.packets() {
-        if stop_flag.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-
-        if stream.index() != stream_index {
+    *stream_started = true;
+    let mut last_frame_at = Instant::now();
+    while let Some(packet) =
+        read_capture_packet(&stop_flag, last_frame_at + CAPTURE_STALL_TIMEOUT, || {
+            let mut packet = ffmpeg::Packet::empty();
+            packet.read(&mut input).map(|()| packet)
+        })
+        .inspect_err(|message| {
+            // Report before input teardown, which can itself block in a driver.
+            let _ = error_tx.send(message.clone());
+        })?
+    {
+        if packet.stream() != stream_index {
             if let (
                 Some(ref sink),
                 Some((
@@ -830,9 +993,10 @@ fn run_device_capture_inner(
                 )),
             ) = (&audio_sink, &mut audio_decoder)
             {
-                if stream.index() == *audio_idx && a_dec.send_packet(&packet).is_ok() {
+                if packet.stream() == *audio_idx && a_dec.send_packet(&packet).is_ok() {
                     while a_dec.receive_frame(a_frame).is_ok() {
                         extract_audio_samples_f32(a_frame, scratch_f32);
+                        sink.diagnostics.record_input_callback(scratch_f32);
                         ch_buf.clear();
                         crate::audio::convert_channels(
                             scratch_f32,
@@ -876,6 +1040,7 @@ fn run_device_capture_inner(
                         let height = slot.height();
                         let format = slot.format();
                         total_frames += 1;
+                        last_frame_at = Instant::now();
                         gpu_errors = 0; // reset consecutive error count on success
 
                         if !logged_first_frame {
@@ -992,6 +1157,7 @@ fn run_device_capture_inner(
             let width = frame.width();
             let height = frame.height();
             total_frames += 1;
+            last_frame_at = Instant::now();
 
             if !logged_first_frame {
                 logged_first_frame = true;
@@ -1451,6 +1617,110 @@ fn generate_test_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_loss_and_eof_are_reported_without_retrying_permanent_errors() {
+        for error in [
+            ffmpeg::Error::Other {
+                errno: ffmpeg::error::EIO,
+            },
+            ffmpeg::Error::Eof,
+        ] {
+            let mut calls = 0;
+            let result = read_capture_packet::<()>(
+                &AtomicBool::new(false),
+                Instant::now() + Duration::from_secs(1),
+                || {
+                    calls += 1;
+                    Err(error)
+                },
+            );
+            assert!(result.unwrap_err().contains("Capture device read failed"));
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn temporarily_empty_capture_can_deliver_a_packet_or_be_cancelled() {
+        let stop = AtomicBool::new(false);
+        let mut calls = 0;
+        let result = read_capture_packet(&stop, Instant::now() + Duration::from_secs(1), || {
+            calls += 1;
+            if calls == 1 {
+                Err(ffmpeg::Error::Other {
+                    errno: ffmpeg::error::EAGAIN,
+                })
+            } else {
+                Ok(42)
+            }
+        });
+        assert_eq!(result.unwrap(), Some(42));
+        let result =
+            read_capture_packet::<()>(&stop, Instant::now() + Duration::from_secs(1), || {
+                stop.store(true, Ordering::Relaxed);
+                Err(ffmpeg::Error::Other {
+                    errno: ffmpeg::error::EAGAIN,
+                })
+            });
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(
+            read_capture_packet::<()>(&stop, Instant::now(), || panic!(
+                "cancelled read was attempted"
+            ))
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn video_stall_deadline_is_enforced_even_if_other_packets_keep_arriving() {
+        let result = read_capture_packet(&AtomicBool::new(false), Instant::now(), || {
+            Ok("audio packet")
+        });
+        assert!(result.unwrap_err().contains("No decoded video frames"));
+    }
+
+    #[test]
+    fn probe_interrupt_observes_stop_and_timeout_but_does_not_expire_live_streams() {
+        let mut state = CaptureInterrupt {
+            stop: Arc::new(AtomicBool::new(false)),
+            probe_started: Instant::now() - CAPTURE_STALL_TIMEOUT,
+            probing: AtomicBool::new(true),
+        };
+        let opaque = std::ptr::from_mut(&mut state).cast();
+        unsafe {
+            assert_eq!(interrupt_capture(opaque), 1);
+            state.probing.store(false, Ordering::Relaxed);
+            assert_eq!(interrupt_capture(opaque), 0);
+            state.stop.store(true, Ordering::Relaxed);
+            assert_eq!(interrupt_capture(opaque), 1);
+        }
+    }
+
+    #[test]
+    fn stopping_keeps_a_busy_worker_available_to_reap_without_blocking_ui() {
+        let (_, frame_consumer) = crate::triple_buffer::triple_buffer(CaptureFrame::empty);
+        let (release, blocked) = crossbeam_channel::bounded::<()>(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut capture = CaptureThread {
+            frame_consumer,
+            stats_rx: unbounded().1,
+            error_rx: unbounded().1,
+            negotiated_rx: unbounded().1,
+            stop_flag: stop.clone(),
+            join_handle: Some(thread::spawn(move || {
+                let _ = blocked.recv_timeout(Duration::from_secs(2));
+            })),
+        };
+        capture.stop();
+        assert!(stop.load(Ordering::Relaxed));
+        assert!(capture.join_handle.is_some());
+        assert!(!capture.is_finished());
+        release.send(()).unwrap();
+        capture.join_handle.take().unwrap().join().unwrap();
+        capture.stop();
+        assert!(capture.is_finished());
+    }
 
     #[test]
     fn extracts_packed_i16_audio_samples_to_interleaved_f32() {
