@@ -26,6 +26,20 @@ impl std::fmt::Display for AudioStatus {
     }
 }
 
+#[derive(Clone)]
+pub struct DirectShowAudioSink {
+    pub ring: Arc<AudioRingBuffer>,
+    pub target_sample_rate: u32,
+    pub target_channels: u16,
+    pub diagnostics: Arc<AudioDiagnostics>,
+}
+
+pub enum ResolvedInput {
+    Device(cpal::Device),
+    #[allow(dead_code)]
+    DirectShow(String),
+}
+
 /// Metadata about an active audio stream (for logging and UI inspection).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioStreamInfo {
@@ -190,6 +204,7 @@ pub fn f32_to_sample<T: Sample + SizedSample + FromSample<f32>>(sample: f32) -> 
 /// - stereo -> mono (averages left and right: (L + R) * 0.5)
 /// - pass-through when in_channels == out_channels
 /// - multi-channel downmixing (N -> 2 or N -> 1)
+#[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
 pub fn convert_channels(
     input: &[f32],
     in_channels: usize,

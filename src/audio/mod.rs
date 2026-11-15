@@ -18,7 +18,7 @@ use tracing::{error, info, warn};
 use crate::devices;
 pub use common::{
     convert_channels, AudioDiagnostics, AudioResampler, AudioRingBuffer, AudioStatus,
-    AudioStreamInfo, VolumeController,
+    AudioStreamInfo, DirectShowAudioSink, ResolvedInput, VolumeController,
 };
 
 const RING_BUFFER_CAPACITY: usize = 48_000 * 2 * 2; // ~2 seconds of stereo audio headroom
@@ -26,6 +26,7 @@ const RING_BUFFER_CAPACITY: usize = 48_000 * 2 * 2; // ~2 seconds of stereo audi
 pub struct AudioPassthrough {
     input_stream: Option<Stream>,
     output_stream: Option<Stream>,
+    directshow_sink: Option<DirectShowAudioSink>,
     volume_ctrl: VolumeController,
     diagnostics: Arc<AudioDiagnostics>,
 }
@@ -35,6 +36,7 @@ impl AudioPassthrough {
         Self {
             input_stream: None,
             output_stream: None,
+            directshow_sink: None,
             volume_ctrl: VolumeController::new(1.0, false),
             diagnostics: Arc::new(AudioDiagnostics::new()),
         }
@@ -42,6 +44,10 @@ impl AudioPassthrough {
 
     pub fn status(&self) -> AudioStatus {
         self.diagnostics.status()
+    }
+
+    pub fn directshow_sink(&self) -> Option<DirectShowAudioSink> {
+        self.directshow_sink.clone()
     }
 
     #[allow(dead_code)]
@@ -70,9 +76,9 @@ impl AudioPassthrough {
         info!("discovered audio outputs: {:?}", outputs);
 
         let video_label = devices::video_device_label(video_device_name);
-        let input_device =
+        let resolved_input =
             match platform::resolve_input_device(&host, input_index, &video_label, &inputs) {
-                Ok(device) => device,
+                Ok(resolved) => resolved,
                 Err(error) => {
                     let msg = format!("audio input unavailable: {error}");
                     warn!("{msg}");
@@ -91,12 +97,82 @@ impl AudioPassthrough {
             }
         };
 
-        let input_name = input_device
-            .name()
-            .unwrap_or_else(|_| "<unknown input>".to_string());
         let output_name = output_device
             .name()
             .unwrap_or_else(|_| "<unknown output>".to_string());
+
+        let input_device = match resolved_input {
+            ResolvedInput::Device(device) => device,
+            ResolvedInput::DirectShow(dshow_label) => {
+                let output_supported = match output_device.default_output_config() {
+                    Ok(cfg) => cfg,
+                    Err(error) => {
+                        let msg = format!("failed to get default output config: {error}");
+                        error!("{msg}");
+                        self.diagnostics.set_status(AudioStatus::Error(msg));
+                        return;
+                    }
+                };
+                let out_config = StreamConfig {
+                    channels: output_supported.channels(),
+                    sample_rate: output_supported.sample_rate(),
+                    buffer_size: cpal::BufferSize::Default,
+                };
+                let out_rate = out_config.sample_rate.0;
+                let out_channels = out_config.channels;
+                let out_format = output_supported.sample_format();
+
+                let out_info = AudioStreamInfo {
+                    device_name: output_name,
+                    sample_rate: out_rate,
+                    channels: out_channels,
+                    sample_format: out_format,
+                };
+                info!("selected audio input:  DirectShow ({dshow_label})");
+                info!("selected audio output: {out_info}");
+                self.diagnostics.set_output_info(Some(out_info));
+
+                let ring = Arc::new(AudioRingBuffer::new(
+                    RING_BUFFER_CAPACITY,
+                    self.diagnostics.clone(),
+                ));
+                let output_stream = match build_output_stream(
+                    &output_device,
+                    &out_config,
+                    out_format,
+                    ring.clone(),
+                    self.volume_ctrl.clone(),
+                    self.diagnostics.clone(),
+                ) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        let msg = format!("failed to build output audio stream: {error}");
+                        error!("{msg}");
+                        self.diagnostics.set_status(AudioStatus::Error(msg));
+                        return;
+                    }
+                };
+                if let Err(error) = output_stream.play() {
+                    let msg = format!("failed to start output audio stream: {error}");
+                    error!("{msg}");
+                    self.diagnostics.set_status(AudioStatus::Error(msg));
+                    return;
+                }
+                info!("Audio output started successfully (DirectShow input sink ready)");
+                self.directshow_sink = Some(DirectShowAudioSink {
+                    ring,
+                    target_sample_rate: out_rate,
+                    target_channels: out_channels,
+                    diagnostics: self.diagnostics.clone(),
+                });
+                self.output_stream = Some(output_stream);
+                return;
+            }
+        };
+
+        let input_name = input_device
+            .name()
+            .unwrap_or_else(|_| "<unknown input>".to_string());
 
         let (input_supported, output_supported, in_config, out_config) =
             match platform::resolve_stream_configs(&input_device, &output_device) {
@@ -200,6 +276,7 @@ impl AudioPassthrough {
     pub fn stop(&mut self) {
         self.input_stream.take();
         self.output_stream.take();
+        self.directshow_sink.take();
         self.diagnostics.set_status(AudioStatus::Stopped);
         self.diagnostics.set_input_info(None);
         self.diagnostics.set_output_info(None);

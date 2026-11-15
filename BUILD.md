@@ -24,6 +24,35 @@ You can instead set `FFMPEG_DIR` to an existing shared development build with `b
 
 GPU decoding requires a compatible NVIDIA GPU and driver. The package includes nvJPEG and cudart, but never the NVIDIA driver DLL `nvcuda.dll`. Machines without compatible hardware automatically use software decoding.
 
+## Windows audio and DXGI compatibility
+
+Automatic audio selection keeps the WASAPI matching rules and falls back to the
+system default input, whether or not a video device is selected. DirectShow audio
+remains an explicit input choice for devices such as the AVerMedia GC550 from
+issue #16. Selecting DirectShow explicitly does not silently switch to a microphone
+if the device has no usable audio pin; inspect the audio status and choose another
+input if needed.
+
+The experimental ReShade/DXGI runtime-patching workaround is disabled. Startup
+only checks for a possible local `dxgi.dll` next to the executable and logs a
+warning; it does not load, modify, remove, or block that file. Presence alone does
+not prove incompatibility. A proxy can still cause startup to fail: disable
+ReShade or move its proxy DLL out of the application directory and retry. Native
+DX12 rendering, FSR and RTX VSR are retained; their usual hardware requirements
+still apply.
+
+Hardware regression checklist (unit tests do not replace these checks):
+
+- Automatic WASAPI name matching and default-input fallback, with and without a
+  selected video device.
+- Explicit WASAPI and DirectShow selection, including GC550 capture audio.
+- Explicit DirectShow with a missing audio pin: video continues and audio status
+  reports the missing input, without silently opening the default microphone.
+- Native DX12 startup and FSR/RTX VSR on supported hardware without a proxy.
+- Local proxy diagnostic: a warning is logged, startup is not deliberately
+  blocked, and the proxy file is unchanged. Repeat without the proxy if startup
+  fails; injected-proxy compatibility is not guaranteed.
+
 ## Linux
 
 On Ubuntu/Debian, install the build tools and audio headers:
@@ -89,7 +118,7 @@ cargo test --locked gpu_shader_color_and_picture_reference -- --ignored
 
 PRs and pushes to `main` run formatting, tests, Clippy, and release builds on Windows and Linux, with default and software-only feature configurations. Clippy failures are fatal. Cargo uses the checked-in lockfile; dependency downloads and Rust builds are cached.
 
-Create a version tag matching `Cargo.toml` (for example, `v2.2.0`) to release. The workflow resolves that existing tag to an exact commit, validates that commit through the reusable CI workflow, builds packages, extracts and verifies them, runs synthetic renderer tests, and uploads archives plus SHA256 files. Publication occurs only after both platforms pass, and only in `SaltedByte/TackleCast`.
+Create a version tag matching `Cargo.toml` (for example, `v2.2.0`) to release. The workflow resolves that existing tag to an exact commit, validates that commit through the reusable CI workflow, builds packages, extracts and verifies them, runs synthetic renderer tests, and uploads archives plus SHA256 files. Publication occurs only after both platforms pass.
 
 Manual dispatch requires an existing version tag and builds that tag's commit. Publication is off by default; enable the `publish` input only when you want a GitHub Release. Forks can validate and generate artifacts without publishing upstream releases. Build jobs have read-only repository access; only the publication job receives release-writing permissions.
 

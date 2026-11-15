@@ -179,6 +179,7 @@ pub struct CaptureConfig {
     pub height: u32,
     pub fps: FrameRate,
     pub source: CaptureSource,
+    pub audio_sink: Option<crate::audio::DirectShowAudioSink>,
 }
 
 #[allow(dead_code)]
@@ -228,6 +229,7 @@ impl CaptureThread {
         let (negotiated_tx, negotiated_rx) = unbounded();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let thread_stop_flag = stop_flag.clone();
+        let audio_sink = config.audio_sink;
 
         let join_handle = thread::spawn(move || match config.source {
             CaptureSource::TestPattern {
@@ -263,6 +265,7 @@ impl CaptureThread {
                 error_tx,
                 negotiated_tx,
                 &event_proxy,
+                audio_sink,
                 #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
                 shared_gpu_handles,
             ),
@@ -286,6 +289,7 @@ impl CaptureThread {
                 error_tx,
                 negotiated_tx,
                 &event_proxy,
+                audio_sink,
                 #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
                 shared_gpu_handles,
             ),
@@ -307,6 +311,7 @@ impl CaptureThread {
                 error_tx,
                 negotiated_tx,
                 &event_proxy,
+                audio_sink,
             ),
         });
 
@@ -429,6 +434,7 @@ fn run_device_capture(
     error_tx: Sender<String>,
     negotiated_tx: Sender<NegotiatedConfig>,
     event_proxy: &EventLoopProxy<AppEvent>,
+    audio_sink: Option<crate::audio::DirectShowAudioSink>,
     #[cfg(all(target_os = "windows", feature = "gpu-decode"))] mut shared_gpu_handles: Option<
         crate::dx12_interop::ImportHandles,
     >,
@@ -485,6 +491,7 @@ fn run_device_capture(
             stats_tx.clone(),
             &negotiated_tx,
             event_proxy,
+            audio_sink.clone(),
             #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
             if attempt == VideoFormat::Mjpeg {
                 shared_gpu_handles.take()
@@ -517,6 +524,7 @@ fn run_device_capture_inner(
     stats_tx: Sender<CaptureStats>,
     negotiated_tx: &Sender<NegotiatedConfig>,
     event_proxy: &EventLoopProxy<AppEvent>,
+    audio_sink: Option<crate::audio::DirectShowAudioSink>,
     #[cfg(all(target_os = "windows", feature = "gpu-decode"))] shared_gpu_handles: Option<
         crate::dx12_interop::ImportHandles,
     >,
@@ -558,6 +566,45 @@ fn run_device_capture_inner(
         }
     }
 
+    #[cfg(target_os = "windows")]
+    let mut input = if audio_sink.is_some() {
+        let mut audio_opts = options.clone();
+        audio_opts.set("audio_buffer_size", "20");
+        let combined_url = format!("video={device_name}:audio={device_name}");
+        let friendly = crate::devices::video_device_label(device_name);
+        let opened = format::open_with(&combined_url, &input_format, audio_opts.clone()).or_else(
+            |first_err| {
+                if friendly != device_name && !friendly.contains(':') {
+                    let alt_url = format!("video={device_name}:audio={friendly}");
+                    format::open_with(&alt_url, &input_format, audio_opts)
+                } else {
+                    Err(first_err)
+                }
+            },
+        );
+        match opened {
+            Ok(ctx) => ctx.input(),
+            Err(audio_err) => {
+                let video_ctx =
+                    format::open_with(&url, &input_format, options).map_err(|error| {
+                        format!(
+                        "failed to open {format_label} input for '{device_name}' ({url}): {error}"
+                    )
+                    })?;
+                warn!(
+                    "DirectShow audio unavailable for '{device_name}' ({audio_err}); capturing video only"
+                );
+                video_ctx.input()
+            }
+        }
+    } else {
+        format::open_with(&url, &input_format, options)
+            .map_err(|error| {
+                format!("failed to open {format_label} input for '{device_name}' ({url}): {error}")
+            })?
+            .input()
+    };
+    #[cfg(not(target_os = "windows"))]
     let mut input = format::open_with(&url, &input_format, options)
         .map_err(|error| {
             format!("failed to open {format_label} input for '{device_name}' ({url}): {error}")
@@ -642,6 +689,63 @@ fn run_device_capture_inner(
             .map(|r| r.to_string())
             .unwrap_or_else(|| "Unknown".into())
     );
+
+    let mut audio_decoder = if let Some(ref sink) = audio_sink {
+        if let Some(audio_stream) = input.streams().best(media::Type::Audio) {
+            let audio_stream_index = audio_stream.index();
+            match codec::context::Context::from_parameters(audio_stream.parameters())
+                .and_then(|ctx| ctx.decoder().audio())
+            {
+                Ok(dec) => {
+                    let in_rate = dec.rate().max(1);
+                    let in_channels = dec.channels().max(1);
+                    let label = crate::devices::video_device_label(device_name);
+                    info!(
+                        "DirectShow audio negotiated for '{}': {} Hz, {} ch, {:?}",
+                        label,
+                        in_rate,
+                        in_channels,
+                        dec.format()
+                    );
+                    sink.diagnostics
+                        .set_input_info(Some(crate::audio::AudioStreamInfo {
+                            device_name: format!("DirectShow: {label}"),
+                            sample_rate: in_rate,
+                            channels: in_channels,
+                            sample_format: cpal::SampleFormat::F32,
+                        }));
+                    sink.diagnostics
+                        .set_status(crate::audio::AudioStatus::Connected);
+                    Some((
+                        audio_stream_index,
+                        dec,
+                        ffmpeg::util::frame::audio::Audio::empty(),
+                        crate::audio::AudioResampler::new(
+                            in_rate,
+                            sink.target_sample_rate,
+                            sink.target_channels as usize,
+                        ),
+                        Vec::<f32>::with_capacity(4096),
+                        Vec::<f32>::with_capacity(4096),
+                        Vec::<f32>::with_capacity(4096),
+                    ))
+                }
+                Err(err) => {
+                    warn!("failed to open DirectShow audio decoder for '{device_name}': {err}");
+                    sink.diagnostics
+                        .set_status(crate::audio::AudioStatus::NoInput);
+                    None
+                }
+            }
+        } else {
+            sink.diagnostics
+                .set_status(crate::audio::AudioStatus::NoInput);
+            None
+        }
+    } else {
+        None
+    };
+
     #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
     let source_color = ColorInfo::from_ffmpeg(
         decoder.color_space(),
@@ -713,6 +817,35 @@ fn run_device_capture_inner(
         }
 
         if stream.index() != stream_index {
+            if let (
+                Some(ref sink),
+                Some((
+                    audio_idx,
+                    ref mut a_dec,
+                    ref mut a_frame,
+                    ref mut resampler,
+                    ref mut scratch_f32,
+                    ref mut ch_buf,
+                    ref mut resampled_buf,
+                )),
+            ) = (&audio_sink, &mut audio_decoder)
+            {
+                if stream.index() == *audio_idx && a_dec.send_packet(&packet).is_ok() {
+                    while a_dec.receive_frame(a_frame).is_ok() {
+                        extract_audio_samples_f32(a_frame, scratch_f32);
+                        ch_buf.clear();
+                        crate::audio::convert_channels(
+                            scratch_f32,
+                            a_frame.channels() as usize,
+                            sink.target_channels as usize,
+                            ch_buf,
+                        );
+                        resampled_buf.clear();
+                        resampler.process(ch_buf, resampled_buf);
+                        sink.ring.push_samples(resampled_buf);
+                    }
+                }
+            }
             continue;
         }
 
@@ -1081,6 +1214,92 @@ fn copy_plane(frame: &Video, plane: usize, row_bytes: usize, rows: usize) -> Vec
     output
 }
 
+fn extract_audio_samples_f32(frame: &ffmpeg::util::frame::audio::Audio, out: &mut Vec<f32>) {
+    use cpal::Sample;
+    use ffmpeg::format::sample::{Sample as FfSample, Type as SampleType};
+
+    let samples = frame.samples();
+    let channels = frame.channels() as usize;
+    out.clear();
+    if samples == 0 || channels == 0 {
+        return;
+    }
+    out.reserve(samples * channels);
+
+    match frame.format() {
+        FfSample::U8(SampleType::Packed) => {
+            let bytes = &frame.data(0)[..samples * channels];
+            out.extend(bytes.iter().map(|&s| f32::from_sample(s)));
+        }
+        FfSample::U8(SampleType::Planar) => {
+            for i in 0..samples {
+                for ch in 0..channels {
+                    out.push(f32::from_sample(frame.data(ch)[i]));
+                }
+            }
+        }
+        FfSample::I16(SampleType::Packed) => {
+            let bytes = &frame.data(0)[..samples * channels * 2];
+            for &chunk in bytes.as_chunks::<2>().0 {
+                out.push(f32::from_sample(i16::from_ne_bytes(chunk)));
+            }
+        }
+        FfSample::I16(SampleType::Planar) => {
+            for i in 0..samples {
+                let offset = i * 2;
+                for ch in 0..channels {
+                    let plane = frame.data(ch);
+                    out.push(f32::from_sample(i16::from_ne_bytes([
+                        plane[offset],
+                        plane[offset + 1],
+                    ])));
+                }
+            }
+        }
+        FfSample::I32(SampleType::Packed) => {
+            let bytes = &frame.data(0)[..samples * channels * 4];
+            for &chunk in bytes.as_chunks::<4>().0 {
+                out.push(f32::from_sample(i32::from_ne_bytes(chunk)));
+            }
+        }
+        FfSample::I32(SampleType::Planar) => {
+            for i in 0..samples {
+                let offset = i * 4;
+                for ch in 0..channels {
+                    let plane = frame.data(ch);
+                    out.push(f32::from_sample(i32::from_ne_bytes([
+                        plane[offset],
+                        plane[offset + 1],
+                        plane[offset + 2],
+                        plane[offset + 3],
+                    ])));
+                }
+            }
+        }
+        FfSample::F32(SampleType::Packed) => {
+            let bytes = &frame.data(0)[..samples * channels * 4];
+            for &chunk in bytes.as_chunks::<4>().0 {
+                out.push(f32::from_ne_bytes(chunk));
+            }
+        }
+        FfSample::F32(SampleType::Planar) => {
+            for i in 0..samples {
+                let offset = i * 4;
+                for ch in 0..channels {
+                    let plane = frame.data(ch);
+                    out.push(f32::from_ne_bytes([
+                        plane[offset],
+                        plane[offset + 1],
+                        plane[offset + 2],
+                        plane[offset + 3],
+                    ]));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn find_dshow_format() -> Option<ffmpeg::Format> {
     device::input::video().find(|format| match format {
@@ -1232,6 +1451,26 @@ fn generate_test_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_packed_i16_audio_samples_to_interleaved_f32() {
+        let mut frame = ffmpeg::util::frame::audio::Audio::new(
+            ffmpeg::format::sample::Sample::I16(ffmpeg::format::sample::Type::Packed),
+            2,
+            ffmpeg::ChannelLayout::STEREO,
+        );
+        let samples = [0i16, i16::MAX, i16::MIN, 0i16];
+        for (i, sample) in samples.iter().enumerate() {
+            frame.data_mut(0)[i * 2..i * 2 + 2].copy_from_slice(&sample.to_ne_bytes());
+        }
+        let mut out = Vec::new();
+        extract_audio_samples_f32(&frame, &mut out);
+        assert_eq!(out.len(), 4);
+        assert!((out[0] - 0.0).abs() < 1e-5);
+        assert!((out[1] - 1.0).abs() < 1e-4);
+        assert!((out[2] - (-1.0)).abs() < 1e-4);
+        assert!((out[3] - 0.0).abs() < 1e-5);
+    }
 
     #[test]
     #[allow(irrefutable_let_patterns)]

@@ -53,6 +53,8 @@ pub fn restore_video_device(saved: &str, devices: &[String]) -> String {
 #[allow(dead_code)]
 const IGNORED_KEYWORDS: &[&str] = &["pro", "the", "and"];
 
+pub const DIRECTSHOW_AUDIO_INDEX: i32 = -2;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioDevice {
     pub index: i32,
