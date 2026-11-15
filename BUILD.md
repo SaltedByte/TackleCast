@@ -24,6 +24,35 @@ You can instead set `FFMPEG_DIR` to an existing shared development build with `b
 
 GPU decoding requires a compatible NVIDIA GPU and driver. The package includes nvJPEG and cudart, but never the NVIDIA driver DLL `nvcuda.dll`. Machines without compatible hardware automatically use software decoding.
 
+## Windows audio and DXGI compatibility
+
+Automatic audio selection keeps the WASAPI matching rules and falls back to the
+system default input, whether or not a video device is selected. DirectShow audio
+remains an explicit input choice for devices such as the AVerMedia GC550 from
+issue #16. Selecting DirectShow explicitly does not silently switch to a microphone
+if the device has no usable audio pin; inspect the audio status and choose another
+input if needed.
+
+The experimental ReShade/DXGI runtime-patching workaround is disabled. Startup
+only checks for a possible local `dxgi.dll` next to the executable and logs a
+warning; it does not load, modify, remove, or block that file. Presence alone does
+not prove incompatibility. A proxy can still cause startup to fail: disable
+ReShade or move its proxy DLL out of the application directory and retry. Native
+DX12 rendering, FSR and RTX VSR are retained; their usual hardware requirements
+still apply.
+
+Hardware regression checklist (unit tests do not replace these checks):
+
+- Automatic WASAPI name matching and default-input fallback, with and without a
+  selected video device.
+- Explicit WASAPI and DirectShow selection, including GC550 capture audio.
+- Explicit DirectShow with a missing audio pin: video continues and audio status
+  reports the missing input, without silently opening the default microphone.
+- Native DX12 startup and FSR/RTX VSR on supported hardware without a proxy.
+- Local proxy diagnostic: a warning is logged, startup is not deliberately
+  blocked, and the proxy file is unchanged. Repeat without the proxy if startup
+  fails; injected-proxy compatibility is not guaranteed.
+
 ## Linux
 
 On Ubuntu/Debian, install the build tools and audio headers:

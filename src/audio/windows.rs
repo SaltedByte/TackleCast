@@ -38,8 +38,10 @@ pub fn preferred_audio_host() -> Host {
 /// 2. If explicit input_index is provided and valid, use that device.
 /// 3. If matching video device name finds a capture audio endpoint, use that.
 /// 4. If any audio input matches known capture keywords ("Digital Audio", "USB Audio", etc.), use that.
-/// 5. If a video capture device is active, try DirectShow audio from that device.
-/// 6. Fall back to host default input device.
+/// 5. Fall back to host default input device.
+///
+/// DirectShow is opt-in: automatic selection must not replace the system fallback
+/// with an unverified audio pin on the video device.
 pub fn resolve_input_device(
     host: &Host,
     input_index: i32,
@@ -100,16 +102,7 @@ pub fn resolve_input_device(
         }
     }
 
-    // 4. Try DirectShow audio from the active video capture device
-    if !video_device_name.is_empty() {
-        info!(
-            "no WASAPI capture input matched '{}'; using DirectShow audio from video device",
-            video_device_name
-        );
-        return Ok(ResolvedInput::DirectShow(video_device_name.to_string()));
-    }
-
-    // 5. Fall back to default input
+    // 4. Fall back to default input
     warn!("no capture-card audio device auto-detected; falling back to default system input");
     host.default_input_device()
         .map(ResolvedInput::Device)
@@ -252,4 +245,38 @@ fn keywords_for_device_name(device_name: &str) -> Vec<String> {
         .filter(|word| word.len() >= 3 && !IGNORED_KEYWORDS.contains(word))
         .map(ToString::to_string)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directshow_requires_explicit_selection_and_video_device() {
+        let host = preferred_audio_host();
+        let video = "Synthetic capture device";
+        assert!(matches!(
+            resolve_input_device(&host, DIRECTSHOW_AUDIO_INDEX, video, &[]),
+            Ok(ResolvedInput::DirectShow(name)) if name == video
+        ));
+        assert!(resolve_input_device(&host, DIRECTSHOW_AUDIO_INDEX, "", &[]).is_err());
+    }
+
+    #[test]
+    fn unmatched_automatic_input_uses_system_default_with_or_without_video() {
+        let host = preferred_audio_host();
+        for video in ["", "Synthetic capture device"] {
+            let expected = host.default_input_device();
+            let resolved = resolve_input_device(&host, -1, video, &[]);
+            match (expected, resolved) {
+                (Some(expected), Ok(ResolvedInput::Device(actual))) => {
+                    assert_eq!(expected.name().ok(), actual.name().ok());
+                }
+                (None, Err(error)) => {
+                    assert_eq!(error, "no default audio input device found on the system");
+                }
+                _ => panic!("automatic selection must retain the WASAPI default fallback"),
+            }
+        }
+    }
 }
