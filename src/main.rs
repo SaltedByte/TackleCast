@@ -139,6 +139,7 @@ fn main() {
     #[cfg(target_os = "windows")]
     let _ = unsafe { SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(APP_ID)) };
 
+    drift::import_reporter_settings();
     let mut settings = Settings::load();
     info!(
         "loaded settings from {}",

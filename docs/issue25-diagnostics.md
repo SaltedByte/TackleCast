@@ -43,6 +43,18 @@ environment and forwards arguments; no desktop-launcher edits or persistent
 settings changes are required. Without this variable, telemetry is off.
 Release logs are in `logs/` beside the extracted executable.
 
+The reporter ZIP is built with `bash scripts/package_linux_diagnostics.sh`
+(also requires `patchelf`). It includes the explicit `diagnostics.enabled`
+opt-in marker and an executable with `$ORIGIN/lib` runtime library lookup.
+The reporter extracts the ZIP and opens `tacklecast` directly in the file
+manager; no command, environment variable, or shell launcher is needed.
+Removing the marker disables this packaged opt-in; the normal build remains
+off by default. A separate bundle folder avoids replacing the original app.
+On first use only, diagnostic mode copies valid existing settings from the
+most recently saved standard installation in AppImages or Downloads if found.
+Existing settings in the diagnostic folder and the original files are never
+overwritten. The reporter still keeps generic PipeWire and other settings unchanged.
+
 While enabled, the file logger accepts only the dedicated diagnostic target,
 even if `RUST_LOG` is set. This suppresses legacy events that contain settings
 paths and USB by-id serials. New events record routing device names and numeric

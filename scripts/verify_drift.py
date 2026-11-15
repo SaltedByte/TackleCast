@@ -13,21 +13,30 @@ import tempfile
 import time
 
 
-def verify(package, render=False):
+def verify(package, render=False, direct=False):
     package = package.resolve()
-    launcher = package / 'run.sh'
+    launcher = package / ('tacklecast' if direct else 'run.sh')
     env = os.environ.copy()
     env.pop('LD_LIBRARY_PATH', None)
     env.pop('TACKLECAST_DIAGNOSTICS', None)
     # Deliberately hostile RUST_LOG tests that diagnostic privacy filtering wins.
     env['RUST_LOG'] = 'trace'
     with tempfile.TemporaryDirectory() as cwd:
-        subprocess.run([str(launcher), '--diagnostic-audio-fixture'], cwd=cwd,
-                       env=env, check=True, capture_output=True, timeout=15)
+        marker = package / 'diagnostics.enabled'
+        saved_marker = package / 'diagnostics.enabled.disabled-for-check'
+        if direct:
+            marker.rename(saved_marker)
+        try:
+            subprocess.run([str(launcher), '--diagnostic-audio-fixture'], cwd=cwd,
+                           env=env, check=True, capture_output=True, timeout=15)
+        finally:
+            if direct:
+                saved_marker.rename(marker)
         off = max((package / 'logs').glob('tacklecast_*.log'), key=lambda p: p.stat().st_mtime)
         assert 'drift startup' not in off.read_text(), 'Diagnostics unexpectedly enabled'
         time.sleep(1.1)  # legacy log filename resolution is one second
-        env['TACKLECAST_DIAGNOSTICS'] = '1'
+        if not direct:
+            env['TACKLECAST_DIAGNOSTICS'] = '1'
         subprocess.run([str(launcher), '--diagnostic-audio-fixture'], cwd=cwd,
                        env=env, check=True, capture_output=True, timeout=60)
     log = max((package / 'logs').glob('tacklecast_*.log'), key=lambda p: p.stat().st_mtime)
@@ -83,5 +92,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--package', type=Path, required=True)
     parser.add_argument('--render', action='store_true', help='Also exercise video markers; requires desktop or Xvfb')
+    parser.add_argument('--direct', action='store_true', help='Test the GUI-launchable bundle with its opt-in marker')
     args = parser.parse_args()
-    verify(args.package, args.render)
+    verify(args.package, args.render, args.direct)

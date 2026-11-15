@@ -11,7 +11,53 @@ static MONITOR: OnceLock<Arc<Monitor>> = OnceLock::new();
 const PERIOD: Duration = Duration::from_secs(2);
 
 pub fn enabled() -> bool {
-    *ENABLED.get_or_init(|| std::env::var("TACKLECAST_DIAGNOSTICS").as_deref() == Ok("1"))
+    *ENABLED.get_or_init(|| {
+        std::env::var("TACKLECAST_DIAGNOSTICS").as_deref() == Ok("1")
+            || std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.join("diagnostics.enabled")))
+                .is_some_and(|p| p.is_file())
+    })
+}
+
+/// The reporter bundle is separate from the original installation. Reuse its
+/// saved settings once, without changing or overwriting the original file.
+pub fn import_reporter_settings() {
+    if !enabled() || crate::settings::settings_path().exists() {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let source = ["AppImages", "Downloads"]
+        .map(|folder| {
+            home.join(folder)
+                .join("TackleCast-Linux-x86_64/tacklecast_settings.json")
+        })
+        .into_iter()
+        .filter(|p| p.is_file())
+        .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok());
+    let Some(source) = source else {
+        event(format_args!("settings_import previous_install_not_found"));
+        return;
+    };
+    let Ok(raw) = std::fs::read_to_string(source) else {
+        return;
+    };
+    if serde_json::from_str::<crate::settings::Settings>(&raw).is_err() {
+        return;
+    }
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(crate::settings::settings_path())
+    {
+        event(format_args!(
+            "settings_import copied_previous_install={}",
+            file.write_all(raw.as_bytes()).is_ok()
+        ));
+    }
 }
 
 struct Monitor {
