@@ -5,6 +5,7 @@ mod capabilities;
 mod capture;
 mod color;
 mod devices;
+mod drift;
 #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
 mod dx12_interop;
 mod frame_rate;
@@ -110,6 +111,16 @@ fn main() {
     if let Err(error) = logger::init_logging() {
         eprintln!("failed to initialize logging: {error}");
     }
+    drift::init();
+    if std::env::args().any(|arg| arg == "--diagnostic-audio-fixture") {
+        if drift::enabled() {
+            drift::audio_fixture();
+        } else {
+            eprintln!("Fixture requires TACKLECAST_DIAGNOSTICS=1");
+        }
+        logger::shutdown_logging();
+        return;
+    }
     if let Err(error) = ffmpeg_next::init() {
         eprintln!("failed to initialize ffmpeg: {error}");
     }
@@ -211,6 +222,8 @@ fn main() {
         event_proxy,
     );
     event_loop.run_app(&mut app).expect("event loop error");
+    app.audio.stop();
+    logger::shutdown_logging();
 }
 
 struct App {
@@ -598,6 +611,7 @@ impl ApplicationHandler<AppEvent> for App {
                 if let (Some(capture), Some(renderer)) = (&mut self.capture, &mut self.renderer) {
                     if let Some(frame) = capture.latest_frame() {
                         renderer.upload_frame(frame);
+                        drift::video(2);
                         uploaded = true;
                     }
                 }
@@ -616,6 +630,7 @@ impl ApplicationHandler<AppEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.audio.poll_diagnostics();
         // Frames arrive as user events, so the loop no longer spins. It still
         // needs a slow tick, though: the channels below and the timers further
         // down are only serviced here, and without a wakeup they'd stall
@@ -631,6 +646,7 @@ impl ApplicationHandler<AppEvent> for App {
             }
 
             if let Some(error_message) = capture.latest_error() {
+                drift::event(format_args!("video_capture_error"));
                 self.latest_error = Some(error_message.clone());
                 warn!("capture error: {error_message}");
             }
@@ -721,6 +737,14 @@ impl App {
             || old_settings.audio_output != self.settings.audio_output;
 
         let mute_changed = old_settings.audio_muted != self.settings.audio_muted;
+
+        drift::event(format_args!(
+            "settings_changed video={} audio_device={} volume_changed={} mute_changed={}",
+            video_changed,
+            audio_device_changed,
+            (old_settings.volume - self.settings.volume).abs() > f64::EPSILON,
+            mute_changed
+        ));
 
         if video_changed {
             if let Some(capture) = &mut self.capture {
@@ -842,6 +866,17 @@ impl App {
             return;
         }
 
+        if drift::enabled() {
+            let label = devices::video_device_label(&video_device);
+            // Missing-device fallback labels are raw IDs and can contain serials.
+            let label = if label == video_device {
+                "unavailable_or_unresolved"
+            } else {
+                &label
+            };
+            drift::event(format_args!("video_selected name={:?}", label));
+        }
+
         // Try to initialize shared DX12 buffers for zero-copy GPU decode
         #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
         let shared_gpu_handles = if let Some(renderer) = &mut self.renderer {
@@ -893,6 +928,10 @@ impl App {
             "starting test-pattern capture: {}x{} @ {}fps ({reason})",
             width, height, fps
         );
+        drift::event(format_args!(
+            "video_synthetic width={} height={} fps={} backend=test_pattern_no_hardware",
+            width, height, fps
+        ));
         self.capture = Some(CaptureThread::start(
             CaptureConfig {
                 width,

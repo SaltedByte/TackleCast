@@ -53,8 +53,9 @@ pub struct AudioDiagnostics {
     output_info: RwLock<Option<AudioStreamInfo>>,
     underrun_counter: AtomicUsize,
     overrun_counter: AtomicUsize,
-    last_underrun_log: Mutex<Option<Instant>>,
-    last_overrun_log: Mutex<Option<Instant>>,
+    last_underrun_log: Mutex<(usize, Option<Instant>)>,
+    last_overrun_log: Mutex<(usize, Option<Instant>)>,
+    stream_errors: AtomicU32,
 }
 
 impl AudioDiagnostics {
@@ -66,8 +67,9 @@ impl AudioDiagnostics {
             output_info: RwLock::new(None),
             underrun_counter: AtomicUsize::new(0),
             overrun_counter: AtomicUsize::new(0),
-            last_underrun_log: Mutex::new(None),
-            last_overrun_log: Mutex::new(None),
+            last_underrun_log: Mutex::new((0, None)),
+            last_overrun_log: Mutex::new((0, None)),
+            stream_errors: AtomicU32::new(0),
         }
     }
 
@@ -84,6 +86,10 @@ impl AudioDiagnostics {
                 4
             }
         };
+        crate::drift::event(format_args!(
+            "audio_status code={} (0=stopped,1=connected,2=no_input,3=no_output,4=error)",
+            code
+        ));
         if code != 4 {
             if let Ok(mut lock) = self.last_error.write() {
                 *lock = None;
@@ -131,37 +137,62 @@ impl AudioDiagnostics {
     }
 
     pub fn record_underrun(&self) {
-        let count = self.underrun_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        self.underrun_counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_overrun(&self) {
+        self.overrun_counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_stream_error(&self, input: bool) {
+        self.stream_errors
+            .fetch_or(if input { 1 } else { 2 }, Ordering::Relaxed);
+    }
+
+    /// Existing throttled warnings/status are drained by the UI housekeeping
+    /// thread. Callback paths never format, log, or acquire these locks.
+    pub fn poll(&self) {
+        let errors = self.stream_errors.swap(0, Ordering::Relaxed);
+        if errors != 0 {
+            let message = format!(
+                "audio stream error (input={}, output={}); backend details omitted",
+                errors & 1 != 0,
+                errors & 2 != 0
+            );
+            warn!("{message}");
+            self.set_status(AudioStatus::Error(message));
+        }
+        let count = self.underrun_counter.load(Ordering::Relaxed);
         if let Ok(mut last_log) = self.last_underrun_log.lock() {
             let now = Instant::now();
-            let should_log = match *last_log {
-                Some(t) => now.duration_since(t).as_secs() >= 5,
-                None => true,
-            };
+            let should_log = count != last_log.0
+                && match last_log.1 {
+                    Some(t) => now.duration_since(t).as_secs() >= 5,
+                    None => true,
+                };
             if should_log {
                 warn!(
                     "audio output underrun (buffer starvation, total: {} occurrences)",
                     count
                 );
-                *last_log = Some(now);
+                *last_log = (count, Some(now));
             }
         }
-    }
 
-    pub fn record_overrun(&self) {
-        let count = self.overrun_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let count = self.overrun_counter.load(Ordering::Relaxed);
         if let Ok(mut last_log) = self.last_overrun_log.lock() {
             let now = Instant::now();
-            let should_log = match *last_log {
-                Some(t) => now.duration_since(t).as_secs() >= 5,
-                None => true,
-            };
+            let should_log = count != last_log.0
+                && match last_log.1 {
+                    Some(t) => now.duration_since(t).as_secs() >= 5,
+                    None => true,
+                };
             if should_log {
                 warn!(
                     "audio input overrun (buffer overflow, dropped samples, total: {} occurrences)",
                     count
                 );
-                *last_log = Some(now);
+                *last_log = (count, Some(now));
             }
         }
     }
@@ -378,6 +409,7 @@ impl AudioResampler {
 /// A thread-safe, lock-free ring buffer for real-time audio sample streaming.
 /// Samples are stored as bitwise f32 in AtomicU32.
 pub struct AudioRingBuffer {
+    pub(crate) trace: Option<Arc<crate::drift::AudioTrace>>,
     data: Box<[AtomicU32]>,
     capacity: usize,
     read_index: AtomicUsize,
@@ -391,11 +423,17 @@ impl AudioRingBuffer {
         values.resize_with(capacity, || AtomicU32::new(0));
         Self {
             data: values.into_boxed_slice(),
+            trace: None,
             capacity,
             read_index: AtomicUsize::new(0),
             write_index: AtomicUsize::new(0),
             diagnostics,
         }
+    }
+
+    pub fn with_trace(mut self, trace: Option<Arc<crate::drift::AudioTrace>>) -> Self {
+        self.trace = trace;
+        self
     }
 
     #[allow(dead_code)]
@@ -410,6 +448,14 @@ impl AudioRingBuffer {
         write.wrapping_sub(read)
     }
 
+    /// Monitoring only: read the consumer first so a concurrent advance cannot
+    /// wrap an older producer index into a false "full" observation.
+    pub fn diagnostic_fill(&self) -> usize {
+        let read = self.read_index.load(Ordering::Acquire);
+        let write = self.write_index.load(Ordering::Acquire);
+        write.wrapping_sub(read).min(self.capacity)
+    }
+
     /// Pushes samples into the ring buffer. If buffer overflows, drops excess and logs.
     pub fn push_samples(&self, samples: &[f32]) -> usize {
         let mut written = 0;
@@ -419,6 +465,9 @@ impl AudioRingBuffer {
 
         if occupied >= self.capacity {
             self.diagnostics.record_overrun();
+            if let Some(t) = &self.trace {
+                t.push(samples.len(), 0, occupied);
+            }
             return 0;
         }
 
@@ -438,6 +487,10 @@ impl AudioRingBuffer {
 
         if written > 0 {
             self.write_index.store(write, Ordering::Release);
+        }
+
+        if let Some(t) = &self.trace {
+            t.push(samples.len(), written, occupied + written);
         }
 
         written
@@ -468,6 +521,10 @@ impl AudioRingBuffer {
 
         if count > 0 {
             self.read_index.store(read, Ordering::Release);
+        }
+
+        if let Some(t) = &self.trace {
+            t.pop(output.len(), count, available - count);
         }
 
         count

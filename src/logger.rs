@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use time::macros::format_description;
 use time::{OffsetDateTime, UtcOffset};
@@ -10,7 +10,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
-static LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
+static LOG_GUARD: OnceLock<Mutex<Option<WorkerGuard>>> = OnceLock::new();
 
 pub fn init_logging() -> Result<(), Box<dyn std::error::Error>> {
     let logs_dir = logs_dir();
@@ -28,7 +28,7 @@ pub fn init_logging() -> Result<(), Box<dyn std::error::Error>> {
 
     let file = File::create(file_path)?;
     let (writer, guard) = tracing_appender::non_blocking(file);
-    let _ = LOG_GUARD.set(guard);
+    let _ = LOG_GUARD.set(Mutex::new(Some(guard)));
 
     let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
     let timer = OffsetTime::new(
@@ -52,7 +52,21 @@ pub fn init_logging() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+pub fn shutdown_logging() {
+    if let Some(guard) = LOG_GUARD.get() {
+        if let Ok(mut guard) = guard.lock() {
+            guard.take();
+        }
+    }
+}
+
 fn default_log_filter() -> EnvFilter {
+    // Legacy events contain settings paths and USB by-id serials. Diagnostic
+    // reports use a dedicated, bounded metadata vocabulary instead. RUST_LOG
+    // cannot accidentally re-enable legacy events in a reporter's diagnostic run.
+    if crate::drift::enabled() {
+        return EnvFilter::new("off,tacklecast::drift=info");
+    }
     if let Ok(filter) = EnvFilter::try_from_default_env() {
         return filter;
     }

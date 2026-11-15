@@ -735,6 +735,7 @@ impl Renderer {
 
         self.window.pre_present_notify();
         frame.present();
+        crate::drift::video(3);
         Ok(())
     }
 }

@@ -342,9 +342,11 @@ impl CaptureThread {
     }
 
     pub fn stop(&mut self) {
+        crate::drift::event(format_args!("video_stop_requested"));
         self.stop_flag.store(true, Ordering::Relaxed);
         if let Some(join_handle) = self.join_handle.take() {
             let _ = join_handle.join();
+            crate::drift::event(format_args!("video_stopped"));
         }
     }
 }
@@ -384,6 +386,7 @@ fn run_test_pattern(
 
         let frame = generate_test_frame(width, height, frame_index, format);
         frame_producer.write(frame);
+        crate::drift::video(1);
         let _ = event_proxy.send_event(AppEvent::FrameReady);
 
         frame_index += 1;
@@ -473,6 +476,18 @@ fn run_device_capture(
             "capture attempt: device='{}' format='{}' {}x{} @ {} FPS",
             device_name, attempt, requested_width, requested_height, requested_fps
         );
+        crate::drift::event(format_args!(
+            "video_open_attempt backend={} format={} width={} height={} fps={}",
+            if cfg!(target_os = "linux") {
+                "V4L2/FFmpeg"
+            } else {
+                "DirectShow/FFmpeg"
+            },
+            attempt,
+            requested_width,
+            requested_height,
+            requested_fps
+        ));
         let result = run_device_capture_inner(
             &device_name,
             requested_width,
@@ -495,6 +510,7 @@ fn run_device_capture(
         match result {
             Ok(()) => return,
             Err(error) => {
+                crate::drift::event(format_args!("video_open_attempt_failed"));
                 warn!("capture attempt failed: {error}");
                 last_error = Some(error);
             }
@@ -569,6 +585,7 @@ fn run_device_capture_inner(
         .best(media::Type::Video)
         .ok_or_else(|| format!("no video stream found for '{device_name}'"))?;
     let stream_index = input_stream.index();
+    let time_base = input_stream.time_base();
     let parameters = input_stream.parameters();
 
     let mut decoder_context = codec::context::Context::from_parameters(parameters)
@@ -615,6 +632,8 @@ fn run_device_capture_inner(
         });
     }
     let capture_format = actual_capture_format(decoder.id(), decoder.format());
+    crate::drift::event(format_args!("video_negotiated width={} height={} format={} fps={:?} ffmpeg_time_base={}/{} packet_pts_clock=driver_or_FFmpeg_unknown_origin_not_compared_to_audio",
+        decoder.width(), decoder.height(), capture_format, nominal_rate, time_base.0, time_base.1));
     let capture_name = if decoder.id() == codec::Id::MJPEG {
         "MJPEG".to_string()
     } else if decoder.id() == codec::Id::RAWVIDEO {
@@ -717,6 +736,7 @@ fn run_device_capture_inner(
         }
 
         // Track frame arrival timing
+        crate::drift::video(0);
         let now = Instant::now();
         if let Some(prev) = last_packet_at {
             let interval_us = now.duration_since(prev).as_micros() as u64;
@@ -757,6 +777,7 @@ fn run_device_capture_inner(
                         color.default_range = ColorRange::Full;
                         frame_producer.back_slot().set_color_info(color);
                         frame_producer.publish();
+                        crate::drift::video(1);
                         let _ = event_proxy.send_event(AppEvent::FrameReady);
 
                         stats_frame_counter += 1;
@@ -872,6 +893,7 @@ fn run_device_capture_inner(
             }
 
             frame_producer.write(frame);
+            crate::drift::video(1);
             let _ = event_proxy.send_event(AppEvent::FrameReady);
 
             stats_frame_counter += 1;

@@ -28,6 +28,7 @@ pub struct AudioPassthrough {
     output_stream: Option<Stream>,
     volume_ctrl: VolumeController,
     diagnostics: Arc<AudioDiagnostics>,
+    drift_ring: Option<Arc<AudioRingBuffer>>,
 }
 
 impl AudioPassthrough {
@@ -37,11 +38,16 @@ impl AudioPassthrough {
             output_stream: None,
             volume_ctrl: VolumeController::new(1.0, false),
             diagnostics: Arc::new(AudioDiagnostics::new()),
+            drift_ring: None,
         }
     }
 
     pub fn status(&self) -> AudioStatus {
         self.diagnostics.status()
+    }
+
+    pub fn poll_diagnostics(&self) {
+        self.diagnostics.poll();
     }
 
     #[allow(dead_code)]
@@ -58,6 +64,10 @@ impl AudioPassthrough {
         muted: bool,
     ) {
         self.stop();
+        crate::drift::event(format_args!(
+            "audio_start_requested input_index={} output_index={}",
+            input_index, output_index
+        ));
         self.volume_ctrl.set_volume(volume);
         self.volume_ctrl.set_muted(muted);
 
@@ -136,10 +146,23 @@ impl AudioPassthrough {
         self.diagnostics.set_input_info(Some(in_info));
         self.diagnostics.set_output_info(Some(out_info));
 
-        let ring = Arc::new(AudioRingBuffer::new(
-            RING_BUFFER_CAPACITY,
-            self.diagnostics.clone(),
-        ));
+        let trace = crate::drift::new_audio(in_rate, in_channels, out_rate, out_channels);
+        if let Some(t) = &trace {
+            crate::drift::event(format_args!("audio_config id={} build={} version={} backend={:?} input={:?} input_hz={} input_channels={} input_format={:?} input_buffer={:?} output={:?} output_hz={} output_channels={} output_format={:?} output_buffer={:?} ring_capacity_samples={} ring_capacity_playback_frames={:.1} ring_capacity_ms={:.2} resampler={} lookahead_input_frames={} backend_latency=unknown",
+                t.id, env!("TACKLECAST_BUILD_ID"), env!("CARGO_PKG_VERSION"), host.id(),
+                input_name, in_rate, in_channels, in_format, in_config.buffer_size,
+                output_name, out_rate, out_channels, out_format, out_config.buffer_size,
+                RING_BUFFER_CAPACITY, RING_BUFFER_CAPACITY as f64 / out_channels as f64,
+                RING_BUFFER_CAPACITY as f64 * 1000.0 / out_channels as f64 / out_rate as f64,
+                if in_rate == out_rate { "identity" } else { "Catmull-Rom" }, if in_rate == out_rate { 0 } else { 2 }));
+        }
+        let ring = Arc::new(
+            AudioRingBuffer::new(RING_BUFFER_CAPACITY, self.diagnostics.clone()).with_trace(trace),
+        );
+        if ring.trace.is_some() {
+            self.drift_ring = Some(ring.clone());
+            crate::drift::start_audio(ring.clone());
+        }
 
         let input_stream = match build_input_stream(
             &input_device,
@@ -193,6 +216,7 @@ impl AudioPassthrough {
         info!("Audio output started successfully");
 
         self.diagnostics.set_status(AudioStatus::Connected);
+        crate::drift::event(format_args!("audio_streams_playing"));
         self.input_stream = Some(input_stream);
         self.output_stream = Some(output_stream);
     }
@@ -200,6 +224,17 @@ impl AudioPassthrough {
     pub fn stop(&mut self) {
         self.input_stream.take();
         self.output_stream.take();
+        self.diagnostics.poll();
+        if let Some(ring) = self.drift_ring.take() {
+            if let Some(t) = &ring.trace {
+                crate::drift::event(format_args!(
+                    "audio_stop id={} discarded_ring_samples={}",
+                    t.id,
+                    ring.available()
+                ));
+                crate::drift::stop_audio(t.id);
+            }
+        }
         self.diagnostics.set_status(AudioStatus::Stopped);
         self.diagnostics.set_input_info(None);
         self.diagnostics.set_output_info(None);
@@ -347,9 +382,13 @@ where
     let mut resampled = Vec::with_capacity(4096);
 
     let err_diag = diagnostics;
+    let error_trace = ring.trace.clone();
     device.build_input_stream(
         config,
         move |data: &[T], _| {
+            if let Some(t) = &ring.trace {
+                t.capture(data.len());
+            }
             scratch_f32.clear();
             scratch_f32.reserve(data.len());
             for &sample in data {
@@ -369,9 +408,11 @@ where
 
             ring.push_samples(&resampled);
         },
-        move |error| {
-            error!("audio input stream error: {error}");
-            err_diag.set_status(AudioStatus::Error(format!("Input error: {error}")));
+        move |_error| {
+            err_diag.record_stream_error(true);
+            if let Some(t) = &error_trace {
+                t.stream_error(true);
+            }
         },
         None,
     )
@@ -389,10 +430,14 @@ where
 {
     let mut scratch = [0.0f32; 2048];
     let err_diag = diagnostics;
+    let error_trace = ring.trace.clone();
 
     device.build_output_stream(
         config,
         move |data: &mut [T], _| {
+            if let Some(t) = &ring.trace {
+                t.output_entry();
+            }
             let mut offset = 0;
             let gain = volume_ctrl.gain();
 
@@ -413,9 +458,11 @@ where
                 offset += chunk_len;
             }
         },
-        move |error| {
-            error!("audio output stream error: {error}");
-            err_diag.set_status(AudioStatus::Error(format!("Output error: {error}")));
+        move |_error| {
+            err_diag.record_stream_error(false);
+            if let Some(t) = &error_trace {
+                t.stream_error(false);
+            }
         },
         None,
     )
