@@ -597,11 +597,18 @@ where
 {
     let mut scratch = [0.0f32; 2048];
     let err_diag = diagnostics.clone();
+    let mut limiter = common::AudioLatencyLimiter::new(config.sample_rate.0, config.channels);
+    let per_ms = (config.sample_rate.0 as usize * config.channels.max(1) as usize / 1000).max(1);
 
     device.build_output_stream(
         config,
         move |data: &mut [T], _| {
             diagnostics.record_output_callback(data.len());
+            let excess = limiter.excess(ring.available(), data.len());
+            if excess > 0 {
+                let dropped = ring.skip(excess);
+                diagnostics.record_latency_trim(dropped / per_ms);
+            }
             let mut offset = 0;
             let gain = volume_ctrl.gain();
 

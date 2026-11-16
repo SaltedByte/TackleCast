@@ -10,6 +10,7 @@ mod dx12_interop;
 #[cfg(target_os = "windows")]
 mod dxgi_compat;
 mod frame_rate;
+mod framegen;
 #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
 mod gpu_decode;
 #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
@@ -72,6 +73,8 @@ enum AudioRestart {
 pub enum AppEvent {
     /// The capture thread has published a new frame to the triple buffer.
     FrameReady,
+    /// The frame generation worker has results or status for the UI thread.
+    FrameGenEvent,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -79,12 +82,33 @@ enum TestPatternMode {
     Alternate,
     Nv12,
     Yuvj422p,
+    /// Moving box, exact pacing (frame generation tests).
+    Motion,
 }
 
 #[derive(Debug)]
 struct CliArgs {
     test_mode: bool,
     test_pattern: TestPatternMode,
+    /// `--test-fps=30|29.97|60000/1001...`: overrides the test pattern rate.
+    test_fps: Option<frame_rate::FrameRate>,
+    /// `--framegen`: enable frame generation for this run (not saved).
+    force_framegen: bool,
+    /// `--framegen-bench=SECONDS`: run, write a report, exit.
+    bench_seconds: Option<f64>,
+    bench_report: Option<std::path::PathBuf>,
+    /// `--framegen-toggle-test`: during the bench, turn frame generation
+    /// off and on again to check release and recovery.
+    toggle_test: bool,
+    /// `--test-clip=<clip folder>`: play a recorded clip as the capture
+    /// source (looping, recorded timing).
+    test_clip: Option<std::path::PathBuf>,
+    /// `--framegen-backend=rife|fruc`: engine for this run (not saved).
+    backend_override: Option<settings::FrameGenBackend>,
+    /// `--framegen-rife-model=rife426fmh|rife46fmh|rife46fm`.
+    rife_model_override: Option<settings::RifeModel>,
+    /// `--framegen-artifacts=off|dynamic|advanced`: for this run (not saved).
+    artifacts_override: Option<settings::FrameGenArtifactMode>,
 }
 
 impl CliArgs {
@@ -92,7 +116,13 @@ impl CliArgs {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let has_flag = |name: &str| args.iter().any(|arg| arg.eq_ignore_ascii_case(name));
 
-        let test_pattern = if has_flag("--test-nv12") {
+        let value = |prefix: &str| {
+            args.iter()
+                .find_map(|arg| arg.strip_prefix(prefix).map(str::to_string))
+        };
+        let test_pattern = if has_flag("--test-motion") {
+            TestPatternMode::Motion
+        } else if has_flag("--test-nv12") {
             TestPatternMode::Nv12
         } else if has_flag("--test-yuvj422p") || has_flag("--test-mjpeg") {
             TestPatternMode::Yuvj422p
@@ -100,15 +130,43 @@ impl CliArgs {
             TestPatternMode::Alternate
         };
 
-        let test_mode = has_flag("--test")
+        let test_clip = value("--test-clip=").map(std::path::PathBuf::from);
+        let test_mode = test_clip.is_some()
+            || has_flag("--test")
             || has_flag("--test-alt")
             || has_flag("--test-nv12")
             || has_flag("--test-yuvj422p")
-            || has_flag("--test-mjpeg");
+            || has_flag("--test-mjpeg")
+            || has_flag("--test-motion");
+        let test_fps = value("--test-fps=").and_then(|v| match v.as_str() {
+            "29.97" => Some(frame_rate::FrameRate::new(30_000, 1001)),
+            "59.94" => Some(frame_rate::FrameRate::new(60_000, 1001)),
+            other => other.parse().ok(),
+        });
+        let bench_seconds = value("--framegen-bench=").and_then(|v| v.parse::<f64>().ok());
 
         Self {
             test_mode,
             test_pattern,
+            test_fps,
+            force_framegen: has_flag("--framegen") || bench_seconds.is_some(),
+            bench_seconds,
+            bench_report: value("--bench-report=").map(std::path::PathBuf::from),
+            toggle_test: has_flag("--framegen-toggle-test"),
+            test_clip,
+            rife_model_override: value("--framegen-rife-model=")
+                .and_then(|v| settings::RifeModel::from_stem(&v)),
+            backend_override: value("--framegen-backend=").and_then(|v| match v.as_str() {
+                "rife" => Some(settings::FrameGenBackend::Rife),
+                "fruc" => Some(settings::FrameGenBackend::NvidiaFruc),
+                _ => None,
+            }),
+            artifacts_override: value("--framegen-artifacts=").and_then(|v| match v.as_str() {
+                "off" => Some(settings::FrameGenArtifactMode::Off),
+                "dynamic" => Some(settings::FrameGenArtifactMode::Dynamic),
+                "advanced" => Some(settings::FrameGenArtifactMode::Advanced),
+                _ => None,
+            }),
         }
     }
 }
@@ -123,6 +181,36 @@ fn main() {
     }
     if let Err(error) = ffmpeg_next::init() {
         eprintln!("failed to initialize ffmpeg: {error}");
+    }
+
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if raw_args.iter().any(|a| a.starts_with("--fruc-selftest")) {
+        #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+        if let Some(args) = framegen::selftest::SelftestArgs::from_cli(&raw_args) {
+            info!("====== TackleCast FRUC self-test ======");
+            std::process::exit(framegen::selftest::run(args));
+        }
+        eprintln!("--fruc-selftest requires the Windows build with the gpu-decode feature");
+        std::process::exit(2);
+    }
+
+    if raw_args.iter().any(|a| a.starts_with("--fruc-reference=")) {
+        #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+        if let Some(args) = framegen::replay::ReferenceArgs::from_cli(&raw_args) {
+            info!("====== TackleCast FRUC reference run ======");
+            std::process::exit(framegen::replay::run_reference(args));
+        }
+        eprintln!("--fruc-reference requires the Windows build with the gpu-decode feature");
+        std::process::exit(2);
+    }
+    if raw_args.iter().any(|a| a.starts_with("--fg-replay=")) {
+        #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
+        if let Some(args) = framegen::replay::ReplayArgs::from_cli(&raw_args) {
+            info!("====== TackleCast frame-generation replay ======");
+            std::process::exit(framegen::replay::run(args));
+        }
+        eprintln!("--fg-replay requires the Windows build with the gpu-decode feature");
+        std::process::exit(2);
     }
 
     info!("====== TackleCast starting ======");
@@ -214,8 +302,7 @@ fn main() {
     let cli = CliArgs::parse();
     let mut app = App::new(
         settings,
-        cli.test_mode,
-        cli.test_pattern,
+        &cli,
         video_devices,
         audio_inputs,
         audio_outputs,
@@ -228,6 +315,7 @@ struct App {
     settings: Settings,
     test_mode: bool,
     test_pattern: TestPatternMode,
+    test_clip: Option<std::path::PathBuf>,
     video_devices: Vec<String>,
     audio_inputs: Vec<AudioDevice>,
     audio_outputs: Vec<AudioDevice>,
@@ -254,22 +342,80 @@ struct App {
     next_ui_redraw: Option<Instant>,
     #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
     gpu_monitor: Option<gpu_monitor::GpuMonitor>,
+    framegen: framegen::FrameGenController,
+    /// Diagnostic clip recorder (raw captured frames for `--fg-replay`).
+    recorder: framegen::recorder::ClipRecorder,
+    /// Frame generation was forced on from the command line (not saved).
+    force_framegen: bool,
+    /// False for automated runs (bench) so the user's settings are untouched.
+    persist_settings: bool,
+    test_fps: Option<frame_rate::FrameRate>,
+    bench: Option<Bench>,
+}
+
+/// `--framegen-bench`: automated run that writes a pacing report and exits.
+struct Bench {
+    started: Instant,
+    duration: Duration,
+    report: std::path::PathBuf,
+    toggle_test: bool,
+    toggled_off: bool,
+    toggled_on: bool,
+    events: Vec<String>,
 }
 
 impl App {
     fn new(
         settings: Settings,
-        test_mode: bool,
-        test_pattern: TestPatternMode,
+        cli: &CliArgs,
         video_devices: Vec<String>,
         audio_inputs: Vec<AudioDevice>,
         audio_outputs: Vec<AudioDevice>,
         event_proxy: EventLoopProxy<AppEvent>,
     ) -> Self {
+        let mut effective = settings.clone();
+        if let Some(backend) = cli.backend_override {
+            effective.framegen_backend = backend;
+        }
+        if let Some(model) = cli.rife_model_override {
+            effective.framegen_rife_model = model;
+        }
+        if let Some(mode) = cli.artifacts_override {
+            effective.framegen_artifact_mode = mode;
+        }
+        let mut fg_config = framegen::FgConfig::from_settings(&effective);
+        if cli.force_framegen {
+            fg_config.enabled = true;
+        }
+        let waker_proxy = event_proxy.clone();
+        let factory = framegen::platform_backend_factory(Box::new(move || {
+            let _ = waker_proxy.send_event(AppEvent::FrameGenEvent);
+        }));
+        let bench = cli.bench_seconds.map(|seconds| Bench {
+            started: Instant::now(),
+            duration: Duration::from_secs_f64(seconds.clamp(5.0, 3600.0)),
+            report: cli.bench_report.clone().unwrap_or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.join("framegen_bench_report.json")))
+                    .unwrap_or_else(|| "framegen_bench_report.json".into())
+            }),
+            toggle_test: cli.toggle_test,
+            toggled_off: false,
+            toggled_on: false,
+            events: Vec::new(),
+        });
         Self {
+            framegen: framegen::FrameGenController::new(fg_config, factory),
+            recorder: Default::default(),
+            force_framegen: cli.force_framegen,
+            persist_settings: cli.bench_seconds.is_none(),
+            test_fps: cli.test_fps,
+            bench,
             settings,
-            test_mode,
-            test_pattern,
+            test_mode: cli.test_mode,
+            test_pattern: cli.test_pattern,
+            test_clip: cli.test_clip.clone(),
             video_devices,
             audio_inputs,
             audio_outputs,
@@ -446,7 +592,11 @@ impl ApplicationHandler<AppEvent> for App {
         self.ui = Some(ui);
         self.window = Some(window);
 
-        self.start_audio();
+        if self.bench.is_none() {
+            self.start_audio();
+        } else {
+            info!("bench run: audio passthrough not started");
+        }
         self.start_capture();
 
         if let Some(window) = &self.window {
@@ -512,9 +662,10 @@ impl ApplicationHandler<AppEvent> for App {
                     capture.stop();
                 }
                 self.audio.stop();
-                if let Err(error) = self.settings.save() {
-                    error!("failed to save settings on exit: {error}");
+                if let Some(renderer) = &mut self.renderer {
+                    self.framegen.shutdown(renderer);
                 }
+                self.save_settings("on exit");
                 event_loop.exit();
             }
             WindowEvent::CursorMoved { .. } => {
@@ -522,7 +673,13 @@ impl ApplicationHandler<AppEvent> for App {
                 self.set_cursor_visible(true);
             }
             WindowEvent::Resized(size) => {
+                let was_minimized = self.is_minimized;
                 self.is_minimized = size.width == 0 || size.height == 0;
+                if was_minimized != self.is_minimized {
+                    if let Some(renderer) = &mut self.renderer {
+                        self.framegen.break_continuity(renderer);
+                    }
+                }
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(size);
                 }
@@ -532,6 +689,11 @@ impl ApplicationHandler<AppEvent> for App {
                 self.update_sleep_suppression();
             }
             WindowEvent::Occluded(occluded) => {
+                if occluded != self.is_minimized {
+                    if let Some(renderer) = &mut self.renderer {
+                        self.framegen.break_continuity(renderer);
+                    }
+                }
                 self.is_minimized = occluded;
                 if !self.is_minimized {
                     window.request_redraw();
@@ -544,6 +706,9 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 let overlay = self.overlay_info();
                 let audio_status = self.audio.status().to_string();
+                let fg_diagnostics = self.framegen.diagnostics(Instant::now());
+                let recorder_status = self.recorder.status().to_string();
+                let recorder_available = !self.recorder.is_busy() && self.capture.is_some();
                 if let (Some(renderer), Some(ui)) = (&mut self.renderer, &mut self.ui) {
                     let prepared_ui = ui.prepare(
                         &window,
@@ -555,8 +720,34 @@ impl ApplicationHandler<AppEvent> for App {
                             audio_outputs: &self.audio_outputs,
                             is_fullscreen: self.is_fullscreen,
                             audio_status: &audio_status,
+                            framegen: &fg_diagnostics,
+                            framegen_forced: self.force_framegen,
+                            recorder_status: &recorder_status,
+                            recorder_available,
                         },
                     );
+                    if prepared_ui.output.retry_framegen {
+                        self.framegen.retry(renderer);
+                    }
+                    if prepared_ui.output.record_clip && !self.recorder.is_busy() {
+                        let height = renderer
+                            .current_video_size()
+                            .map(|(_, h)| h)
+                            .unwrap_or(1080);
+                        let color = renderer.color_info();
+                        let info = framegen::recorder::ClipInfo {
+                            color_space: color.resolve_space(self.settings.color_space, height),
+                            color_range: color.resolve_range(self.settings.color_range),
+                            nominal_fps: nominal_fps(&self.settings.fps_mode),
+                            framegen_settings: framegen_settings_json(&self.settings),
+                        };
+                        let base = std::env::current_exe()
+                            .ok()
+                            .and_then(|p| p.parent().map(|d| d.join("recordings")))
+                            .unwrap_or_else(|| "recordings".into());
+                        self.recorder
+                            .start(&base, Duration::from_secs(10), info, Instant::now());
+                    }
                     let toggle_fullscreen = prepared_ui.output.toggle_fullscreen;
                     let exit_requested = prepared_ui.output.exit_requested;
                     let apply_settings = prepared_ui.output.apply_settings.clone();
@@ -578,6 +769,7 @@ impl ApplicationHandler<AppEvent> for App {
                     if let Err(error) = renderer.render(Some(prepared_ui)) {
                         error!("render error: {error}");
                     }
+                    self.framegen.on_presented(Instant::now());
                     self.render_frame_counter += 1;
                     if toggle_fullscreen {
                         self.toggle_fullscreen();
@@ -605,9 +797,10 @@ impl ApplicationHandler<AppEvent> for App {
                             capture.stop();
                         }
                         self.audio.stop();
-                        if let Err(error) = self.settings.save() {
-                            error!("failed to save settings on exit: {error}");
+                        if let Some(renderer) = &mut self.renderer {
+                            self.framegen.shutdown(renderer);
                         }
+                        self.save_settings("on exit");
                         event_loop.exit();
                     }
                 }
@@ -639,10 +832,14 @@ impl ApplicationHandler<AppEvent> for App {
                 }
 
                 let mut uploaded = false;
+                let mut action = framegen::FrameAction::RedrawNow;
                 if let (Some(capture), Some(renderer)) = (&mut self.capture, &mut self.renderer) {
                     if let Some(frame) = capture.latest_frame() {
+                        let arrival = Instant::now();
                         renderer.upload_frame(frame);
+                        self.recorder.push(frame, arrival);
                         uploaded = true;
+                        action = self.framegen.on_frame_uploaded(renderer, arrival);
                     }
                 }
                 if uploaded {
@@ -652,10 +849,15 @@ impl ApplicationHandler<AppEvent> for App {
                     self.update_sleep_suppression();
                 }
 
-                if let Some(window) = &self.window {
-                    window.request_redraw();
+                // With frame generation presenting, frames are shown on its
+                // schedule instead of on arrival.
+                if action == framegen::FrameAction::RedrawNow || !uploaded {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
                 }
             }
+            AppEvent::FrameGenEvent => self.service_framegen(),
         }
     }
 
@@ -665,7 +867,14 @@ impl ApplicationHandler<AppEvent> for App {
         // down are only serviced here, and without a wakeup they'd stall
         // whenever frames stop — leaving a capture error unreported and the
         // overlay frozen on stale numbers.
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + HOUSEKEEPING_TICK));
+        self.service_framegen();
+        self.recorder.tick(Instant::now());
+        let mut wake_at = Instant::now() + HOUSEKEEPING_TICK;
+        if let Some(deadline) = self.framegen.next_deadline() {
+            wake_at = wake_at.min(deadline);
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(wake_at));
+        self.update_bench(event_loop);
 
         // Poll non-frame channels (stats, errors, negotiation).
         // These are low-frequency and don't need event-driven wakeup.
@@ -694,9 +903,7 @@ impl ApplicationHandler<AppEvent> for App {
                 );
                 self.settings
                     .apply_negotiated(negotiated.width, negotiated.height, negotiated.fps);
-                if let Err(error) = self.settings.save() {
-                    error!("failed to save negotiated settings: {error}");
-                }
+                self.save_settings("after negotiation");
             }
         }
 
@@ -823,8 +1030,116 @@ impl ApplicationHandler<AppEvent> for App {
 }
 
 impl App {
+    fn save_settings(&self, context: &str) {
+        if !self.persist_settings {
+            return;
+        }
+        if let Err(error) = self.settings.save() {
+            if context.is_empty() {
+                error!("failed to save settings: {error}");
+            } else {
+                error!("failed to save settings {context}: {error}");
+            }
+        }
+    }
+
+    /// Drain frame generation results and show any image that is due.
+    fn service_framegen(&mut self) {
+        let Some(renderer) = &mut self.renderer else {
+            return;
+        };
+        let now = Instant::now();
+        let mut redraw = self.framegen.process_events(renderer, now);
+        if !self.is_minimized {
+            redraw |= self.framegen.poll_display(renderer, now);
+        }
+        if redraw {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
+    /// Drive `--framegen-bench`: optional off/on toggle, then report and exit.
+    fn update_bench(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(bench) = self.bench.as_mut() else {
+            return;
+        };
+        let elapsed = bench.started.elapsed();
+        let fraction = elapsed.as_secs_f64() / bench.duration.as_secs_f64();
+        let mut toggle: Option<bool> = None;
+        if bench.toggle_test && !bench.toggled_off && fraction >= 0.40 {
+            bench.toggled_off = true;
+            toggle = Some(false);
+        } else if bench.toggle_test && bench.toggled_off && !bench.toggled_on && fraction >= 0.55 {
+            bench.toggled_on = true;
+            toggle = Some(true);
+        }
+        if let (Some(enabled), Some(renderer)) = (toggle, self.renderer.as_mut()) {
+            let before = format!("{:?}", self.framegen.state());
+            let mut config = self.framegen.config().clone();
+            config.enabled = enabled;
+            self.framegen.configure(config, renderer);
+            let message = format!(
+                "{:.1}s: frame generation {} ({} -> {:?})",
+                elapsed.as_secs_f64(),
+                if enabled { "re-enabled" } else { "disabled" },
+                before,
+                self.framegen.state()
+            );
+            info!("bench: {message}");
+            bench.events.push(message);
+        }
+        if elapsed < bench.duration {
+            return;
+        }
+        let diagnostics = self.framegen.diagnostics(Instant::now());
+        let intervals = self.framegen.present_intervals_ms();
+        let mut histogram = std::collections::BTreeMap::<String, usize>::new();
+        for value in &intervals {
+            let bucket = (value * 2.0).round() / 2.0;
+            *histogram.entry(format!("{bucket:05.1} ms")).or_default() += 1;
+        }
+        let report = serde_json::json!({
+            "tool": format!("TackleCast-FrameGen {} --framegen-bench", env!("CARGO_PKG_VERSION")),
+            "duration_s": bench.duration.as_secs_f64(),
+            "test_pattern": format!("{:?}", self.test_pattern),
+            "test_clip": self.test_clip.as_ref().map(|p| p.display().to_string()),
+            "framegen_backend": self.framegen.config().backend.to_string(),
+            "framegen_rife_model": self.framegen.config().rife_model.stem(),
+            "source_fps": self.test_fps.map(|f| f.as_f64()).unwrap_or_else(|| self.settings.get_fps().as_f64()),
+            "capture_resolution": self.latest_stats.as_ref().map(|s| format!("{}x{}", s.width, s.height)),
+            "capture_measured_fps": self.latest_stats.as_ref().map(|s| s.fps),
+            "framegen": diagnostics,
+            "present_intervals_last_n_ms": intervals,
+            "present_interval_histogram": histogram,
+            "toggle_events": bench.events,
+            "note": "Present intervals are measured when TackleCast hands a new image to the swap chain;                      the compositor and display add their own (unmeasured) timing.",
+        });
+        let path = bench.report.clone();
+        match std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&report).unwrap_or_default(),
+        ) {
+            Ok(()) => info!("bench report written to {}", path.display()),
+            Err(e) => error!("could not write bench report {}: {e}", path.display()),
+        }
+        if let Some(capture) = &mut self.capture {
+            capture.stop();
+        }
+        self.audio.stop();
+        if let Some(renderer) = &mut self.renderer {
+            self.framegen.shutdown(renderer);
+        }
+        self.bench = None;
+        event_loop.exit();
+    }
+
     fn queue_capture_restart(&mut self, restart_audio: Option<AudioRestart>) {
         self.capture_restart_pending = true;
+        if let Some(renderer) = &mut self.renderer {
+            self.framegen.break_continuity(renderer);
+        }
         // A user-selected route takes priority over a queued recovery of the old route.
         if self.audio_restart_pending != Some(AudioRestart::Selected) {
             self.audio_restart_pending = restart_audio.or(self.audio_restart_pending);
@@ -844,8 +1159,15 @@ impl App {
         let old_settings = self.settings.clone();
         self.settings = new_settings;
 
-        if let Err(error) = self.settings.save() {
-            error!("failed to save settings: {error}");
+        self.save_settings("");
+        if let Some(renderer) = &mut self.renderer {
+            let mut fg_config = framegen::FgConfig::from_settings(&self.settings);
+            if self.force_framegen
+                && self.settings.framegen_enabled == old_settings.framegen_enabled
+            {
+                fg_config.enabled = true;
+            }
+            self.framegen.configure(fg_config, renderer);
         }
 
         let video_changed = old_settings.video_device != self.settings.video_device
@@ -1036,9 +1358,11 @@ impl App {
     ) {
         let (alternate_formats, force_format) = match self.test_pattern {
             TestPatternMode::Alternate => (true, None),
-            TestPatternMode::Nv12 => (false, Some(PixelFormat::Nv12)),
+            TestPatternMode::Nv12 | TestPatternMode::Motion => (false, Some(PixelFormat::Nv12)),
             TestPatternMode::Yuvj422p => (false, Some(PixelFormat::Yuvj422p)),
         };
+        let motion = matches!(self.test_pattern, TestPatternMode::Motion);
+        let fps = self.test_fps.unwrap_or(fps);
 
         info!(
             "starting test-pattern capture: {}x{} @ {}fps ({reason})",
@@ -1052,6 +1376,8 @@ impl App {
                 source: CaptureSource::TestPattern {
                     alternate_formats,
                     force_format,
+                    motion,
+                    clip: self.test_clip.clone(),
                 },
                 audio_sink: None,
             },
@@ -1083,4 +1409,28 @@ impl App {
             self.settings.audio_muted,
         );
     }
+}
+
+/// Nominal capture rate from the settings key ("30", "29.97", "30000/1001").
+fn nominal_fps(key: &str) -> f64 {
+    if let Some((n, d)) = key.split_once('/') {
+        if let (Ok(n), Ok(d)) = (n.trim().parse::<f64>(), d.trim().parse::<f64>()) {
+            if d > 0.0 {
+                return n / d;
+            }
+        }
+    }
+    key.trim().parse().unwrap_or(0.0)
+}
+
+/// The frame-generation part of the settings, as JSON (for clip metadata).
+fn framegen_settings_json(settings: &settings::Settings) -> String {
+    let Ok(serde_json::Value::Object(all)) = serde_json::to_value(settings) else {
+        return String::new();
+    };
+    let fg: serde_json::Map<_, _> = all
+        .into_iter()
+        .filter(|(k, _)| k.starts_with("framegen"))
+        .collect();
+    serde_json::Value::Object(fg).to_string()
 }

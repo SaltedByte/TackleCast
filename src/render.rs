@@ -25,6 +25,15 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
 #[path = "render_gpu_tests.rs"]
 mod gpu_tests;
 
+#[path = "render_framegen.rs"]
+pub mod framegen_gpu;
+#[allow(unused_imports)]
+pub use framegen_gpu::{
+    fg_readback_size, FgGpu, FgImage, FgImport, FgProtection, FixReport, FixStats, FG_FORMAT,
+    VIEW_FINAL, VIEW_OVERLAY, VIEW_RAW, ZONE_BOTTOM_LEFT, ZONE_BOTTOM_RIGHT, ZONE_TOP_LEFT,
+    ZONE_TOP_RIGHT,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveScaleFilter {
     Bilinear,
@@ -99,6 +108,13 @@ pub struct Renderer {
     // Shared DX12 buffers for zero-copy GPU decode (None = not available)
     #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
     shared_gpu_buffers: Option<crate::dx12_interop::SharedGpuBuffers>,
+    /// Bumped whenever `video_frame` is rebuilt, so cached bind groups that
+    /// reference its textures (frame generation capture) are recreated.
+    video_generation: u64,
+    /// Frame-generation slot textures/buffers (None when inactive).
+    fg_gpu: Option<FgGpu>,
+    /// When set, present this frame-generation image instead of the YUV frame.
+    fg_display: Option<FgImage>,
 }
 
 impl Renderer {
@@ -148,7 +164,8 @@ impl Renderer {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("tacklecast-device"),
-                    required_features: wgpu::Features::empty(),
+                    // Optional: lets frame generation measure its GPU passes.
+                    required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
                     required_limits: wgpu::Limits::default(),
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
@@ -341,6 +358,9 @@ impl Renderer {
             nv12_v_scratch: Vec::new(),
             #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
             shared_gpu_buffers: None,
+            video_generation: 0,
+            fg_gpu: None,
+            fg_display: None,
         })
     }
 
@@ -467,6 +487,7 @@ impl Renderer {
             .unwrap_or(true);
 
         if needs_rebuild {
+            self.video_generation += 1;
             self.video_frame = Some(VideoFrameResources::new(
                 &self.device,
                 &self.video_bind_group_layout,
@@ -575,6 +596,7 @@ impl Renderer {
             .unwrap_or(true);
 
         if needs_rebuild {
+            self.video_generation += 1;
             self.video_frame = Some(VideoFrameResources::new(
                 &self.device,
                 &self.video_bind_group_layout,
@@ -747,7 +769,10 @@ impl Renderer {
             )
         });
 
-        if let (Some(video_frame), Some(viewport)) = (&self.video_frame, video_viewport) {
+        let fg_drawn = self.fg_display.is_some() && self.encode_fg_display(&mut encoder, &view);
+        if fg_drawn {
+            // Frame generation drew an RGB frame (original or interpolated).
+        } else if let (Some(video_frame), Some(viewport)) = (&self.video_frame, video_viewport) {
             let is_upscaling = viewport.width > video_frame.width as f32
                 || viewport.height > video_frame.height as f32;
             let is_equal = viewport.width == video_frame.width as f32
@@ -1391,7 +1416,10 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            // COPY_DST: frame generation copies its RGB output in for FSR.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let native_rgb_view =

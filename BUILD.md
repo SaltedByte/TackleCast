@@ -151,3 +151,12 @@ Create a version tag matching `Cargo.toml` (for example, `v2.2.0`) to release. T
 Manual dispatch requires an existing version tag and builds that tag's commit. Publication is off by default; enable the `publish` input only when you want a GitHub Release. Forks can validate and generate artifacts without publishing upstream releases. Build jobs have read-only repository access; only the publication job receives release-writing permissions.
 
 Both packages include `build-info.json` with their source commit and version, and dependency license/source information. Packaging always invokes Cargo before copying the executable, so an existing binary cannot silently bypass the build.
+
+## Frame generation
+
+The frame generation code lives in `src/framegen/`, `src/render_framegen.rs` and `src/render_framegen_fix.rs`, and builds with the normal steps above (default features). Nothing extra is needed at compile time:
+
+- RIFE: `onnxruntime.dll`, `onnxruntime_providers_shared.dll`, `DirectML.dll` and the models are loaded at runtime from a `rife` folder next to the exe. Take that folder from the release zip, or rebuild the models with `scripts/rife/export_models.py`.
+- NVIDIA FRUC: `nvcuda.dll` comes with the driver, `NvOFFRUC.dll` / `cudart64_110.dll` come from your own Optical Flow SDK 5.0.7 and can't be redistributed.
+
+`cargo test -- --ignored` also runs the GPU tests (needs a working wgpu adapter).

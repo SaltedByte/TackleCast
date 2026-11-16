@@ -54,6 +54,235 @@ pub struct Settings {
     pub gamma: f32,
     #[serde(default = "default_sharpness")]
     pub sharpness: f32,
+    /// Frame generation master switch. Off by default until enabled by hand.
+    #[serde(default)]
+    pub framegen_enabled: bool,
+    #[serde(default)]
+    pub framegen_backend: FrameGenBackend,
+    #[serde(default, deserialize_with = "lenient_rife_model")]
+    pub framegen_rife_model: RifeModel,
+    #[serde(default)]
+    pub framegen_mode: FrameGenMode,
+    #[serde(default)]
+    pub framegen_target: FrameGenTarget,
+    /// Show the frame-generation diagnostics overlay.
+    #[serde(default)]
+    pub framegen_overlay: bool,
+    /// Folder holding NvOFFRUC.dll (or the Optical Flow SDK root). Empty:
+    /// search next to the executable and the default SDK location.
+    #[serde(default)]
+    pub framegen_runtime_dir: String,
+    /// Require NVIDIA Authenticode signatures on the FRUC DLLs.
+    #[serde(default = "default_true")]
+    pub framegen_require_signature: bool,
+    /// Duplicate-frame detection thresholds (advanced; JSON only).
+    #[serde(default)]
+    pub framegen_duplicates: crate::framegen::duplicate::DuplicateThresholds,
+    /// Scene-cut detection (transition stabilisation): mean luma difference
+    /// (8-bit levels) between consecutive frames that, together with a
+    /// failed camera-motion match, marks a cut / full-screen change. JSON
+    /// only; 0 disables cut detection.
+    #[serde(default = "default_framegen_skip_difference")]
+    pub framegen_skip_difference: f32,
+    /// Artifact reduction applied to generated frames (Off = raw FRUC).
+    #[serde(default)]
+    pub framegen_artifact_mode: FrameGenArtifactMode,
+    /// Dynamic: correct pixels that are static in both real frames (HUD,
+    /// still scenery) but were warped by interpolation.
+    #[serde(default = "default_true")]
+    pub framegen_fix_static: bool,
+    /// Dynamic: where the scenery follows the measured camera motion but the
+    /// generated pixel disagrees (HUD ghosts, smearing), use a
+    /// motion-compensated reconstruction from the two real frames.
+    #[serde(default = "default_true")]
+    pub framegen_fix_motion: bool,
+    /// Dynamic: content entering the screen during camera motion is taken
+    /// from the one real frame that contains it, shifted to the midpoint.
+    #[serde(default = "default_true")]
+    pub framegen_fix_edges: bool,
+    /// Dynamic: in-place fades (UI fading in/out) and scene cuts.
+    #[serde(default = "default_true")]
+    pub framegen_fix_transitions: bool,
+    /// HUD guard (any mode): crosshair, icons and text that stay put while
+    /// the camera moves are kept out of interpolation and drawn from the
+    /// real frame, so they do not flicker or leave dragged copies.
+    #[serde(default = "default_true")]
+    pub framegen_hud_guard: bool,
+    /// Debug view of generated frames.
+    #[serde(default)]
+    pub framegen_debug_view: FrameGenDebugView,
+    /// Optional manual regions always shown from the real frame (bit 0
+    /// top-left, 1 top-right, 2 bottom-left, 3 bottom-right). Off by
+    /// default: these regions update at the source rate.
+    #[serde(default)]
+    pub framegen_manual_zones: u32,
+    #[serde(default = "default_framegen_zone_width")]
+    pub framegen_manual_zone_width: f32,
+    #[serde(default = "default_framegen_zone_height")]
+    pub framegen_manual_zone_height: f32,
+}
+
+/// Frame-generation backend (interpolation engine).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameGenBackend {
+    /// NVIDIA Optical Flow FRUC (NvOFFRUC.dll from the Optical Flow SDK,
+    /// not redistributable, so the user supplies it).
+    NvidiaFruc,
+    /// RIFE neural interpolation on the GPU (ONNX Runtime + DirectML,
+    /// shipped in the `rife` folder next to the executable).
+    #[default]
+    Rife,
+}
+
+impl Display for FrameGenBackend {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NvidiaFruc => f.write_str("NVIDIA FRUC (Optical Flow)"),
+            Self::Rife => f.write_str("RIFE (DirectML)"),
+        }
+    }
+}
+
+/// RIFE network used by the RIFE backend (Practical-RIFE weights, MIT).
+/// Each is an ONNX file `rife/models/<stem>_<W>x<H>.onnx` that outputs
+/// motion + blend mask; the renderer builds the frame from the real frames.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum RifeModel {
+    /// RIFE 4.26 run on the frames scaled down 2x. At 1440p the network
+    /// misses thin objects (rifle barrel, hat brim) in fast camera turns;
+    /// at half resolution it keeps them, and it is ~10 ms on an RTX 5080.
+    #[default]
+    #[serde(rename = "4.26_half")]
+    V426Half,
+    /// RIFE 4.6 at half resolution: fastest (~5 ms).
+    #[serde(rename = "4.6_half")]
+    V46Half,
+    /// RIFE 4.6 at full resolution (~18 ms).
+    #[serde(rename = "4.6_sharp")]
+    V46Full,
+}
+
+impl RifeModel {
+    pub const ALL: [Self; 3] = [Self::V426Half, Self::V46Half, Self::V46Full];
+
+    /// File-name stem of the ONNX model.
+    pub fn stem(self) -> &'static str {
+        match self {
+            Self::V426Half => "rife426fmh",
+            Self::V46Half => "rife46fmh",
+            Self::V46Full => "rife46fm",
+        }
+    }
+
+    pub fn from_stem(stem: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.stem() == stem)
+    }
+}
+
+impl Display for RifeModel {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::V426Half => f.write_str("RIFE 4.26, half-res motion (recommended)"),
+            Self::V46Half => f.write_str("RIFE 4.6, half-res motion (fastest)"),
+            Self::V46Full => f.write_str("RIFE 4.6, full-res motion"),
+        }
+    }
+}
+
+/// Unknown model names (from older test builds) fall back to the default
+/// instead of resetting every setting.
+fn lenient_rife_model<'de, D: serde::Deserializer<'de>>(d: D) -> Result<RifeModel, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameGenMode {
+    Off,
+    /// One interpolated frame between every pair of unique source frames.
+    #[default]
+    #[serde(rename = "2x")]
+    Double,
+}
+
+impl Display for FrameGenMode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => f.write_str("Off"),
+            Self::Double => f.write_str("2\u{00D7}"),
+        }
+    }
+}
+
+/// Artifact reduction for generated frames.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameGenArtifactMode {
+    /// Raw NVIDIA FRUC output, full screen, no extra processing.
+    #[default]
+    Off,
+    /// Content-aware correction of unreliable generated pixels.
+    Dynamic,
+    /// Dynamic, plus hiding detected static HUD from FRUC's input.
+    Advanced,
+}
+
+impl Display for FrameGenArtifactMode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => f.write_str("Off (engine output as is)"),
+            Self::Dynamic => f.write_str("Dynamic"),
+            Self::Advanced => f.write_str("Advanced (Dynamic + HUD hidden from FRUC)"),
+        }
+    }
+}
+
+/// What is shown in place of generated frames (debugging).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameGenDebugView {
+    /// Final output (raw FRUC + corrections).
+    #[default]
+    Final,
+    /// Raw FRUC output, ignoring corrections (they are still measured).
+    RawFruc,
+    /// Final output with corrected pixels tinted by correction type.
+    CorrectionOverlay,
+}
+
+impl Display for FrameGenDebugView {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Final => f.write_str("Final output"),
+            Self::RawFruc => f.write_str("Raw engine output"),
+            Self::CorrectionOverlay => f.write_str("Correction overlay"),
+        }
+    }
+}
+
+/// What output rate frame generation aims for.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameGenTarget {
+    /// 60 FPS: interpolate 30 / 29.97 FPS sources; pause automatically when
+    /// the game itself already runs faster than ~45 FPS.
+    #[default]
+    #[serde(rename = "60")]
+    Fps60,
+    /// Always double the unique source rate.
+    #[serde(rename = "double")]
+    AlwaysDouble,
+}
+
+impl Display for FrameGenTarget {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fps60 => f.write_str("60 FPS (30 / 29.97 FPS sources)"),
+            Self::AlwaysDouble => f.write_str("Always 2\u{00D7} source rate"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,6 +488,26 @@ impl Default for Settings {
             saturation: default_saturation(),
             gamma: default_gamma(),
             sharpness: default_sharpness(),
+            framegen_enabled: false,
+            framegen_backend: FrameGenBackend::default(),
+            framegen_rife_model: RifeModel::default(),
+            framegen_mode: FrameGenMode::default(),
+            framegen_target: FrameGenTarget::default(),
+            framegen_overlay: false,
+            framegen_runtime_dir: String::new(),
+            framegen_require_signature: true,
+            framegen_duplicates: Default::default(),
+            framegen_skip_difference: default_framegen_skip_difference(),
+            framegen_artifact_mode: FrameGenArtifactMode::Off,
+            framegen_fix_static: true,
+            framegen_fix_motion: true,
+            framegen_fix_edges: true,
+            framegen_fix_transitions: true,
+            framegen_hud_guard: true,
+            framegen_debug_view: FrameGenDebugView::Final,
+            framegen_manual_zones: 0,
+            framegen_manual_zone_width: default_framegen_zone_width(),
+            framegen_manual_zone_height: default_framegen_zone_height(),
         }
     }
 }
@@ -305,6 +554,23 @@ impl Settings {
             1.0
         };
         self.custom_fps = self.custom_fps.clamp(MIN_FPS, MAX_FPS);
+        self.framegen_duplicates = self.framegen_duplicates.sanitized();
+        self.framegen_manual_zones &= 0xF;
+        let pct = |v: f32, d: f32| if v.is_finite() { v.clamp(2.0, 50.0) } else { d };
+        self.framegen_manual_zone_width = pct(
+            self.framegen_manual_zone_width,
+            default_framegen_zone_width(),
+        );
+        self.framegen_manual_zone_height = pct(
+            self.framegen_manual_zone_height,
+            default_framegen_zone_height(),
+        );
+        self.framegen_skip_difference = if self.framegen_skip_difference.is_finite() {
+            self.framegen_skip_difference.clamp(0.0, 128.0)
+        } else {
+            default_framegen_skip_difference()
+        };
+        self.framegen_runtime_dir = self.framegen_runtime_dir.trim().to_string();
         if self.fps_mode != FPS_MODE_CUSTOM && self.fps_mode.parse::<FrameRate>().is_err() {
             self.fps_mode = default_fps_mode();
         }
@@ -356,6 +622,22 @@ pub fn settings_path() -> PathBuf {
     }
 
     base.join("tacklecast_settings.json")
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_framegen_skip_difference() -> f32 {
+    32.0
+}
+
+fn default_framegen_zone_width() -> f32 {
+    15.0
+}
+
+fn default_framegen_zone_height() -> f32 {
+    25.0
 }
 
 fn default_audio_index() -> i32 {
@@ -593,4 +875,14 @@ mod tests {
             assert_eq!(s.scaling_filter, ScaleFilter::RtxVsr);
         }
     }
+    #[test]
+    fn unknown_rife_model_falls_back_to_default() {
+        let s: Settings =
+            serde_json::from_str(r#"{"framegen_rife_model":"4.26_heavy","volume":0.5}"#).unwrap();
+        assert_eq!(s.framegen_rife_model, RifeModel::default());
+        assert_eq!(s.volume, 0.5);
+        let s: Settings = serde_json::from_str(r#"{"framegen_rife_model":"4.6_half"}"#).unwrap();
+        assert_eq!(s.framegen_rife_model, RifeModel::V46Half);
+    }
+
 }

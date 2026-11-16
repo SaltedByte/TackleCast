@@ -2,7 +2,11 @@ use crate::capabilities;
 use crate::color::ColorInfo;
 use crate::devices::AudioDevice;
 use crate::frame_rate::FrameRate;
-use crate::settings::{ColorRange, ColorSpace, ScaleFilter, Settings, VideoFormat};
+use crate::framegen::FgDiagnostics;
+use crate::settings::{
+    ColorRange, ColorSpace, FrameGenArtifactMode, FrameGenBackend, FrameGenDebugView, FrameGenMode, RifeModel,
+    FrameGenTarget, ScaleFilter, Settings, VideoFormat,
+};
 use egui::{
     Align, Align2, Button, Color32, ComboBox, CornerRadius, FontId, Frame, Layout, Margin,
     RichText, Slider, Stroke,
@@ -39,6 +43,7 @@ pub enum MenuTab {
     Video,
     Picture,
     Audio,
+    FrameGen,
     Display,
 }
 
@@ -77,6 +82,13 @@ pub struct UiFrame<'a> {
     pub audio_outputs: &'a [AudioDevice],
     pub is_fullscreen: bool,
     pub audio_status: &'a str,
+    pub framegen: &'a FgDiagnostics,
+    /// Enabled from the command line for this run.
+    pub framegen_forced: bool,
+    /// Diagnostic clip recorder status ("" when idle and never used).
+    pub recorder_status: &'a str,
+    /// Whether a clip can be recorded right now (CPU frames available).
+    pub recorder_available: bool,
 }
 
 pub struct PreparedUi {
@@ -95,6 +107,9 @@ pub struct UiOutput {
     pub slider_active: bool,
     pub toggle_fullscreen: bool,
     pub exit_requested: bool,
+    pub retry_framegen: bool,
+    /// Start recording a diagnostic clip (raw captured frames).
+    pub record_clip: bool,
     pub repaint_after: Duration,
 }
 
@@ -170,7 +185,10 @@ impl UiState {
                 overlay.filter = self.draft_settings.scaling_filter;
                 overlay.filter_label = self.draft_settings.scaling_filter.to_string();
             }
-            draw_overlay(ctx, &overlay);
+            draw_overlay(ctx, &overlay, frame.framegen);
+            if frame.settings.framegen_overlay && !self.menu_open {
+                draw_framegen_overlay(ctx, frame.framegen);
+            }
         });
         if self.menu_open {
             ui_output.live_video = Some(self.draft_settings.clone());
@@ -241,8 +259,16 @@ fn configure_style(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
-fn draw_overlay(ctx: &egui::Context, overlay: &OverlayInfo) {
-    let text = overlay_text(overlay);
+fn draw_overlay(ctx: &egui::Context, overlay: &OverlayInfo, framegen: &FgDiagnostics) {
+    let mut text = overlay_text(overlay);
+    if let Some(text) = text.as_mut() {
+        if overlay.status_message.is_none() && framegen.active && !framegen.paused {
+            text.push_str(&format!(
+                "  \u{2022}  FG 2\u{00D7} {:.1} FPS",
+                framegen.displayed_fps
+            ));
+        }
+    }
     let color = if overlay.status_is_alert {
         COLOR_EXIT_BORDER
     } else {
@@ -528,6 +554,9 @@ fn draw_menu(
                                             }
                                         });
                                     }
+                                    MenuTab::FrameGen => {
+                                        framegen_tab(ui, draft, frame, output, text_scale);
+                                    }
                                     MenuTab::Display => {
                                         card_section(ui, "WINDOW & DISPLAY", text_scale, |ui| {
                                             if styled_button(
@@ -595,6 +624,7 @@ fn tab_bar(ui: &mut egui::Ui, current_tab: &mut MenuTab, text_scale: f32) {
         (MenuTab::Video, "Video"),
         (MenuTab::Picture, "Picture"),
         (MenuTab::Audio, "Audio"),
+        (MenuTab::FrameGen, "Frame Gen"),
         (MenuTab::Display, "Display"),
     ];
 
@@ -999,4 +1029,346 @@ fn overlay_text(overlay: &OverlayInfo) -> Option<String> {
         }),
         _ => Some("Waiting For Video...".to_string()),
     }
+}
+
+fn framegen_tab(
+    ui: &mut egui::Ui,
+    draft: &mut Settings,
+    frame: &UiFrame<'_>,
+    output: &mut UiOutput,
+    text_scale: f32,
+) {
+    let diag = frame.framegen;
+    card_section(ui, "FRAME GENERATION", text_scale, |ui| {
+        ui.checkbox(&mut draft.framegen_enabled, "Enable Frame Generation");
+        if frame.framegen_forced && !draft.framegen_enabled {
+            warning_text(
+                ui,
+                "Enabled for this run by --framegen; this checkbox sets the saved default.",
+                text_scale,
+            );
+        }
+        ui.add_enabled_ui(draft.framegen_enabled, |ui| {
+            ui.columns(2, |columns| {
+                columns[0].label(RichText::new("Backend").color(COLOR_TEXT_SECONDARY));
+                ComboBox::from_id_salt("framegen_backend")
+                    .width(columns[0].available_width())
+                    .selected_text(draft.framegen_backend.to_string())
+                    .show_ui(&mut columns[0], |ui| {
+                        for backend in [FrameGenBackend::Rife, FrameGenBackend::NvidiaFruc] {
+                            ui.selectable_value(
+                                &mut draft.framegen_backend,
+                                backend,
+                                backend.to_string(),
+                            );
+                        }
+                    });
+                if draft.framegen_backend == FrameGenBackend::Rife {
+                    columns[0].label(RichText::new("RIFE model").color(COLOR_TEXT_SECONDARY));
+                    ComboBox::from_id_salt("framegen_rife_model")
+                        .width(columns[0].available_width())
+                        .selected_text(draft.framegen_rife_model.to_string())
+                        .show_ui(&mut columns[0], |ui| {
+                            for model in RifeModel::ALL {
+                                ui.selectable_value(
+                                    &mut draft.framegen_rife_model,
+                                    model,
+                                    model.to_string(),
+                                );
+                            }
+                        });
+                }
+                columns[1].label(RichText::new("Mode").color(COLOR_TEXT_SECONDARY));
+                ComboBox::from_id_salt("framegen_mode")
+                    .width(columns[1].available_width())
+                    .selected_text(draft.framegen_mode.to_string())
+                    .show_ui(&mut columns[1], |ui| {
+                        for mode in [FrameGenMode::Off, FrameGenMode::Double] {
+                            ui.selectable_value(&mut draft.framegen_mode, mode, mode.to_string());
+                        }
+                    });
+            });
+            ui.label(RichText::new("Output target").color(COLOR_TEXT_SECONDARY));
+            ComboBox::from_id_salt("framegen_target")
+                .width(ui.available_width())
+                .selected_text(draft.framegen_target.to_string())
+                .show_ui(ui, |ui| {
+                    for target in [FrameGenTarget::Fps60, FrameGenTarget::AlwaysDouble] {
+                        ui.selectable_value(&mut draft.framegen_target, target, target.to_string());
+                    }
+                });
+            ui.checkbox(&mut draft.framegen_overlay, "Diagnostics overlay");
+            ui.checkbox(
+                &mut draft.framegen_hud_guard,
+                "Keep HUD steady (crosshair, icons, text stay sharp while the camera moves)",
+            );
+            ui.add_space(4.0);
+            ui.label(RichText::new("Artifact reduction").color(COLOR_TEXT_SECONDARY));
+            ComboBox::from_id_salt("framegen_artifact_mode")
+                .width(ui.available_width())
+                .selected_text(draft.framegen_artifact_mode.to_string())
+                .show_ui(ui, |ui| {
+                    for mode in [
+                        FrameGenArtifactMode::Off,
+                        FrameGenArtifactMode::Dynamic,
+                        FrameGenArtifactMode::Advanced,
+                    ] {
+                        ui.selectable_value(
+                            &mut draft.framegen_artifact_mode,
+                            mode,
+                            mode.to_string(),
+                        );
+                    }
+                });
+            if draft.framegen_artifact_mode != FrameGenArtifactMode::Off {
+                ui.checkbox(
+                    &mut draft.framegen_fix_static,
+                    "Dynamic HUD protection (HUD and still areas warped by interpolation)",
+                );
+                ui.checkbox(
+                    &mut draft.framegen_fix_motion,
+                    "Occlusion-aware correction (HUD ghosts and smearing on panning scenery)",
+                );
+                ui.checkbox(
+                    &mut draft.framegen_fix_edges,
+                    "Dynamic edge correction (content entering the screen during camera motion)",
+                );
+                ui.checkbox(
+                    &mut draft.framegen_fix_transitions,
+                    "UI transition stabilisation (fading UI, scene cuts)",
+                );
+            }
+            egui::CollapsingHeader::new("Advanced / debug")
+                .id_salt("framegen_debug")
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Show in generated frames").color(COLOR_TEXT_SECONDARY));
+                    ComboBox::from_id_salt("framegen_debug_view")
+                        .width(ui.available_width())
+                        .selected_text(draft.framegen_debug_view.to_string())
+                        .show_ui(ui, |ui| {
+                            for view in [
+                                FrameGenDebugView::Final,
+                                FrameGenDebugView::RawFruc,
+                                FrameGenDebugView::CorrectionOverlay,
+                            ] {
+                                ui.selectable_value(
+                                    &mut draft.framegen_debug_view,
+                                    view,
+                                    view.to_string(),
+                                );
+                            }
+                        });
+                    if draft.framegen_debug_view == FrameGenDebugView::CorrectionOverlay {
+                        ui.label(
+                            RichText::new(
+                                "red = still-pixel fix, green = camera-motion fix, \
+                                 blue = screen-edge fix, yellow = fade fix, magenta = manual region",
+                            )
+                            .size(12.0 * text_scale)
+                            .color(COLOR_TEXT_MUTED),
+                        );
+                    }
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Manual regions (troubleshooting only: always shown from the real \
+                             frame, so they update at the source rate)",
+                        )
+                        .color(COLOR_TEXT_SECONDARY),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        for (bit, name) in [
+                            (crate::render::ZONE_BOTTOM_LEFT, "Bottom-left"),
+                            (crate::render::ZONE_BOTTOM_RIGHT, "Bottom-right"),
+                            (crate::render::ZONE_TOP_LEFT, "Top-left"),
+                            (crate::render::ZONE_TOP_RIGHT, "Top-right"),
+                        ] {
+                            let mut on = draft.framegen_manual_zones & bit != 0;
+                            if ui.checkbox(&mut on, name).changed() {
+                                draft.framegen_manual_zones ^= bit;
+                            }
+                        }
+                    });
+                    if draft.framegen_manual_zones != 0 {
+                        ui.add(
+                            egui::Slider::new(&mut draft.framegen_manual_zone_width, 5.0..=40.0)
+                                .step_by(1.0)
+                                .suffix(" %")
+                                .text("region width"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut draft.framegen_manual_zone_height, 5.0..=40.0)
+                                .step_by(1.0)
+                                .suffix(" %")
+                                .text("region height"),
+                        );
+                    }
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Diagnostic clip: saves the next 10 s of captured frames (raw, \
+                             ~1.7 GB) to the recordings folder for offline replay \
+                             (--fg-replay). Recording does not change what is shown.",
+                        )
+                        .size(12.0 * text_scale)
+                        .color(COLOR_TEXT_MUTED),
+                    );
+                    ui.add_enabled_ui(frame.recorder_available, |ui| {
+                        if styled_button(ui, "Record diagnostic clip (10 s)")
+                            .clicked()
+                        {
+                            output.record_clip = true;
+                        }
+                    });
+                    if !frame.recorder_status.is_empty() {
+                        ui.label(
+                            RichText::new(frame.recorder_status)
+                                .size(12.0 * text_scale)
+                                .color(COLOR_TEXT_SECONDARY),
+                        );
+                    }
+                });
+            ui.label(
+                RichText::new("FRUC runtime folder (Optical Flow SDK or folder with NvOFFRUC.dll)")
+                    .color(COLOR_TEXT_SECONDARY),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut draft.framegen_runtime_dir)
+                    .hint_text("Auto: next to the app, ..\\..\\Optical_Flow_SDK_5.0.7")
+                    .desired_width(f32::INFINITY),
+            );
+        });
+        ui.label(
+            RichText::new(
+                "Interpolates one frame between each pair of new game frames using the GPU's \
+                 optical-flow engine. Adds about half a source frame of latency (~17 ms at 30 FPS) \
+                 plus processing time; the exact figure is shown below while active.",
+            )
+            .size(12.0 * text_scale)
+            .color(COLOR_TEXT_MUTED),
+        );
+    });
+    card_section(ui, "STATUS", text_scale, |ui| {
+        let status_color = if diag.active {
+            COLOR_TEXT_PRIMARY
+        } else if diag.state.starts_with("Unavailable") {
+            COLOR_WARNING
+        } else {
+            COLOR_TEXT_SECONDARY
+        };
+        ui.label(RichText::new(&diag.state).color(status_color));
+        if !diag.backend.is_empty() {
+            ui.label(
+                RichText::new(&diag.backend)
+                    .size(12.0 * text_scale)
+                    .color(COLOR_TEXT_SECONDARY),
+            );
+        }
+        if diag.state.starts_with("Unavailable")
+            && styled_button(ui, "Retry frame generation").clicked()
+        {
+            output.retry_framegen = true;
+        }
+        if diag.active {
+            for line in framegen_lines(diag) {
+                ui.label(RichText::new(line).size(12.0 * text_scale).monospace());
+            }
+        }
+    });
+}
+
+fn framegen_lines(d: &FgDiagnostics) -> Vec<String> {
+    vec![
+        format!(
+            "Captured {:5.1}  Unique {:5.1}  Generated {:5.1}  Displayed {:5.1} FPS",
+            d.captured_fps, d.unique_fps, d.generated_fps, d.displayed_fps
+        ),
+        format!(
+            "FRUC {:5.2} ms (p95 {:5.2})   Frametime {:5.2} \u{00B1} {:4.2} ms (max {:5.2})",
+            d.fruc_time.mean_ms,
+            d.fruc_time.p95_ms,
+            d.frametime.mean_ms,
+            d.frametime.stddev_ms,
+            d.frametime.max_ms
+        ),
+        format!(
+            "Added latency \u{2248}{:4.1} ms   Duplicates {}   Dropped {}   Gaps {}",
+            d.added_latency_ms, d.duplicates, d.dropped_no_slot, d.source_gaps
+        ),
+        format!(
+            "Late {}   Transition skips {}   FRUC repeats {}   Failures {}   Hitches {}",
+            d.late_generated, d.transition_skips, d.fruc_repeats, d.failures, d.hitches
+        ),
+        format!(
+            "Present late p99 {:5.2} ms   Missed deadlines {}   Near-dup kept {}",
+            d.present_lateness.p99_ms, d.missed_deadlines, d.near_duplicates_kept
+        ),
+        format!(
+            "Frame difference {:5.1}   Camera motion {:6.1} px (residual {:.2})",
+            d.last_diff_mean,
+            d.motion_px[0].hypot(d.motion_px[1]),
+            d.motion_residual
+        ),
+        match &d.correction {
+            Some(c) if c.fix_failed => "Corrections: unavailable on this GPU (raw FRUC)".into(),
+            Some(c) => format!(
+                "Corrected area {:4.1}% now, {:4.1}% avg   GPU fix {}   capture {}",
+                c.last.map(|s| s.corrected_pct).unwrap_or(0.0),
+                c.mean_corrected_pct,
+                c.fix_gpu
+                    .as_ref()
+                    .map(|s| format!("{:.2}/{:.2} ms", s.mean_ms, s.p99_ms))
+                    .unwrap_or_else(|| "n/a".into()),
+                c.prep_gpu
+                    .as_ref()
+                    .map(|s| format!("{:.2}/{:.2} ms", s.mean_ms, s.p99_ms))
+                    .unwrap_or_else(|| "n/a".into()),
+            ),
+            None => "Corrections: off".into(),
+        },
+        format!(
+            "Present lateness p99 {:.1} ms   missed {}   hitch causes: {}",
+            d.present_lateness.p99_ms,
+            d.missed_deadlines,
+            if d.hitch_causes.is_empty() {
+                "none".to_string()
+            } else {
+                d.hitch_causes
+                    .iter()
+                    .map(|(c, n)| format!("{c} {n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ),
+    ]
+}
+
+fn draw_framegen_overlay(ctx: &egui::Context, diag: &FgDiagnostics) {
+    let mut lines = vec![format!("FRAME GEN  {}", diag.state)];
+    if diag.active {
+        lines.extend(framegen_lines(diag));
+    }
+    egui::Area::new("framegen_overlay".into())
+        .anchor(Align2::RIGHT_TOP, [-12.0, 12.0])
+        .interactable(false)
+        .movable(false)
+        .show(ctx, |ui| {
+            Frame::new()
+                .fill(COLOR_PILL_BG)
+                .stroke(Stroke::new(1.0_f32, Color32::from_white_alpha(30)))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(12, 6))
+                .show(ui, |ui| {
+                    for line in lines {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(line)
+                                    .font(FontId::monospace(12.0))
+                                    .color(COLOR_TEXT_PRIMARY),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                        );
+                    }
+                });
+        });
 }
