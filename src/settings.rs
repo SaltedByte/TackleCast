@@ -12,8 +12,21 @@ pub const FPS_MODE_CUSTOM: &str = "custom";
 pub const MIN_FPS: u32 = 1;
 pub const MAX_FPS: u32 = 240;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    #[default]
+    Vice,
+    Classic,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
+    /// None means an older settings file; migrate detailed_overlay once.
+    #[serde(default)]
+    pub overlay: Option<crate::overlay::OverlayLayout>,
+    #[serde(default)]
+    pub theme: Theme,
     #[serde(default)]
     pub video_device: String,
     #[serde(default = "default_video_format")]
@@ -240,6 +253,8 @@ impl Display for ColorRange {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            theme: Theme::default(),
+            overlay: Some(crate::overlay::OverlayLayout::default()),
             video_device: String::new(),
             video_format: default_video_format(),
             scaling_filter: default_scaling_filter(),
@@ -287,6 +302,12 @@ impl Settings {
     }
 
     pub fn sanitize(&mut self) {
+        if self.overlay.is_none() {
+            self.overlay = Some(crate::overlay::OverlayLayout::legacy(self.detailed_overlay));
+        }
+        if let Some(layout) = &mut self.overlay {
+            layout.normalize();
+        }
         fn finite(value: f32, default: f32, min: f32, max: f32) -> f32 {
             if value.is_finite() {
                 value.clamp(min, max)
@@ -421,6 +442,45 @@ fn default_sharpness() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edition_defaults_to_vice_and_persists_classic() {
+        let value = serde_json::to_value(Settings::default()).unwrap();
+        assert_eq!(value["theme"], "vice");
+        let settings: Settings = serde_json::from_str(r#"{"theme":"classic"}"#).unwrap();
+        assert_eq!(serde_json::to_value(settings).unwrap()["theme"], "classic");
+    }
+
+    #[test]
+    fn overlay_legacy_migration_preserves_master_and_detail() {
+        let mut compact: Settings = serde_json::from_str(r#"{"show_overlay":false}"#).unwrap();
+        compact.sanitize();
+        let json = serde_json::to_value(&compact).unwrap();
+        assert!(!compact.show_overlay);
+        assert_eq!(json["overlay"]["stats"].as_array().unwrap().len(), 7);
+        assert_eq!(json["overlay"]["stats"][4]["enabled"], false);
+        let mut detailed: Settings = serde_json::from_str(r#"{"detailed_overlay":true}"#).unwrap();
+        detailed.sanitize();
+        let json = serde_json::to_value(detailed).unwrap();
+        assert!(json["overlay"]["stats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["enabled"] == true));
+    }
+
+    #[test]
+    fn overlay_normalizes_duplicates_missing_entries_and_preserves_all_off() {
+        let mut s: Settings = serde_json::from_str(r#"{"overlay":{"stats":[{"stat":"pixel_format","enabled":false},{"stat":"pixel_format","enabled":true}]}}"#).unwrap();
+        s.sanitize();
+        let layout = s.overlay.unwrap();
+        assert_eq!(layout.stats.len(), 7);
+        assert_eq!(layout.stats[0].stat, crate::overlay::Stat::PixelFormat);
+        assert!(layout.stats.iter().all(|row| !row.enabled));
+        let mut empty: Settings = serde_json::from_str(r#"{"overlay":{"stats":[]}}"#).unwrap();
+        empty.sanitize();
+        assert!(empty.overlay.unwrap().stats.iter().all(|row| !row.enabled));
+    }
 
     #[test]
     fn default_settings_round_trip() {

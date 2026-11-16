@@ -2,7 +2,8 @@ use crate::capabilities;
 use crate::color::ColorInfo;
 use crate::devices::AudioDevice;
 use crate::frame_rate::FrameRate;
-use crate::settings::{ColorRange, ColorSpace, ScaleFilter, Settings, VideoFormat};
+use crate::settings::{ColorRange, ColorSpace, ScaleFilter, Settings, Theme, VideoFormat};
+use crate::theme::Palette;
 use egui::{
     Align, Align2, Button, Color32, ComboBox, CornerRadius, FontId, Frame, Layout, Margin,
     RichText, Slider, Stroke,
@@ -13,26 +14,6 @@ use std::time::Duration;
 use winit::event::WindowEvent;
 use winit::window::Window;
 
-const COLOR_TEXT_PRIMARY: Color32 = Color32::from_rgb(0xE0, 0xE0, 0xE0);
-const COLOR_TEXT_SECONDARY: Color32 = Color32::from_rgb(0x88, 0x99, 0xAA);
-const COLOR_TEXT_MUTED: Color32 = Color32::from_rgb(0x88, 0x99, 0xAA);
-const COLOR_ACCENT: Color32 = Color32::from_rgb(0xE9, 0x45, 0x60);
-const COLOR_ACCENT_HOVER: Color32 = Color32::from_rgb(0xF4, 0x6A, 0x81);
-const COLOR_CARD_BG: Color32 = Color32::from_rgb(0x10, 0x19, 0x2F);
-const COLOR_PANEL_BG: Color32 = Color32::from_rgb(0x16, 0x21, 0x3E);
-const COLOR_PANEL_HOVER: Color32 = Color32::from_rgb(0x1A, 0x2A, 0x50);
-const COLOR_BORDER: Color32 = Color32::from_rgb(0x0F, 0x34, 0x60);
-const COLOR_BORDER_SUBTLE: Color32 = Color32::from_rgb(0x1A, 0x2A, 0x50);
-const COLOR_MENU_BORDER: Color32 = Color32::from_rgb(0x1A, 0x2A, 0x50);
-const COLOR_TAB_BAR_BG: Color32 = Color32::from_rgb(0x0C, 0x10, 0x22);
-const COLOR_TAB_ACTIVE_BG: Color32 = Color32::from_rgb(0x16, 0x21, 0x3E);
-const COLOR_DIM_OVERLAY: Color32 = Color32::from_black_alpha(120);
-const COLOR_PILL_BG: Color32 = Color32::from_black_alpha(180);
-const COLOR_EXIT_BG: Color32 = Color32::from_rgb(0x3A, 0x10, 0x20);
-const COLOR_EXIT_BORDER: Color32 = Color32::from_rgb(0xE9, 0x45, 0x60);
-const COLOR_EXIT_TEXT: Color32 = Color32::from_rgb(0xE0, 0xE0, 0xE0);
-const COLOR_WARNING: Color32 = Color32::from_rgb(0xF5, 0x9E, 0x0B);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MenuTab {
     #[default]
@@ -42,12 +23,35 @@ pub enum MenuTab {
     Display,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewPage {
+    None,
+    Video,
+    Picture,
+    Audio,
+    Display,
+    Overlay,
+}
+
+impl PreviewPage {
+    fn menu_tab(self) -> Option<MenuTab> {
+        match self {
+            Self::None => None,
+            Self::Video => Some(MenuTab::Video),
+            Self::Picture => Some(MenuTab::Picture),
+            Self::Audio => Some(MenuTab::Audio),
+            Self::Display | Self::Overlay => Some(MenuTab::Display),
+        }
+    }
+}
+
 pub struct UiState {
     egui_ctx: egui::Context,
     egui_winit: State,
     menu_open: bool,
     draft_settings: Settings,
     tab: MenuTab,
+    icon_theme: Option<Theme>,
 }
 
 #[derive(Clone)]
@@ -63,8 +67,7 @@ pub struct OverlayInfo {
     pub nominal_rate: Option<FrameRate>,
     pub color_info: ColorInfo,
     pub show_overlay: bool,
-    /// Stack resolution, filter, and FPS over three lines instead of one.
-    pub detailed: bool,
+    pub layout: crate::overlay::OverlayLayout,
     pub status_message: Option<String>,
     pub status_is_alert: bool,
 }
@@ -101,7 +104,7 @@ pub struct UiOutput {
 impl UiState {
     pub fn new(window: &Window, max_texture_side: usize) -> Self {
         let egui_ctx = egui::Context::default();
-        configure_style(&egui_ctx);
+        configure_style(&egui_ctx, Theme::default());
 
         let egui_winit = State::new(
             egui_ctx.clone(),
@@ -118,6 +121,7 @@ impl UiState {
             menu_open: false,
             draft_settings: Settings::default(),
             tab: MenuTab::default(),
+            icon_theme: None,
         }
     }
 
@@ -132,6 +136,20 @@ impl UiState {
     pub fn open_menu(&mut self, settings: &Settings) {
         self.menu_open = true;
         self.draft_settings = settings.clone();
+    }
+
+    /// Startup-only selection for an explicitly gated synthetic capture preview.
+    pub fn open_preview(&mut self, settings: &Settings, page: PreviewPage) {
+        self.draft_settings = settings.clone();
+        self.menu_open = page.menu_tab().is_some();
+        if let Some(tab) = page.menu_tab() {
+            self.tab = tab;
+        }
+        if page == PreviewPage::Overlay {
+            self.egui_ctx.data_mut(|data| {
+                data.insert_temp(egui::Id::new("test_overlay_focus"), true);
+            });
+        }
     }
 
     pub fn close_menu_and_apply(&mut self) -> Option<Settings> {
@@ -151,6 +169,18 @@ impl UiState {
             }
         }
 
+        configure_style(&self.egui_ctx, self.draft_settings.theme);
+        if self.icon_theme != Some(self.draft_settings.theme) {
+            if let Ok(icon) = theme_icon(self.draft_settings.theme) {
+                #[cfg(target_os = "windows")]
+                {
+                    use winit::platform::windows::WindowExtWindows;
+                    window.set_taskbar_icon(Some(icon.clone()));
+                }
+                window.set_window_icon(Some(icon));
+            }
+            self.icon_theme = Some(self.draft_settings.theme);
+        }
         let raw_input = self.egui_winit.take_egui_input(window);
         let mut ui_output = UiOutput::default();
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
@@ -167,8 +197,8 @@ impl UiState {
             if self.menu_open {
                 overlay.color_space = self.draft_settings.color_space;
                 overlay.color_range = self.draft_settings.color_range;
-                overlay.filter = self.draft_settings.scaling_filter;
-                overlay.filter_label = self.draft_settings.scaling_filter.to_string();
+                overlay.show_overlay = self.draft_settings.show_overlay;
+                overlay.layout = self.draft_settings.overlay.clone().unwrap_or_default();
             }
             draw_overlay(ctx, &overlay);
         });
@@ -206,35 +236,50 @@ impl UiState {
     }
 }
 
-fn configure_style(ctx: &egui::Context) {
+fn theme_icon(theme: Theme) -> Result<winit::window::Icon, String> {
+    let bytes: &[u8] = match theme {
+        Theme::Vice => include_bytes!("../assets/icon.png"),
+        Theme::Classic => include_bytes!("../assets/icon-classic.png"),
+    };
+    let image = image::load_from_memory(bytes)
+        .map_err(|error| error.to_string())?
+        .to_rgba8();
+    let (width, height) = image.dimensions();
+    winit::window::Icon::from_rgba(image.into_raw(), width, height)
+        .map_err(|error| error.to_string())
+}
+
+fn configure_style(ctx: &egui::Context, theme: Theme) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("edition_theme"), theme));
+    let p = Palette::for_theme(theme);
     // Keep the app's branding when the desktop reports a light system theme.
     ctx.set_theme(egui::ThemePreference::Dark);
     let mut style = (*ctx.style()).clone();
     style.visuals = egui::Visuals::dark();
-    style.visuals.override_text_color = Some(COLOR_TEXT_PRIMARY);
+    style.visuals.override_text_color = Some(p.text_primary);
     style.visuals.panel_fill = Color32::TRANSPARENT;
-    style.visuals.window_fill = menu_background();
-    style.visuals.window_stroke = Stroke::new(1.0_f32, COLOR_MENU_BORDER);
+    style.visuals.window_fill = p.menu_bg;
+    style.visuals.window_stroke = Stroke::new(1.0_f32, p.menu_border);
     style.visuals.window_corner_radius = CornerRadius::same(12);
     style.visuals.menu_corner_radius = CornerRadius::same(8);
-    style.visuals.widgets.noninteractive.bg_fill = COLOR_PANEL_BG;
-    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, COLOR_BORDER_SUBTLE);
+    style.visuals.widgets.noninteractive.bg_fill = p.panel_bg;
+    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, p.border_subtle);
     style.visuals.widgets.noninteractive.corner_radius = CornerRadius::same(6);
-    style.visuals.widgets.noninteractive.fg_stroke.color = COLOR_TEXT_PRIMARY;
-    style.visuals.widgets.inactive.bg_fill = COLOR_PANEL_BG;
-    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, COLOR_BORDER);
+    style.visuals.widgets.noninteractive.fg_stroke.color = p.text_primary;
+    style.visuals.widgets.inactive.bg_fill = p.panel_bg;
+    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, p.border);
     style.visuals.widgets.inactive.corner_radius = CornerRadius::same(6);
-    style.visuals.widgets.inactive.fg_stroke.color = COLOR_TEXT_PRIMARY;
-    style.visuals.widgets.hovered.bg_fill = COLOR_PANEL_HOVER;
-    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, COLOR_ACCENT_HOVER);
+    style.visuals.widgets.inactive.fg_stroke.color = p.text_primary;
+    style.visuals.widgets.hovered.bg_fill = p.panel_hover;
+    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, p.accent_hover);
     style.visuals.widgets.hovered.corner_radius = CornerRadius::same(6);
-    style.visuals.widgets.hovered.fg_stroke.color = COLOR_TEXT_PRIMARY;
-    style.visuals.widgets.active.bg_fill = COLOR_PANEL_HOVER;
-    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, COLOR_ACCENT);
+    style.visuals.widgets.hovered.fg_stroke.color = p.text_primary;
+    style.visuals.widgets.active.bg_fill = p.panel_hover;
+    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, p.accent);
     style.visuals.widgets.active.corner_radius = CornerRadius::same(6);
-    style.visuals.widgets.active.fg_stroke.color = COLOR_TEXT_PRIMARY;
-    style.visuals.selection.bg_fill = COLOR_ACCENT;
-    style.visuals.selection.stroke = Stroke::new(1.0_f32, COLOR_ACCENT);
+    style.visuals.widgets.active.fg_stroke.color = p.text_primary;
+    style.visuals.selection.bg_fill = p.accent;
+    style.visuals.selection.stroke = Stroke::new(1.0_f32, p.accent);
     style.visuals.slider_trailing_fill = true;
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
     style.spacing.button_padding = egui::vec2(10.0, 6.0);
@@ -242,39 +287,62 @@ fn configure_style(ctx: &egui::Context) {
 }
 
 fn draw_overlay(ctx: &egui::Context, overlay: &OverlayInfo) {
-    let text = overlay_text(overlay);
+    let p = Palette::current(ctx);
+    // Recovery status is independent of the performance master and choices.
+    let text = overlay
+        .status_message
+        .clone()
+        .or_else(|| overlay_text(overlay));
     let color = if overlay.status_is_alert {
-        COLOR_EXIT_BORDER
+        p.exit_border
     } else {
-        COLOR_TEXT_PRIMARY
+        p.text_primary
     };
 
     if text.is_none() {
         return;
     }
 
-    egui::Area::new("fps_overlay".into())
-        .anchor(Align2::LEFT_TOP, [12.0, 12.0])
-        .interactable(false)
-        .movable(false)
-        .show(ctx, |ui| {
-            Frame::new()
-                .fill(COLOR_PILL_BG)
-                .stroke(Stroke::new(1.0_f32, Color32::from_white_alpha(30)))
-                .corner_radius(CornerRadius::same(8))
-                .inner_margin(Margin::symmetric(12, 6))
-                .show(ui, |ui| {
+    use crate::overlay::Corner;
+    let (anchor, offset) = match overlay.layout.corner {
+        Corner::TopLeft => (Align2::LEFT_TOP, [12.0, 12.0]),
+        Corner::TopRight => (Align2::RIGHT_TOP, [-12.0, 12.0]),
+        Corner::BottomLeft => (Align2::LEFT_BOTTOM, [12.0, -12.0]),
+        Corner::BottomRight => (Align2::RIGHT_BOTTOM, [-12.0, -12.0]),
+    };
+    let max_width = (ctx.screen_rect().width() - 48.0).clamp(64.0, 560.0);
+    egui::Area::new(
+        if overlay.status_message.is_some() {
+            "capture_status"
+        } else {
+            "fps_overlay"
+        }
+        .into(),
+    )
+    .anchor(anchor, offset)
+    .interactable(false)
+    .movable(false)
+    .show(ctx, |ui| {
+        Frame::new()
+            .fill(p.pill_bg)
+            .stroke(Stroke::new(1.0_f32, Color32::from_white_alpha(30)))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(12, 6))
+            .show(ui, |ui| {
+                ui.set_max_width(max_width);
+                ui.spacing_mut().item_spacing.y = 3.0;
+                for (index, line) in text.unwrap_or_default().lines().enumerate() {
                     ui.add(
                         egui::Label::new(
-                            RichText::new(text.unwrap_or_default())
-                                .font(FontId::proportional(13.0))
-                                .strong()
-                                .color(color),
+                            RichText::new(line)
+                                .font(FontId::monospace(if index == 0 { 13.0 } else { 11.0 }))
+                                .color(if index == 0 { color } else { p.text_secondary }),
                         )
-                        .wrap_mode(egui::TextWrapMode::Extend),
+                        .wrap(),
                     );
-                });
-        });
+                }
+            });
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -285,34 +353,29 @@ fn draw_menu(
     frame: &UiFrame<'_>,
     output: &mut UiOutput,
 ) {
+    let p = Palette::current(ctx);
     let screen = ctx.screen_rect();
     let scale = (screen.width() / 1280.0).clamp(0.85, 1.3);
     let menu_width = (480.0_f32 * scale).min((screen.width() - 56.0).max(180.0));
     let text_scale = scale.clamp(0.9, 1.15);
     // Reserve the same space for every tab. Shorter pages keep their empty
     // space, while small windows scroll instead of growing the outer menu.
-    let content_height = (400.0 * text_scale).min((screen.height() - 190.0).max(90.0));
+    let content_height = (400.0 * text_scale).min((screen.height() - 250.0).max(60.0));
     egui::Area::new("settings_menu".into())
         .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
         .order(egui::Order::Foreground)
         .movable(false)
         .show(ctx, |ui| {
             Frame::new()
-                .fill(menu_background())
-                .stroke(Stroke::new(1.0_f32, COLOR_MENU_BORDER))
+                .fill(p.menu_bg)
+                .stroke(Stroke::new(1.0_f32, p.menu_border))
                 .corner_radius(CornerRadius::same(12))
                 .inner_margin(Margin::same(18))
                 .show(ui, |ui| {
                     ui.set_width(menu_width);
                     ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
                     ui.vertical(|ui| {
-                        ui.with_layout(Layout::top_down(Align::Center), |ui| {
-                            ui.label(
-                                RichText::new("Settings")
-                                    .font(FontId::proportional(20.0 * text_scale))
-                                    .strong(),
-                            );
-                        });
+                        edition_header(ui, draft.theme);
                         tab_bar(ui, tab, text_scale);
                         egui::ScrollArea::vertical()
                             .id_salt("settings_content")
@@ -521,7 +584,7 @@ fn draw_menu(
                                             ui.label(
                                                 RichText::new(frame.audio_status)
                                                     .size(12.0 * text_scale)
-                                                    .color(COLOR_TEXT_SECONDARY),
+                                                    .color(p.text_secondary),
                                             );
                                             if styled_button(ui, "Restart audio").clicked() {
                                                 output.restart_audio = true;
@@ -530,6 +593,19 @@ fn draw_menu(
                                     }
                                     MenuTab::Display => {
                                         card_section(ui, "WINDOW & DISPLAY", text_scale, |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.label("Theme");
+                                                ui.selectable_value(
+                                                    &mut draft.theme,
+                                                    Theme::Vice,
+                                                    "Vice",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut draft.theme,
+                                                    Theme::Classic,
+                                                    "Classic",
+                                                );
+                                            });
                                             if styled_button(
                                                 ui,
                                                 if frame.is_fullscreen {
@@ -546,13 +622,27 @@ fn draw_menu(
                                         card_section(ui, "ON-SCREEN OVERLAY", text_scale, |ui| {
                                             ui.checkbox(
                                                 &mut draft.show_overlay,
-                                                "Show Performance Overlay (FPS & Resolution)",
+                                                "Show performance pill",
                                             );
-                                            if draft.show_overlay {
-                                                ui.checkbox(
-                                                    &mut draft.detailed_overlay,
-                                                    "Include Scaling & Color Info",
-                                                );
+                                            let legacy = draft.detailed_overlay;
+                                            let layout = draft.overlay.get_or_insert_with(|| {
+                                                crate::overlay::OverlayLayout::legacy(legacy)
+                                            });
+                                            overlay_corner_combo(ui, &mut layout.corner);
+                                            let focus = ctx.data_mut(|data| {
+                                                data.remove_temp::<bool>(egui::Id::new(
+                                                    "test_overlay_focus",
+                                                ))
+                                                .unwrap_or(false)
+                                            });
+                                            let editor =
+                                                egui::CollapsingHeader::new("Customize statistics")
+                                                    .default_open(focus)
+                                                    .show(ui, |ui| overlay_editor(ui, layout));
+                                            if focus {
+                                                if let Some(body) = editor.body_response {
+                                                    body.scroll_to_me(Some(Align::Center));
+                                                }
                                             }
                                         });
                                         card_section(ui, "SESSION", text_scale, |ui| {
@@ -567,7 +657,7 @@ fn draw_menu(
                             ui.label(
                                 RichText::new("Escape or click outside to save and close")
                                     .size(12.0 * text_scale)
-                                    .color(COLOR_TEXT_MUTED),
+                                    .color(p.text_muted),
                             );
                         });
                     });
@@ -582,7 +672,7 @@ fn draw_menu(
         .show(ctx, |ui| {
             let response = ui.allocate_rect(screen, egui::Sense::click());
             if !output.slider_active {
-                ui.painter().rect_filled(screen, 0.0, COLOR_DIM_OVERLAY);
+                ui.painter().rect_filled(screen, 0.0, p.dim_overlay);
             }
             if response.clicked() {
                 output.apply_settings = Some(draft.clone());
@@ -590,7 +680,148 @@ fn draw_menu(
         });
 }
 
+fn edition_header(ui: &mut egui::Ui, theme: Theme) {
+    let p = Palette::current(ui.ctx());
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 70.0), egui::Sense::hover());
+    if theme == Theme::Classic {
+        ui.painter().rect_filled(rect, 8.0, p.card_bg);
+    }
+    if theme == Theme::Vice {
+        // Frame reserves the one-point stroke in addition to its 18-point
+        // padding. Bleed to the border's inner edge; keep text and controls inset.
+        let art_rect = egui::Rect::from_min_max(
+            rect.min - egui::vec2(18.0, 18.0),
+            rect.max + egui::vec2(18.0, 0.0),
+        );
+        let id = egui::Id::new("vice_header_texture");
+        let texture = ui
+            .ctx()
+            .data_mut(|data| data.get_temp::<egui::TextureHandle>(id));
+        let texture = texture.unwrap_or_else(|| {
+            let image = image::load_from_memory(include_bytes!("../assets/vice-header.png"))
+                .expect("embedded Vice header PNG")
+                .to_rgba8();
+            let pixels = egui::ColorImage::from_rgba_unmultiplied(
+                [image.width() as usize, image.height() as usize],
+                image.as_raw(),
+            );
+            let texture =
+                ui.ctx()
+                    .load_texture("vice_header", pixels, egui::TextureOptions::LINEAR);
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(id, texture.clone()));
+            texture
+        });
+        // Cover the wider header without distorting the supplied illustration.
+        let visible = (art_rect.height() * texture.aspect_ratio() / art_rect.width()).min(1.0);
+        let uv = egui::Rect::from_min_max(
+            egui::pos2(0.0, (1.0 - visible) * 0.5),
+            egui::pos2(1.0, (1.0 + visible) * 0.5),
+        );
+        egui::Image::new((texture.id(), texture.size_vec2()))
+            .uv(uv)
+            .tint(Color32::from_white_alpha(180))
+            .corner_radius(CornerRadius {
+                nw: 11,
+                ne: 11,
+                sw: 0,
+                se: 0,
+            })
+            .paint_at(ui, art_rect);
+    }
+    ui.painter().text(
+        rect.left_top() + egui::vec2(14.0, 10.0),
+        Align2::LEFT_TOP,
+        "TackleCast VI",
+        FontId::proportional(23.0),
+        p.text_primary,
+    );
+    ui.painter().text(
+        rect.left_top() + egui::vec2(15.0, 42.0),
+        Align2::LEFT_TOP,
+        if theme == Theme::Vice {
+            "VICE EDITION  /  SETTINGS"
+        } else {
+            "CLASSIC  /  SETTINGS"
+        },
+        FontId::proportional(10.0),
+        p.text_secondary,
+    );
+}
+
+fn overlay_corner_combo(ui: &mut egui::Ui, corner: &mut crate::overlay::Corner) {
+    use crate::overlay::Corner;
+    let options = [
+        (Corner::TopLeft, "Top left"),
+        (Corner::TopRight, "Top right"),
+        (Corner::BottomLeft, "Bottom left"),
+        (Corner::BottomRight, "Bottom right"),
+    ];
+    ui.horizontal(|ui| {
+        ui.label("Position");
+        ComboBox::from_id_salt("overlay_corner")
+            .selected_text(options.iter().find(|(value, _)| value == corner).unwrap().1)
+            .show_ui(ui, |ui| {
+                for (value, label) in options {
+                    ui.selectable_value(corner, value, label);
+                }
+            });
+    });
+}
+
+fn overlay_editor(ui: &mut egui::Ui, layout: &mut crate::overlay::OverlayLayout) {
+    use crate::overlay::Stat;
+    layout.normalize();
+    ui.label(RichText::new("Drag the grip to reorder, or use Up / Down. All off hides the pill; recovery messages stay visible.").small().color(Palette::current(ui.ctx()).text_secondary));
+    let mut movement = None;
+    let count = layout.stats.len();
+    for (index, choice) in layout.stats.iter_mut().enumerate() {
+        let stat = choice.stat;
+        ui.push_id(stat, |ui| {
+            let (_, dropped) = ui.dnd_drop_zone::<Stat, _>(Frame::new().inner_margin(3), |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    // Restrict drag hit-testing to the handle. A drag source
+                    // over the completed row would mask checkbox/button clicks
+                    // in egui 0.31 (the last drag-only widget wins hit-testing).
+                    ui.dnd_drag_source(egui::Id::new(("overlay_stat_drag", stat)), stat, |ui| {
+                        ui.label(RichText::new("::").color(Palette::current(ui.ctx()).text_muted))
+                            .on_hover_text("Drag to reorder this statistic");
+                    });
+                    ui.checkbox(&mut choice.enabled, stat.label());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add_enabled(index + 1 < count, Button::new("Down").small())
+                            .on_hover_text("Move down")
+                            .clicked()
+                        {
+                            movement = Some((stat, index + 1));
+                        }
+                        if ui
+                            .add_enabled(index > 0, Button::new("Up").small())
+                            .on_hover_text("Move up")
+                            .clicked()
+                        {
+                            movement = Some((stat, index.saturating_sub(1)));
+                        }
+                    });
+                });
+            });
+            if let Some(payload) = dropped {
+                movement = Some((*payload, index));
+            }
+        });
+    }
+    if let Some((stat, to)) = movement {
+        if let Some(from) = layout.stats.iter().position(|row| row.stat == stat) {
+            layout.move_row(from, to);
+        }
+    }
+}
+
 fn tab_bar(ui: &mut egui::Ui, current_tab: &mut MenuTab, text_scale: f32) {
+    let p = Palette::current(ui.ctx());
     let tabs = [
         (MenuTab::Video, "Video"),
         (MenuTab::Picture, "Picture"),
@@ -599,8 +830,8 @@ fn tab_bar(ui: &mut egui::Ui, current_tab: &mut MenuTab, text_scale: f32) {
     ];
 
     Frame::new()
-        .fill(COLOR_TAB_BAR_BG)
-        .stroke(Stroke::new(1.0_f32, COLOR_BORDER_SUBTLE))
+        .fill(p.tab_bar_bg)
+        .stroke(Stroke::new(1.0_f32, p.border_subtle))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::same(3))
         .show(ui, |ui| {
@@ -614,12 +845,12 @@ fn tab_bar(ui: &mut egui::Ui, current_tab: &mut MenuTab, text_scale: f32) {
                     let is_active = *current_tab == tab;
                     let (bg, text_color, stroke) = if is_active {
                         (
-                            COLOR_TAB_ACTIVE_BG,
-                            COLOR_TEXT_PRIMARY,
-                            Stroke::new(1.0_f32, COLOR_ACCENT),
+                            p.tab_active_bg,
+                            p.text_primary,
+                            Stroke::new(1.0_f32, p.accent),
                         )
                     } else {
-                        (Color32::TRANSPARENT, COLOR_TEXT_MUTED, Stroke::NONE)
+                        (Color32::TRANSPARENT, p.text_muted, Stroke::NONE)
                     };
 
                     let btn = Button::new(
@@ -647,17 +878,18 @@ fn card_section<R>(
     text_scale: f32,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
+    let p = Palette::current(ui.ctx());
     ui.add_space(3.0);
     ui.label(
         RichText::new(title)
             .size(11.0 * text_scale)
             .strong()
-            .color(COLOR_TEXT_MUTED),
+            .color(p.text_muted),
     );
     ui.add_space(1.0);
     Frame::new()
-        .fill(COLOR_CARD_BG)
-        .stroke(Stroke::new(1.0_f32, COLOR_BORDER_SUBTLE))
+        .fill(p.card_bg)
+        .stroke(Stroke::new(1.0_f32, p.border_subtle))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::same(12))
         .show(ui, |ui| {
@@ -669,11 +901,8 @@ fn card_section<R>(
 }
 
 fn warning_text(ui: &mut egui::Ui, text: &str, text_scale: f32) {
-    ui.label(
-        RichText::new(text)
-            .size(12.0 * text_scale)
-            .color(COLOR_WARNING),
-    );
+    let p = Palette::current(ui.ctx());
+    ui.label(RichText::new(text).size(12.0 * text_scale).color(p.warning));
 }
 
 fn labeled_combo_string(
@@ -682,7 +911,8 @@ fn labeled_combo_string(
     selected: &mut String,
     options: Vec<String>,
 ) {
-    ui.label(RichText::new(label).color(COLOR_TEXT_SECONDARY));
+    let p = Palette::current(ui.ctx());
+    ui.label(RichText::new(label).color(p.text_secondary));
     ComboBox::from_id_salt(label)
         .width(ui.available_width())
         .selected_text(display_or_default(&crate::devices::video_device_label(
@@ -700,7 +930,8 @@ fn labeled_combo_string(
 }
 
 fn labeled_combo_static(ui: &mut egui::Ui, label: &str, selected: &mut String, options: &[&str]) {
-    ui.label(RichText::new(label).color(COLOR_TEXT_SECONDARY));
+    let p = Palette::current(ui.ctx());
+    ui.label(RichText::new(label).color(p.text_secondary));
     ComboBox::from_id_salt(label)
         .width(ui.available_width())
         .selected_text(selected.clone())
@@ -719,7 +950,8 @@ fn video_format_combo(
     active: Option<&str>,
     live: bool,
 ) {
-    ui.label(RichText::new(label).color(COLOR_TEXT_SECONDARY));
+    let p = Palette::current(ui.ctx());
+    ui.label(RichText::new(label).color(p.text_secondary));
     let text = if *selected == VideoFormat::Auto {
         if !live {
             "Auto (pending apply)".into()
@@ -745,7 +977,8 @@ fn video_format_combo(
 }
 
 fn scaling_filter_combo(ui: &mut egui::Ui, label: &str, selected: &mut ScaleFilter) {
-    ui.label(RichText::new(label).color(COLOR_TEXT_SECONDARY));
+    let p = Palette::current(ui.ctx());
+    ui.label(RichText::new(label).color(p.text_secondary));
     ComboBox::from_id_salt(label)
         .width(ui.available_width())
         .selected_text(selected.to_string())
@@ -763,7 +996,8 @@ fn color_space_combo(
     info: ColorInfo,
     height: u32,
 ) {
-    ui.label(RichText::new(label).color(COLOR_TEXT_SECONDARY));
+    let p = Palette::current(ui.ctx());
+    ui.label(RichText::new(label).color(p.text_secondary));
     ComboBox::from_id_salt(label)
         .width(ui.available_width())
         .selected_text(info.space_label(*selected, height))
@@ -775,7 +1009,8 @@ fn color_space_combo(
 }
 
 fn color_range_combo(ui: &mut egui::Ui, label: &str, selected: &mut ColorRange, info: ColorInfo) {
-    ui.label(RichText::new(label).color(COLOR_TEXT_SECONDARY));
+    let p = Palette::current(ui.ctx());
+    ui.label(RichText::new(label).color(p.text_secondary));
     ComboBox::from_id_salt(label)
         .width(ui.available_width())
         .selected_text(info.range_label(*selected))
@@ -787,7 +1022,8 @@ fn color_range_combo(ui: &mut egui::Ui, label: &str, selected: &mut ColorRange, 
 }
 
 fn fps_mode_combo(ui: &mut egui::Ui, selected: &mut String, rates: &[FrameRate]) {
-    ui.label(RichText::new("Frame Rate").color(COLOR_TEXT_SECONDARY));
+    let p = Palette::current(ui.ctx());
+    ui.label(RichText::new("Frame Rate").color(p.text_secondary));
     let text = selected
         .parse::<FrameRate>()
         .map(|rate| format!("{rate} FPS"))
@@ -809,7 +1045,8 @@ fn labeled_audio_combo(
     devices: &[AudioDevice],
     dshow_option: Option<&str>,
 ) {
-    ui.label(RichText::new(label).color(COLOR_TEXT_SECONDARY));
+    let p = Palette::current(ui.ctx());
+    ui.label(RichText::new(label).color(p.text_secondary));
     ComboBox::from_id_salt(label)
         .width(ui.available_width())
         .selected_text(audio_device_name(*selected, devices, dshow_option))
@@ -850,6 +1087,7 @@ fn picture_slider(
     step: f64,
     text_scale: f32,
 ) -> bool {
+    let p = Palette::current(ui.ctx());
     let available_width = ui.available_width();
     let label_width = (86.0 * text_scale).min(available_width * 0.28);
     let value_width = 64.0 * text_scale;
@@ -863,7 +1101,7 @@ fn picture_slider(
                 egui::Label::new(
                     RichText::new(label)
                         .size(12.0 * text_scale)
-                        .color(COLOR_TEXT_SECONDARY),
+                        .color(p.text_secondary),
                 )
                 .halign(Align::Min),
             );
@@ -898,34 +1136,28 @@ fn picture_slider(
 }
 
 fn styled_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let p = Palette::current(ui.ctx());
     ui.add(
-        Button::new(RichText::new(text).color(COLOR_TEXT_PRIMARY).strong())
-            .fill(COLOR_PANEL_BG)
-            .stroke(Stroke::new(1.0_f32, COLOR_BORDER))
+        Button::new(RichText::new(text).color(p.text_primary).strong())
+            .fill(p.panel_bg)
+            .stroke(Stroke::new(1.0_f32, p.border))
             .corner_radius(CornerRadius::same(6))
             .min_size(egui::vec2(0.0, 28.0)),
     )
 }
 
 fn exit_button(ui: &mut egui::Ui) -> egui::Response {
+    let p = Palette::current(ui.ctx());
     ui.with_layout(Layout::top_down(Align::Center), |ui| {
         ui.add(
-            Button::new(
-                RichText::new("Exit TackleCast")
-                    .color(COLOR_EXIT_TEXT)
-                    .strong(),
-            )
-            .fill(COLOR_EXIT_BG)
-            .stroke(Stroke::new(1.0_f32, COLOR_EXIT_BORDER))
-            .corner_radius(CornerRadius::same(6))
-            .min_size(egui::vec2(ui.available_width(), 32.0)),
+            Button::new(RichText::new("Exit TackleCast").color(p.exit_text).strong())
+                .fill(p.exit_bg)
+                .stroke(Stroke::new(1.0_f32, p.exit_border))
+                .corner_radius(CornerRadius::same(6))
+                .min_size(egui::vec2(ui.available_width(), 32.0)),
         )
     })
     .inner
-}
-
-fn menu_background() -> Color32 {
-    Color32::from_rgba_unmultiplied(12, 12, 28, 240)
 }
 
 fn video_device_options(video_devices: &[String], current: &str) -> Vec<String> {
@@ -965,38 +1197,615 @@ fn audio_device_name(index: i32, devices: &[AudioDevice], dshow_option: Option<&
 }
 
 fn overlay_text(overlay: &OverlayInfo) -> Option<String> {
-    if let Some(message) = overlay.status_message.as_ref() {
-        return Some(message.clone());
+    if overlay.status_is_alert || overlay.status_message.is_some() {
+        return None;
     }
 
     if !overlay.show_overlay {
         return None;
     }
 
-    match (overlay.width, overlay.height, overlay.fps) {
-        (Some(width), Some(height), Some(fps)) => Some({
-            let fmt_suffix = overlay
-                .active_format
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(|s| format!(" | {s}"))
-                .unwrap_or_default();
-            let nominal = overlay
+    use crate::overlay::Stat;
+    let height = overlay.height.unwrap_or(1080);
+    let mut cells = Vec::new();
+    for row in overlay.layout.stats.iter().filter(|row| row.enabled) {
+        let value = match row.stat {
+            Stat::Resolution => match (overlay.width, overlay.height) {
+                (Some(w), Some(h)) => format!("{w}×{h}"),
+                _ => "—".into(),
+            },
+            Stat::DeliveredFps => overlay
+                .fps
+                .filter(|fps| fps.is_finite())
+                .map(|fps| format!("{fps:.1}"))
+                .unwrap_or_else(|| "—".into()),
+            Stat::NominalFps => overlay
                 .nominal_rate
-                .map(|rate| format!(" | {rate} nominal FPS"))
-                .unwrap_or_else(|| " | nominal FPS unknown".into());
-            let fmt_suffix = format!("{fmt_suffix}{nominal}");
-            if overlay.detailed {
-                format!(
-                    "{width}x{height}{fmt_suffix}\n{} | {} {}\n{fps:.1} delivered FPS",
-                    overlay.filter_label,
-                    overlay.color_info.space_label(overlay.color_space, height),
-                    overlay.color_info.range_label(overlay.color_range)
-                )
-            } else {
-                format!("{width}x{height}{fmt_suffix} | {fps:.1} delivered FPS")
+                .map(|rate| format!("{rate} ({})", rate.key()))
+                .unwrap_or_else(|| "unknown".into()),
+            Stat::PixelFormat => overlay
+                .active_format
+                .clone()
+                .unwrap_or_else(|| "unknown".into()),
+            Stat::ScalingFilter => {
+                if overlay.filter_label.is_empty() {
+                    overlay.filter.to_string()
+                } else {
+                    overlay.filter_label.clone()
+                }
             }
-        }),
-        _ => Some("Waiting For Video...".to_string()),
+            Stat::ColorSpace => overlay.color_info.space_label(overlay.color_space, height),
+            Stat::ColorRange => overlay.color_info.range_label(overlay.color_range),
+        };
+        let label = match row.stat {
+            Stat::Resolution => "Video",
+            Stat::DeliveredFps => "FPS",
+            Stat::NominalFps => "Target",
+            Stat::PixelFormat => "Format",
+            Stat::ScalingFilter => "Filter",
+            Stat::ColorSpace => "Color",
+            Stat::ColorRange => "Range",
+        };
+        cells.push(format!("{label}  {value}"));
+    }
+    if cells.is_empty() {
+        return None;
+    }
+    // Two values per line: a compact primary pair, followed by secondary data.
+    Some(
+        cells
+            .chunks(2)
+            .map(|row| row.join("  ·  "))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vice_header_art_reaches_panel_edges_while_title_stays_padded() {
+        let ctx = egui::Context::default();
+        let mut panel = egui::Rect::NOTHING;
+        let mut content = egui::Rect::NOTHING;
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            configure_style(ctx, Theme::Vice);
+            let p = Palette::current(ctx);
+            egui::CentralPanel::default().show(ctx, |ui| {
+                panel = Frame::new()
+                    .fill(p.menu_bg)
+                    .stroke(Stroke::new(1.0_f32, p.menu_border))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(Margin::same(18))
+                    .show(ui, |ui| {
+                        ui.set_width(480.0);
+                        content = ui.available_rect_before_wrap();
+                        edition_header(ui, Theme::Vice);
+                    })
+                    .response
+                    .rect;
+            });
+        });
+        let title = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "TackleCast VI" => {
+                    Some(text.pos)
+                }
+                _ => None,
+            })
+            .expect("header title");
+        // Frame reserves both its stroke and padding before laying out content.
+        assert_eq!(content.left() - panel.left(), 19.0);
+        assert_eq!(content.top() - panel.top(), 19.0);
+        assert_eq!(title, content.left_top() + egui::vec2(14.0, 10.0));
+        let texture = ctx
+            .data(|data| data.get_temp::<egui::TextureHandle>(egui::Id::new("vice_header_texture")))
+            .unwrap();
+        // Artwork must meet the border's inner edge, not just approach the
+        // outer frame within a tolerance broad enough to hide a one-point seam.
+        let intended = egui::Rect::from_min_max(
+            panel.left_top() + egui::vec2(1.0, 1.0),
+            egui::pos2(panel.right() - 1.0, content.top() + 70.0),
+        );
+        let (art, clip) = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect)
+                    if rect
+                        .brush
+                        .as_ref()
+                        .is_some_and(|brush| brush.fill_texture_id == texture.id()) =>
+                {
+                    Some((rect, shape.clip_rect))
+                }
+                _ => None,
+            })
+            .expect("header image paint shape");
+        assert_eq!(art.rect, intended, "art must reach the border's inner edge");
+        assert_eq!(
+            art.corner_radius,
+            CornerRadius {
+                nw: 11,
+                ne: 11,
+                sw: 0,
+                se: 0
+            }
+        );
+        assert!(
+            clip.contains_rect(intended),
+            "clip {clip:?} cuts off intended art {intended:?}"
+        );
+        let jobs = ctx.tessellate(output.shapes, 1.0);
+        let (art, clip) = jobs
+            .iter()
+            .find_map(|job| match &job.primitive {
+                egui::epaint::Primitive::Mesh(mesh) if mesh.texture_id == texture.id() => {
+                    Some((mesh.calc_bounds(), job.clip_rect))
+                }
+                _ => None,
+            })
+            .expect("header image mesh");
+        assert!(
+            art.contains_rect(intended),
+            "mesh {art:?} misses intended art {intended:?}"
+        );
+        assert!(
+            clip.contains_rect(intended),
+            "mesh clip {clip:?} cuts off intended art {intended:?}"
+        );
+    }
+
+    #[test]
+    fn editor_controls_have_glyphs_in_bundled_fonts() {
+        let ctx = egui::Context::default();
+        let mut layout = crate::overlay::OverlayLayout::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| overlay_editor(ui, &mut layout));
+        });
+        for clipped in output.shapes {
+            if let egui::Shape::Text(text) = clipped.shape {
+                for section in &text.galley.job.sections {
+                    let label = &text.galley.job.text[section.byte_range.clone()];
+                    assert!(
+                        ctx.fonts(|fonts| fonts.has_glyphs(&section.format.font_id, label)),
+                        "editor label is not renderable with bundled fonts: {label:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn sample() -> OverlayInfo {
+        OverlayInfo {
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(59.8),
+            filter: ScaleFilter::Bilinear,
+            filter_label: "Bilinear (RTX VSR unavailable)".into(),
+            color_space: ColorSpace::Auto,
+            color_range: ColorRange::Auto,
+            active_format: Some("NV12".into()),
+            nominal_rate: Some("60000/1001".parse().unwrap()),
+            color_info: ColorInfo::default(),
+            show_overlay: true,
+            layout: crate::overlay::OverlayLayout::default(),
+            status_message: None,
+            status_is_alert: false,
+        }
+    }
+    #[test]
+    fn overlay_choices_control_order_exact_rate_and_real_fallback_label() {
+        let mut overlay = sample();
+        overlay.layout.stats.reverse();
+        let text = overlay_text(&overlay).unwrap();
+        assert!(text.starts_with("Format  NV12"));
+        assert!(text.contains("60000/1001"));
+        assert!(text.contains("59.8"));
+        for row in &mut overlay.layout.stats {
+            row.enabled = row.stat == crate::overlay::Stat::ScalingFilter;
+        }
+        assert_eq!(
+            overlay_text(&overlay).unwrap(),
+            "Filter  Bilinear (RTX VSR unavailable)"
+        );
+        for row in &mut overlay.layout.stats {
+            row.enabled = false;
+        }
+        assert_eq!(overlay_text(&overlay), None);
+    }
+
+    #[test]
+    fn preview_pages_select_expected_menu_without_changing_settings() {
+        for (page, tab) in [
+            (PreviewPage::None, None),
+            (PreviewPage::Video, Some(MenuTab::Video)),
+            (PreviewPage::Picture, Some(MenuTab::Picture)),
+            (PreviewPage::Audio, Some(MenuTab::Audio)),
+            (PreviewPage::Display, Some(MenuTab::Display)),
+            (PreviewPage::Overlay, Some(MenuTab::Display)),
+        ] {
+            assert_eq!(page.menu_tab(), tab);
+        }
+    }
+
+    #[test]
+    fn overlay_preview_opens_editor_and_scrolls_all_rows_into_view() {
+        let ctx = egui::Context::default();
+        let mut settings = Settings::default();
+        let applied = settings.clone();
+        let overlay = sample();
+        let frame = UiFrame {
+            overlay: &overlay,
+            settings: &applied,
+            video_devices: &[],
+            audio_inputs: &[],
+            audio_outputs: &[],
+            is_fullscreen: false,
+            audio_status: "Not running",
+        };
+        let mut tab = MenuTab::Display;
+        ctx.data_mut(|data| data.insert_temp(egui::Id::new("test_overlay_focus"), true));
+        let mut visible = Vec::new();
+        for _ in 0..12 {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 720.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    configure_style(ctx, settings.theme);
+                    draw_menu(
+                        ctx,
+                        &mut settings,
+                        &mut tab,
+                        &frame,
+                        &mut UiOutput::default(),
+                    );
+                },
+            );
+            visible = output
+                .shapes
+                .into_iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::Text(text) = shape.shape {
+                        let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                        if shape.clip_rect.contains_rect(rect) {
+                            return Some(text.galley.job.text.clone());
+                        }
+                    }
+                    None
+                })
+                .collect();
+        }
+        for stat in &crate::overlay::OverlayLayout::default().stats {
+            assert!(
+                visible.iter().any(|text| text == stat.stat.label()),
+                "missing {}: {visible:?}",
+                stat.stat.label()
+            );
+        }
+        assert!(!ctx
+            .data(|data| data.get_temp::<bool>(egui::Id::new("test_overlay_focus")))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn display_menu_exposes_theme_and_collapsible_editor_in_headless_frame() {
+        let ctx = egui::Context::default();
+        let mut settings = Settings::default();
+        let overlay = sample();
+        let frame = UiFrame {
+            overlay: &overlay,
+            settings: &Settings::default(),
+            video_devices: &[],
+            audio_inputs: &[],
+            audio_outputs: &[],
+            is_fullscreen: false,
+            audio_status: "Not running",
+        };
+        let mut tab = MenuTab::Display;
+        let mut texts = String::new();
+        for _ in 0..3 {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(640.0, 480.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    configure_style(ctx, settings.theme);
+                    draw_menu(
+                        ctx,
+                        &mut settings,
+                        &mut tab,
+                        &frame,
+                        &mut UiOutput::default(),
+                    );
+                },
+            );
+            texts.clear();
+            for shape in output.shapes {
+                if let egui::Shape::Text(text) = shape.shape {
+                    texts.push_str(&text.galley.job.text);
+                    texts.push('\n');
+                }
+            }
+        }
+        assert!(texts.contains("TackleCast VI"), "{texts}");
+        assert!(texts.contains("Theme"), "{texts}");
+        assert!(texts.contains("Customize statistics"), "{texts}");
+    }
+
+    #[test]
+    fn pill_respects_all_corners_and_small_screen_bounds() {
+        use crate::overlay::Corner;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 360.0));
+        for corner in [
+            Corner::TopLeft,
+            Corner::TopRight,
+            Corner::BottomLeft,
+            Corner::BottomRight,
+        ] {
+            let ctx = egui::Context::default();
+            let mut overlay = sample();
+            overlay.layout.corner = corner;
+            for row in &mut overlay.layout.stats {
+                row.enabled = true;
+            }
+            for _ in 0..3 {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ctx| draw_overlay(ctx, &overlay),
+                );
+            }
+            let rect = ctx
+                .memory(|memory| memory.area_rect(egui::Id::new("fps_overlay")))
+                .unwrap();
+            assert!(screen.contains_rect(rect), "{corner:?}: {rect:?}");
+            match corner {
+                Corner::TopLeft => assert!(rect.left() < 20.0 && rect.top() < 20.0),
+                Corner::TopRight => assert!(rect.right() > 300.0 && rect.top() < 20.0),
+                Corner::BottomLeft => assert!(rect.left() < 20.0 && rect.bottom() > 340.0),
+                Corner::BottomRight => assert!(rect.right() > 300.0 && rect.bottom() > 340.0),
+            }
+        }
+    }
+
+    fn editor_frame(
+        ctx: &egui::Context,
+        layout: &mut crate::overlay::OverlayLayout,
+        events: Vec<egui::Event>,
+    ) -> Vec<(String, egui::Pos2)> {
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(420.0, 500.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                configure_style(ctx, Theme::Vice);
+                egui::CentralPanel::default().show(ctx, |ui| overlay_editor(ui, layout));
+            },
+        );
+        output
+            .shapes
+            .into_iter()
+            .filter_map(|shape| match shape.shape {
+                egui::Shape::Text(text) => Some((
+                    text.galley.job.text.clone(),
+                    text.pos + text.galley.size() * 0.5,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn editor_checkbox_arrows_and_whole_row_drag_preserve_choices() {
+        use crate::overlay::{OverlayLayout, Stat};
+        let ctx = egui::Context::default();
+        let mut layout = OverlayLayout::default();
+        let mut texts = editor_frame(&ctx, &mut layout, vec![]);
+        let point = texts
+            .iter()
+            .find(|(text, _)| text == "Resolution")
+            .unwrap()
+            .1;
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        editor_frame(
+            &ctx,
+            &mut layout,
+            vec![egui::Event::PointerMoved(point), button(point, true)],
+        );
+        texts = editor_frame(&ctx, &mut layout, vec![button(point, false)]);
+        assert!(
+            !layout.stats[0].enabled,
+            "checkbox click must not start a row drag"
+        );
+        let down = texts.iter().find(|(text, _)| text == "Down").unwrap().1;
+        editor_frame(
+            &ctx,
+            &mut layout,
+            vec![egui::Event::PointerMoved(down), button(down, true)],
+        );
+        editor_frame(&ctx, &mut layout, vec![button(down, false)]);
+        assert_eq!(layout.stats[1].stat, Stat::Resolution);
+        assert!(!layout.stats[1].enabled);
+        texts = editor_frame(&ctx, &mut layout, vec![]);
+        let handles: Vec<_> = texts
+            .iter()
+            .filter(|(text, _)| text == "::")
+            .map(|(_, pos)| *pos)
+            .collect();
+        assert_eq!(handles.len(), 7);
+        let (from, to) = (handles[0], handles[6]);
+        editor_frame(
+            &ctx,
+            &mut layout,
+            vec![egui::Event::PointerMoved(from), button(from, true)],
+        );
+        editor_frame(&ctx, &mut layout, vec![egui::Event::PointerMoved(to)]);
+        editor_frame(&ctx, &mut layout, vec![]);
+        editor_frame(&ctx, &mut layout, vec![button(to, false)]);
+        assert_eq!(layout.stats[6].stat, Stat::DeliveredFps);
+        assert!(layout.stats[6].enabled);
+        assert!(
+            !layout
+                .stats
+                .iter()
+                .find(|row| row.stat == Stat::Resolution)
+                .unwrap()
+                .enabled
+        );
+    }
+
+    #[test]
+    fn menus_keep_stable_bounds_across_tabs_themes_and_small_windows() {
+        for size in [
+            egui::vec2(320.0, 360.0),
+            egui::vec2(640.0, 480.0),
+            egui::vec2(1280.0, 720.0),
+        ] {
+            for theme in [Theme::Vice, Theme::Classic] {
+                let ctx = egui::Context::default();
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                let mut settings = Settings {
+                    theme,
+                    ..Settings::default()
+                };
+                let overlay = sample();
+                let applied = settings.clone();
+                let frame = UiFrame {
+                    overlay: &overlay,
+                    settings: &applied,
+                    video_devices: &[],
+                    audio_inputs: &[],
+                    audio_outputs: &[],
+                    is_fullscreen: false,
+                    audio_status: "Not running",
+                };
+                let mut previous_size = None;
+                for mut tab in [
+                    MenuTab::Video,
+                    MenuTab::Picture,
+                    MenuTab::Audio,
+                    MenuTab::Display,
+                ] {
+                    for _ in 0..3 {
+                        let _ = ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(screen),
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                configure_style(ctx, theme);
+                                draw_menu(
+                                    ctx,
+                                    &mut settings,
+                                    &mut tab,
+                                    &frame,
+                                    &mut UiOutput::default(),
+                                );
+                            },
+                        );
+                    }
+                    let rect = ctx
+                        .memory(|memory| memory.area_rect(egui::Id::new("settings_menu")))
+                        .unwrap();
+                    assert!(
+                        screen.contains_rect(rect),
+                        "{theme:?} {tab:?} {size:?}: {rect:?}"
+                    );
+                    if let Some(previous) = previous_size {
+                        assert_eq!(rect.size(), previous, "{theme:?} {tab:?}");
+                    }
+                    previous_size = Some(rect.size());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn embedded_theme_icons_decode_to_winit_icons() {
+        assert!(theme_icon(Theme::Vice).is_ok());
+        assert!(theme_icon(Theme::Classic).is_ok());
+    }
+
+    #[test]
+    fn recovery_status_renders_when_master_and_all_statistics_are_off() {
+        let ctx = egui::Context::default();
+        let mut overlay = sample();
+        overlay.show_overlay = false;
+        overlay
+            .layout
+            .stats
+            .iter_mut()
+            .for_each(|row| row.enabled = false);
+        overlay.status_message = Some("Reconnecting capture…".into());
+        overlay.status_is_alert = true;
+        let mut text = String::new();
+        for _ in 0..3 {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(320.0, 360.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| draw_overlay(ctx, &overlay),
+            );
+            text = output
+                .shapes
+                .into_iter()
+                .filter_map(|shape| match shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                    _ => None,
+                })
+                .collect();
+        }
+        assert!(text.contains("Reconnecting capture…"));
+        assert!(!text.contains("59.8"));
+        assert!(ctx
+            .memory(|memory| memory.area_rect(egui::Id::new("capture_status")))
+            .is_some());
+        assert!(ctx
+            .memory(|memory| memory.area_rect(egui::Id::new("fps_overlay")))
+            .is_none());
+    }
+
+    #[test]
+    fn stats_never_replace_status_or_show_stale_fps_during_failure() {
+        let mut overlay = sample();
+        overlay.status_message = Some("Reconnecting capture…".into());
+        overlay.status_is_alert = true;
+        assert_eq!(overlay_text(&overlay), None);
+        overlay.show_overlay = false;
+        assert_eq!(overlay_text(&overlay), None);
+        assert_eq!(
+            overlay.status_message.as_deref(),
+            Some("Reconnecting capture…")
+        );
     }
 }

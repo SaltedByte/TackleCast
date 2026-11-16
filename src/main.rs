@@ -15,9 +15,11 @@ mod gpu_decode;
 #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
 mod gpu_monitor;
 mod logger;
+mod overlay;
 mod recovery;
 mod render;
 mod settings;
+mod theme;
 mod triple_buffer;
 mod ui;
 #[cfg(target_os = "windows")]
@@ -46,7 +48,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowAttributes};
 
-const WINDOW_TITLE: &str = "TackleCast";
+const WINDOW_TITLE: &str = "TackleCast VI";
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 720;
 #[cfg(target_os = "windows")]
@@ -85,11 +87,24 @@ enum TestPatternMode {
 struct CliArgs {
     test_mode: bool,
     test_pattern: TestPatternMode,
+    preview_page: Option<ui::PreviewPage>,
+    preview_theme: Option<settings::Theme>,
 }
 
 impl CliArgs {
     fn parse() -> Self {
-        let args: Vec<String> = std::env::args().skip(1).collect();
+        Self::parse_from(std::env::args().skip(1))
+    }
+
+    fn preview_active(&self) -> bool {
+        self.preview_page.is_some() || self.preview_theme.is_some()
+    }
+
+    fn parse_from(args: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        let args: Vec<String> = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_ascii_lowercase())
+            .collect();
         let has_flag = |name: &str| args.iter().any(|arg| arg.eq_ignore_ascii_case(name));
 
         let test_pattern = if has_flag("--test-nv12") {
@@ -106,9 +121,35 @@ impl CliArgs {
             || has_flag("--test-yuvj422p")
             || has_flag("--test-mjpeg");
 
+        let mut preview_page = None;
+        let mut preview_theme = None;
+        if test_mode {
+            for arg in &args {
+                if let Some(value) = arg.strip_prefix("--test-ui=") {
+                    preview_page = match value {
+                        "video" => Some(ui::PreviewPage::Video),
+                        "picture" => Some(ui::PreviewPage::Picture),
+                        "audio" => Some(ui::PreviewPage::Audio),
+                        "display" => Some(ui::PreviewPage::Display),
+                        "overlay" => Some(ui::PreviewPage::Overlay),
+                        "none" => Some(ui::PreviewPage::None),
+                        _ => None,
+                    };
+                }
+                if let Some(value) = arg.strip_prefix("--test-theme=") {
+                    preview_theme = match value {
+                        "classic" => Some(settings::Theme::Classic),
+                        "vice" => Some(settings::Theme::Vice),
+                        _ => None,
+                    };
+                }
+            }
+        }
         Self {
             test_mode,
             test_pattern,
+            preview_page,
+            preview_theme,
         }
     }
 }
@@ -139,12 +180,24 @@ fn main() {
     #[cfg(target_os = "windows")]
     let _ = unsafe { SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(APP_ID)) };
 
+    let cli = CliArgs::parse();
     let mut settings = Settings::load();
+    if let Some(theme) = cli.preview_theme {
+        settings.theme = theme;
+    }
     info!(
         "loaded settings from {}",
         settings::settings_path().display()
     );
-    let video_devices = devices::enumerate_video_devices();
+    let video_devices = if cli.preview_active() {
+        Vec::new()
+    } else {
+        devices::enumerate_video_devices()
+    };
+    if cli.preview_active() {
+        // Do not query saved hardware capabilities while drawing the Video page.
+        settings.video_device.clear();
+    }
     settings.video_device = devices::restore_video_device(&settings.video_device, &video_devices);
     let mode_query = std::env::args()
         .find(|arg| arg == "--list-capture-modes" || arg.starts_with("--list-capture-modes="));
@@ -181,8 +234,16 @@ fn main() {
     if !settings.video_device.is_empty() && !std::env::args().any(|arg| arg.starts_with("--test")) {
         capabilities::prime_device_capabilities(&settings.video_device);
     }
-    let audio_inputs = devices::enumerate_audio_inputs();
-    let audio_outputs = devices::enumerate_audio_outputs();
+    let audio_inputs = if cli.preview_active() {
+        Vec::new()
+    } else {
+        devices::enumerate_audio_inputs()
+    };
+    let audio_outputs = if cli.preview_active() {
+        Vec::new()
+    } else {
+        devices::enumerate_audio_outputs()
+    };
 
     info!("=== Audio & Video Diagnostics at Startup ===");
     info!("detected video capture devices ({}):", video_devices.len());
@@ -211,7 +272,6 @@ fn main() {
         .build()
         .expect("failed to create event loop");
     let event_proxy = event_loop.create_proxy();
-    let cli = CliArgs::parse();
     let mut app = App::new(
         settings,
         cli.test_mode,
@@ -221,11 +281,15 @@ fn main() {
         audio_outputs,
         event_proxy,
     );
+    app.preview_mode = cli.preview_active();
+    app.preview_page = cli.preview_page;
     event_loop.run_app(&mut app).expect("event loop error");
 }
 
 struct App {
     settings: Settings,
+    preview_mode: bool,
+    preview_page: Option<ui::PreviewPage>,
     test_mode: bool,
     test_pattern: TestPatternMode,
     video_devices: Vec<String>,
@@ -268,6 +332,8 @@ impl App {
     ) -> Self {
         Self {
             settings,
+            preview_mode: false,
+            preview_page: None,
             test_mode,
             test_pattern,
             video_devices,
@@ -440,7 +506,10 @@ impl ApplicationHandler<AppEvent> for App {
             }
         };
 
-        let ui = UiState::new(&window, renderer.max_texture_side());
+        let mut ui = UiState::new(&window, renderer.max_texture_side());
+        if let Some(page) = self.preview_page.take() {
+            ui.open_preview(&self.settings, page);
+        }
 
         self.renderer = Some(renderer);
         self.ui = Some(ui);
@@ -512,9 +581,7 @@ impl ApplicationHandler<AppEvent> for App {
                     capture.stop();
                 }
                 self.audio.stop();
-                if let Err(error) = self.settings.save() {
-                    error!("failed to save settings on exit: {error}");
-                }
+                self.save_settings();
                 event_loop.exit();
             }
             WindowEvent::CursorMoved { .. } => {
@@ -605,9 +672,7 @@ impl ApplicationHandler<AppEvent> for App {
                             capture.stop();
                         }
                         self.audio.stop();
-                        if let Err(error) = self.settings.save() {
-                            error!("failed to save settings on exit: {error}");
-                        }
+                        self.save_settings();
                         event_loop.exit();
                     }
                 }
@@ -694,9 +759,7 @@ impl ApplicationHandler<AppEvent> for App {
                 );
                 self.settings
                     .apply_negotiated(negotiated.width, negotiated.height, negotiated.fps);
-                if let Err(error) = self.settings.save() {
-                    error!("failed to save negotiated settings: {error}");
-                }
+                self.save_settings();
             }
         }
 
@@ -823,6 +886,14 @@ impl ApplicationHandler<AppEvent> for App {
 }
 
 impl App {
+    fn save_settings(&self) {
+        if !self.preview_mode {
+            if let Err(error) = self.settings.save() {
+                error!("failed to save settings: {error}");
+            }
+        }
+    }
+
     fn queue_capture_restart(&mut self, restart_audio: Option<AudioRestart>) {
         self.capture_restart_pending = true;
         // A user-selected route takes priority over a queued recovery of the old route.
@@ -844,9 +915,7 @@ impl App {
         let old_settings = self.settings.clone();
         self.settings = new_settings;
 
-        if let Err(error) = self.settings.save() {
-            error!("failed to save settings: {error}");
-        }
+        self.save_settings();
 
         let video_changed = old_settings.video_device != self.settings.video_device
             || old_settings.video_format != self.settings.video_format
@@ -939,7 +1008,11 @@ impl App {
                 .latest_stats
                 .as_ref()
                 .and_then(|stats| stats.nominal_rate),
-            detailed: self.settings.detailed_overlay,
+            layout: self
+                .settings
+                .overlay
+                .clone()
+                .unwrap_or_else(|| overlay::OverlayLayout::legacy(self.settings.detailed_overlay)),
             status_message,
             status_is_alert: self.latest_error.is_some() || self.latest_stats.is_none(),
         }
@@ -1082,5 +1155,68 @@ impl App {
             self.settings.volume,
             self.settings.audio_muted,
         );
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn preview_defaults_invalid_values_and_duplicate_flags_are_bounded() {
+        let plain = CliArgs::parse_from(["--test"]);
+        assert!(plain.test_mode);
+        assert!(!plain.preview_active());
+        assert_eq!(plain.preview_page, None);
+        assert_eq!(plain.preview_theme, None);
+        let invalid = CliArgs::parse_from(["--test", "--test-ui=bogus", "--test-theme=bogus"]);
+        assert!(!invalid.preview_active());
+        let selected = CliArgs::parse_from([
+            "--TEST-NV12",
+            "--test-ui=video",
+            "--TEST-UI=OVERLAY",
+            "--TEST-THEME=VICE",
+        ]);
+        assert_eq!(selected.preview_page, Some(ui::PreviewPage::Overlay));
+        assert_eq!(selected.preview_theme, Some(settings::Theme::Vice));
+        assert!(matches!(selected.test_pattern, TestPatternMode::Nv12));
+        let theme_only = CliArgs::parse_from(["--test-mjpeg", "--test-theme=classic"]);
+        assert!(theme_only.preview_active());
+        assert_eq!(theme_only.preview_page, None);
+        assert!(matches!(theme_only.test_pattern, TestPatternMode::Yuvj422p));
+        let not_a_test_flag = CliArgs::parse_from(["--test-ui=none"]);
+        assert!(!not_a_test_flag.test_mode);
+        assert!(!not_a_test_flag.preview_active());
+    }
+
+    #[test]
+    fn preview_selection_requires_explicit_test_mode() {
+        for flag in [
+            "--test",
+            "--test-alt",
+            "--test-nv12",
+            "--test-yuvj422p",
+            "--test-mjpeg",
+        ] {
+            for (name, page) in [
+                ("video", ui::PreviewPage::Video),
+                ("picture", ui::PreviewPage::Picture),
+                ("audio", ui::PreviewPage::Audio),
+                ("display", ui::PreviewPage::Display),
+                ("overlay", ui::PreviewPage::Overlay),
+                ("none", ui::PreviewPage::None),
+            ] {
+                let selection = format!("--test-ui={name}");
+                let cli = CliArgs::parse_from([flag, selection.as_str(), "--test-theme=classic"]);
+                assert_eq!(cli.preview_page, Some(page));
+                assert_eq!(cli.preview_theme, Some(settings::Theme::Classic));
+                assert!(cli.preview_active());
+            }
+        }
+        let cli = CliArgs::parse_from(["--test-ui=overlay", "--test-theme=vice"]);
+        assert!(!cli.test_mode);
+        assert_eq!(cli.preview_page, None);
+        assert_eq!(cli.preview_theme, None);
+        assert!(!cli.preview_active());
     }
 }
