@@ -41,6 +41,10 @@ pub struct Settings {
     pub audio_input: i32,
     #[serde(default = "default_audio_index")]
     pub audio_output: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_input_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_output_name: Option<String>,
     #[serde(default = "default_resolution")]
     pub resolution: String,
     #[serde(default = "default_fps_mode")]
@@ -262,6 +266,8 @@ impl Default for Settings {
             color_range: default_color_range(),
             audio_input: default_audio_index(),
             audio_output: default_audio_index(),
+            audio_input_name: None,
+            audio_output_name: None,
             resolution: default_resolution(),
             fps_mode: default_fps_mode(),
             custom_fps: default_custom_fps(),

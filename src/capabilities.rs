@@ -25,14 +25,54 @@ pub struct CaptureMode {
 pub struct DeviceCapabilities {
     pub modes: Vec<CaptureMode>,
     pub message: Option<String>,
+    pub usb_warning: Option<String>,
 }
 
-type Cache = Mutex<HashMap<String, Arc<DeviceCapabilities>>>;
+#[derive(Default)]
+struct CapabilityCache {
+    generation: u64,
+    refreshing: bool,
+    entries: HashMap<String, Arc<DeviceCapabilities>>,
+}
+impl CapabilityCache {
+    fn publish(&mut self, generation: u64, device: String, caps: DeviceCapabilities) {
+        if generation == self.generation {
+            self.entries.insert(device, Arc::new(caps));
+        }
+    }
+    fn invalidate(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.entries.clear();
+        self.generation
+    }
+}
+type Cache = Mutex<CapabilityCache>;
 static CACHE: OnceLock<Cache> = OnceLock::new();
 
+#[cfg(test)]
+pub(crate) fn cache_test_device(device: &str) {
+    cache_test_capabilities(device, test_pattern_capabilities());
+}
+
+#[cfg(test)]
+pub(crate) fn cache_test_capabilities(device: &str, caps: DeviceCapabilities) {
+    CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entries
+        .insert(device.into(), Arc::new(caps));
+}
+
 pub fn query_device_capabilities(device: &str) -> DeviceCapabilities {
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    let result = platform::query(device, current_generation());
+    #[cfg(target_os = "linux")]
     let result = platform::query(device);
+    #[cfg(target_os = "windows")]
+    let usb_warning = crate::usb_link::warning(device);
+    #[cfg(not(target_os = "windows"))]
+    let usb_warning = None;
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     let result: Result<Vec<CaptureMode>, String> =
         Err("Mode discovery is unavailable on this platform".into());
@@ -49,11 +89,16 @@ pub fn query_device_capabilities(device: &str) -> DeviceCapabilities {
             });
             modes.dedup();
             let message = modes.is_empty().then(|| "The device did not report supported capture modes. Selections cannot be verified.".to_string());
-            DeviceCapabilities { modes, message }
+            DeviceCapabilities {
+                modes,
+                message,
+                usb_warning,
+            }
         }
         Err(message) => DeviceCapabilities {
             modes: Vec::new(),
             message: Some(message),
+            usb_warning,
         },
     }
 }
@@ -61,12 +106,36 @@ pub fn query_device_capabilities(device: &str) -> DeviceCapabilities {
 /// Prime the selected card before capture opens it. Other cards are queried on
 /// background threads so a slow driver cannot stall the menu or active video.
 pub fn prime_device_capabilities(device: &str) {
-    let caps = Arc::new(query_device_capabilities(device));
+    let generation = CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .generation;
+    prime_generation(device, generation);
+}
+
+fn prime_generation(device: &str, generation: u64) {
+    if !is_current_generation(generation) {
+        return;
+    }
+    let caps = query_device_capabilities(device);
+    CACHE.get_or_init(Default::default).lock().unwrap().publish(
+        generation,
+        device.to_string(),
+        caps,
+    );
+}
+
+fn current_generation() -> u64 {
     CACHE
         .get_or_init(Default::default)
         .lock()
         .unwrap()
-        .insert(device.to_string(), caps);
+        .generation
+}
+
+pub(crate) fn is_current_generation(generation: u64) -> bool {
+    current_generation() == generation
 }
 
 pub fn get_device_capabilities(device: &str) -> Arc<DeviceCapabilities> {
@@ -75,25 +144,39 @@ pub fn get_device_capabilities(device: &str) -> Arc<DeviceCapabilities> {
     }
     let cache = CACHE.get_or_init(Default::default);
     let mut guard = cache.lock().unwrap();
-    if let Some(caps) = guard.get(device) {
+    if let Some(caps) = guard.entries.get(device) {
         return caps.clone();
     }
     let pending = Arc::new(DeviceCapabilities {
         modes: vec![],
         message: Some("Reading device capture modes…".into()),
+        usb_warning: None,
     });
-    guard.insert(device.to_string(), pending.clone());
+    if guard.refreshing {
+        return pending;
+    }
+    let generation = guard.generation;
+    guard.entries.insert(device.to_string(), pending.clone());
     let device = device.to_string();
-    std::thread::spawn(move || prime_device_capabilities(&device));
+    std::thread::spawn(move || prime_generation(&device, generation));
     pending
 }
 
-pub fn refresh(device: &str) {
-    CACHE
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .remove(device);
+pub fn begin_device_refresh() -> u64 {
+    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+    cache.refreshing = true;
+    cache.invalidate()
+}
+
+pub fn finish_device_refresh(generation: u64, result: Option<(String, DeviceCapabilities)>) {
+    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+    if generation != cache.generation {
+        return;
+    }
+    cache.refreshing = false;
+    if let Some((device, caps)) = result {
+        cache.publish(generation, device, caps);
+    }
 }
 
 pub fn resolution_dimensions(resolution: &str) -> (u32, u32) {
@@ -221,12 +304,37 @@ fn test_pattern_capabilities() -> DeviceCapabilities {
     DeviceCapabilities {
         modes,
         message: None,
+        usb_warning: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn late_pre_reconnect_probe_cannot_restore_the_old_capability_list() {
+        let mut cache = CapabilityCache::default();
+        let stale_generation = cache.generation;
+        let old = DeviceCapabilities {
+            modes: vec![mode(VideoFormat::Mjpeg, 60)],
+            usb_warning: Some("USB 2".into()),
+            ..Default::default()
+        };
+        cache.publish(stale_generation, "card".into(), old.clone());
+        let fresh_generation = cache.invalidate();
+        let fresh = DeviceCapabilities {
+            modes: vec![CaptureMode {
+                width: 3840,
+                height: 2160,
+                ..mode(VideoFormat::Mjpeg, 60)
+            }],
+            ..Default::default()
+        };
+        cache.publish(fresh_generation, "card".into(), fresh);
+        cache.publish(stale_generation, "card".into(), old);
+        assert_eq!(cache.entries["card"].modes[0].width, 3840);
+        assert!(cache.entries["card"].usb_warning.is_none());
+    }
     fn mode(format: VideoFormat, fps: u32) -> CaptureMode {
         CaptureMode {
             format,
@@ -239,7 +347,7 @@ mod tests {
     fn no_rates_are_invented_between_disjoint_modes() {
         let caps = DeviceCapabilities {
             modes: vec![mode(VideoFormat::Nv12, 30), mode(VideoFormat::Mjpeg, 120)],
-            message: None,
+            ..Default::default()
         };
         assert_eq!(
             supported_rates(&caps, "1080p", VideoFormat::Auto),
@@ -260,7 +368,7 @@ mod tests {
         exact.rate = FrameRate::new(60_000, 1001);
         let caps = DeviceCapabilities {
             modes: vec![exact],
-            message: None,
+            ..Default::default()
         };
         assert_eq!(
             supported_video_formats(&caps, "1080p", 30.into()),
@@ -283,7 +391,7 @@ mod tests {
                 height: 2160,
                 ..mode(VideoFormat::Mjpeg, 60)
             }],
-            message: None,
+            ..Default::default()
         };
         let mut draft = Settings {
             resolution: "1080p".into(),

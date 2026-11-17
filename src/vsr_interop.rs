@@ -94,12 +94,11 @@ impl VsrContext {
     /// or the GPU/driver does not support NVIDIA RTX VSR.
     pub fn try_new(device: &wgpu::Device) -> Option<Self> {
         let (d3d12_device, d3d12_queue) = unsafe {
-            device.as_hal::<Dx12, _, _>(|hal_device| {
-                let hal_device = hal_device?;
-                Some((
+            device.as_hal::<Dx12>().map(|hal_device| {
+                (
                     hal_device.raw_device().clone(),
                     hal_device.raw_queue().clone(),
-                ))
+                )
             })?
         };
 
@@ -216,7 +215,10 @@ impl VsrContext {
 
         if needs_rebuild {
             // Wait for in-flight GPU commands on the previous shared textures before replacing them.
-            device.poll(wgpu::Maintain::Wait);
+            if let Err(error) = device.poll(wgpu::PollType::wait_indefinitely()) {
+                warn!("GPU wait before rebuilding VSR resources failed: {error}");
+                return None;
+            }
             self.resources = self.create_resources(
                 device,
                 rcas_bind_group_layout,

@@ -153,8 +153,7 @@ impl SharedGpuBuffers {
 
         // Access the raw DX12 device via wgpu HAL.
         let raw_resources = unsafe {
-            device.as_hal::<Dx12, _, _>(|hal_device| {
-                let hal_device = hal_device?;
+            device.as_hal::<Dx12>().and_then(|hal_device| {
                 let raw_device: &ID3D12Device = hal_device.raw_device();
 
                 let mut sets = Vec::with_capacity(NUM_BUFFER_SETS);

@@ -8,12 +8,28 @@ is implied by this document.
 
 - Vice is the default theme: deep aubergine surfaces, warm text, peach/pink
   accents, and an original coastal header confined to the settings menu.
+  The full-bleed header scales to the image's original aspect ratio so the entire
+  banner stays visible. Its height adapts to the menu width; settings scroll below.
 - Display → Theme previews Vice or Classic immediately. Escape or clicking the
   backdrop saves the draft, including the theme. Classic retains the original
   UI palette; the runtime window icon follows the selected theme.
-- Video, Picture, Audio, and Display remain the four tabs. Content scrolls inside
-  a fixed-size menu; picture sliders retain the undimmed live-image preview.
+- Video, Picture, Audio, and Display remain the four tabs. The settings list uses
+  roomier aligned label/control rows, bounded library controls and simple
+  section headings. Every page shares fixed columns; Picture sliders and numeric
+  fields also share their own columns. There are no per-setting subtitles.
+  Content scrolls inside a fixed-size opaque menu; picture sliders retain the undimmed
+  live-image preview. Apply & close or Escape saves the selection.
+- Volume and mute preview immediately while settings stay open. Audio controls
+  keep the image dimmed; only picture/video adjustments reveal the live image.
 - Theme and performance-pill changes do not require a capture restart.
+- Reinitialize devices replaces the separate capture/audio restart actions.
+  It refreshes device lists, pairing and capabilities, then reopens the selected
+  routes while preserving the settings window. Windows warns when it measures
+  a USB 2-or-slower connection that may restrict available capture modes.
+- Automatic capture selection pairs video friendly names with capture audio
+  inputs; it never uses generic name tokens to choose an unrelated camera or
+  microphone. Explicit selections are preserved. No unique match prompts manual
+  selection in Video and Audio. Playback output remains separate.
 
 ## Performance pill
 

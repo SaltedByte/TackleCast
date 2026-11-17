@@ -6,13 +6,12 @@ use wgpu::util::DeviceExt;
 #[test]
 #[ignore = "requires a working wgpu adapter; run explicitly on desktop test machines"]
 fn gpu_shader_color_and_picture_reference() {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter =
         pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
             .expect("A wgpu adapter is required for this explicit graphics test");
     let (device, queue) =
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
-            .unwrap();
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("color-reference-layout"),
         entries: &[
@@ -49,8 +48,8 @@ fn gpu_shader_color_and_picture_reference() {
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: None,
-        bind_group_layouts: &[&layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
     });
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: None,
@@ -74,7 +73,7 @@ fn gpu_shader_color_and_picture_reference() {
         primitive: Default::default(),
         depth_stencil: None,
         multisample: Default::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
     let samplers = VideoSamplers {
@@ -159,8 +158,12 @@ fn gpu_shader_color_and_picture_reference() {
         let mut encoder = device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                multiview_mask: None,
+
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    depth_slice: None,
+
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -204,7 +207,9 @@ fn gpu_shader_color_and_picture_reference() {
             .map_async(wgpu::MapMode::Read, move |result| {
                 tx.send(result).unwrap();
             });
-        device.poll(wgpu::Maintain::Wait);
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("GPU readback must complete");
         rx.recv().unwrap().unwrap();
         let data = readback.slice(..).get_mapped_range();
         for offset in [0, 4, 256, 260] {
@@ -220,13 +225,12 @@ fn gpu_shader_color_and_picture_reference() {
 #[test]
 #[ignore = "requires a working wgpu adapter; run explicitly on desktop test machines"]
 fn gpu_fsr_rcas_neutral_and_strong_reference() {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter =
         pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
             .expect("A wgpu adapter is required for this explicit graphics test");
     let (device, queue) =
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
-            .unwrap();
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
 
     let quad_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("test-quad-shader"),
@@ -266,8 +270,8 @@ fn gpu_fsr_rcas_neutral_and_strong_reference() {
 
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("test-rcas-pipeline-layout"),
-        bind_group_layouts: &[&rcas_bind_group_layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&rcas_bind_group_layout)],
+        immediate_size: 0,
     });
 
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -292,7 +296,7 @@ fn gpu_fsr_rcas_neutral_and_strong_reference() {
         primitive: Default::default(),
         depth_stencil: None,
         multisample: Default::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
 
@@ -394,8 +398,12 @@ fn gpu_fsr_rcas_neutral_and_strong_reference() {
     let mut encoder = device.create_command_encoder(&Default::default());
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            multiview_mask: None,
+
             label: Some("test-neutral-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                depth_slice: None,
+
                 view: &output_view,
                 resolve_target: None,
                 ops: wgpu::Operations {
@@ -438,7 +446,9 @@ fn gpu_fsr_rcas_neutral_and_strong_reference() {
     readback_buffer
         .slice(..)
         .map_async(wgpu::MapMode::Read, move |res| tx.send(res).unwrap());
-    device.poll(wgpu::Maintain::Wait);
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("GPU readback must complete");
     rx.recv().unwrap().unwrap();
     {
         let data = readback_buffer.slice(..).get_mapped_range();
@@ -464,8 +474,12 @@ fn gpu_fsr_rcas_neutral_and_strong_reference() {
     let mut encoder = device.create_command_encoder(&Default::default());
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            multiview_mask: None,
+
             label: Some("test-strong-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                depth_slice: None,
+
                 view: &output_view,
                 resolve_target: None,
                 ops: wgpu::Operations {
@@ -508,7 +522,9 @@ fn gpu_fsr_rcas_neutral_and_strong_reference() {
     readback_buffer
         .slice(..)
         .map_async(wgpu::MapMode::Read, move |res| tx.send(res).unwrap());
-    device.poll(wgpu::Maintain::Wait);
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("GPU readback must complete");
     rx.recv().unwrap().unwrap();
     {
         let data = readback_buffer.slice(..).get_mapped_range();
@@ -531,9 +547,9 @@ fn gpu_fsr_rcas_neutral_and_strong_reference() {
 #[test]
 #[ignore = "requires an NVIDIA RTX GPU with DX12/D3D11 VSR support"]
 fn gpu_rtx_vsr_interop_upscale_reference() {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::DX12,
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
@@ -542,8 +558,7 @@ fn gpu_rtx_vsr_interop_upscale_reference() {
     }))
     .expect("A DX12 adapter is required for this test");
     let (device, queue) =
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
-            .unwrap();
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
 
     let mut vsr = crate::vsr_interop::VsrContext::try_new(&device)
         .expect("NVIDIA RTX VSR should initialize on an RTX GPU");
@@ -608,8 +623,12 @@ fn gpu_rtx_vsr_interop_upscale_reference() {
     {
         let res = vsr.resources.as_ref().unwrap();
         let _pass = pass1.begin_render_pass(&wgpu::RenderPassDescriptor {
+            multiview_mask: None,
+
             label: Some("vsr-test-clear-input"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                depth_slice: None,
+
                 view: &res.input_view,
                 resolve_target: None,
                 ops: wgpu::Operations {
@@ -669,7 +688,9 @@ fn gpu_rtx_vsr_interop_upscale_reference() {
     readback
         .slice(..)
         .map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
-    device.poll(wgpu::Maintain::Wait);
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("GPU readback must complete");
     rx.recv().unwrap().unwrap();
     let data = readback.slice(..).get_mapped_range();
     // Center pixel of the 256x256 output should be bright green ([0, ~255, 0])

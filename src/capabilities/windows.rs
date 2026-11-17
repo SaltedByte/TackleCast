@@ -6,7 +6,8 @@ use std::mem::{size_of, ManuallyDrop};
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use windows::core::{Interface, GUID, HSTRING, VARIANT};
+#[cfg(target_os = "windows")]
+use windows::core::{Interface, GUID, HSTRING};
 use windows::Win32::Media::DirectShow::{
     IAMStreamConfig, IBaseFilter, ICreateDevEnum, PINDIR_OUTPUT, VIDEO_STREAM_CONFIG_CAPS,
 };
@@ -22,6 +23,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Diagnostics::Debug::{
     SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX,
 };
+use windows::Win32::System::Variant::VARIANT;
 
 struct ComApartment(bool);
 impl Drop for ComApartment {
@@ -57,7 +59,7 @@ pub fn moniker_id(moniker: &IMoniker) -> Option<String> {
 
 /// Vendor drivers execute inside the probe process. A hung or crashing driver
 /// must not take down the viewer, its audio, or an already active capture.
-pub fn query(device: &str) -> Result<Vec<CaptureMode>, String> {
+pub fn query(device: &str, generation: u64) -> Result<Vec<CaptureMode>, String> {
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut child = Command::new(executable)
         .arg("--probe-capture-modes")
@@ -80,6 +82,11 @@ pub fn query(device: &str) -> Result<Vec<CaptureMode>, String> {
     });
     let deadline = Instant::now() + Duration::from_secs(15);
     let status = loop {
+        if !super::is_current_generation(generation) {
+            let _ = child.kill();
+            let _ = child.wait();
+            break Err("Device mode query superseded by reinitialization".into());
+        }
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),

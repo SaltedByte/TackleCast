@@ -1,30 +1,9 @@
 use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{Device, Host, StreamConfig, SupportedStreamConfig};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::audio::common::ResolvedInput;
-use crate::devices::{AudioDevice, DIRECTSHOW_AUDIO_INDEX};
-
-const CAPTURE_KEYWORDS: &[&str] = &[
-    "capture",
-    "digital audio",
-    "hdmi",
-    "usb audio",
-    "shadowcast",
-    "cam link",
-    "camlink",
-    "elgato",
-    "avermedia",
-    "mirabox",
-    "video",
-    "game",
-    "ps4",
-    "playstation",
-    "interface",
-    "endpoint",
-];
-
-const IGNORED_KEYWORDS: &[&str] = &["pro", "the", "and", "audio", "device"];
+use crate::devices::{find_audio_input_for_video, AudioDevice, DIRECTSHOW_AUDIO_INDEX};
 
 pub fn preferred_audio_host() -> Host {
     if let Ok(host) = cpal::host_from_id(cpal::HostId::Wasapi) {
@@ -55,15 +34,8 @@ pub fn refresh_recovery_device(previous: &Device, input: bool) -> Result<Device,
         })
 }
 
-/// Resolves the audio input device for capture, with multi-stage fallback:
-/// 1. If DIRECTSHOW_AUDIO_INDEX is selected, use DirectShow audio from the active video device.
-/// 2. If explicit input_index is provided and valid, use that device.
-/// 3. If matching video device name finds a capture audio endpoint, use that.
-/// 4. If any audio input matches known capture keywords ("Digital Audio", "USB Audio", etc.), use that.
-/// 5. Fall back to host default input device.
-///
-/// DirectShow is opt-in: automatic selection must not replace the system fallback
-/// with an unverified audio pin on the video device.
+/// Preserve explicit inputs (including opt-in DirectShow); automatic input
+/// requires a unique name match. Never substitute a system microphone.
 pub fn resolve_input_device(
     host: &Host,
     input_index: i32,
@@ -91,10 +63,9 @@ pub fn resolve_input_device(
             );
             return Ok(ResolvedInput::Device(device));
         }
-        warn!(
-            "saved audio input index {} is no longer available; searching for capture device",
-            input_index
-        );
+        return Err(format!(
+            "Selected audio input #{input_index} is unavailable. Choose an input in Audio."
+        ));
     }
 
     // 2. Try auto-detect based on video device name
@@ -109,26 +80,7 @@ pub fn resolve_input_device(
         }
     }
 
-    // 3. Try finding any input matching generic capture keywords
-    for device_info in inputs {
-        let name_lower = device_info.name.to_ascii_lowercase();
-        if CAPTURE_KEYWORDS.iter().any(|&kw| name_lower.contains(kw)) {
-            if let Some(device) = resolve_device_by_index(host, device_info.index, Direction::Input)
-            {
-                info!(
-                    "matched generic capture card audio input {} ('{}')",
-                    device_info.index, device_info.name
-                );
-                return Ok(ResolvedInput::Device(device));
-            }
-        }
-    }
-
-    // 4. Fall back to default input
-    warn!("no capture-card audio device auto-detected; falling back to default system input");
-    host.default_input_device()
-        .map(ResolvedInput::Device)
-        .ok_or_else(|| "no default audio input device found on the system".to_string())
+    Err("No unique matching capture audio input. Choose an input in Audio.".into())
 }
 
 /// Resolves the audio output device (speakers, headphones, etc.).
@@ -146,10 +98,9 @@ pub fn resolve_output_device(
             );
             return Ok(device);
         }
-        warn!(
-            "saved audio output index {} is no longer available; falling back to default output",
-            output_index
-        );
+        return Err(format!(
+            "Selected audio output #{output_index} is unavailable. Choose an output in Audio."
+        ));
     }
 
     host.default_output_device()
@@ -231,44 +182,6 @@ pub fn device_supports_direction(device: &Device, direction: Direction) -> bool 
     }
 }
 
-pub fn find_audio_input_for_video(video_device_name: &str, inputs: &[AudioDevice]) -> Option<i32> {
-    let keywords = keywords_for_device_name(video_device_name);
-    if keywords.is_empty() {
-        return None;
-    }
-
-    let mut best_index = None;
-    let mut best_score = 0;
-    for device in inputs {
-        let haystack = device.name.to_ascii_lowercase();
-        let score = keywords
-            .iter()
-            .filter(|keyword| haystack.contains(keyword.as_str()))
-            .count();
-        if score > best_score {
-            best_score = score;
-            best_index = Some(device.index);
-        }
-    }
-
-    let threshold = if keywords.len() == 1 { 1 } else { 2 };
-    if best_score >= threshold {
-        best_index
-    } else {
-        None
-    }
-}
-
-fn keywords_for_device_name(device_name: &str) -> Vec<String> {
-    device_name
-        .to_ascii_lowercase()
-        .replace(['-', '_', '/', '\\', '(', ')'], " ")
-        .split_whitespace()
-        .filter(|word| word.len() >= 3 && !IGNORED_KEYWORDS.contains(word))
-        .map(ToString::to_string)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,20 +198,11 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_automatic_input_uses_system_default_with_or_without_video() {
+    fn unmatched_automatic_input_requires_selection_with_or_without_video() {
         let host = preferred_audio_host();
         for video in ["", "Synthetic capture device"] {
-            let expected = host.default_input_device();
             let resolved = resolve_input_device(&host, -1, video, &[]);
-            match (expected, resolved) {
-                (Some(expected), Ok(ResolvedInput::Device(actual))) => {
-                    assert_eq!(expected.name().ok(), actual.name().ok());
-                }
-                (None, Err(error)) => {
-                    assert_eq!(error, "no default audio input device found on the system");
-                }
-                _ => panic!("automatic selection must retain the WASAPI default fallback"),
-            }
+            assert!(resolved.is_err());
         }
     }
 }

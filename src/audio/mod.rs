@@ -66,7 +66,7 @@ impl AudioPassthrough {
             )
         {
             return AudioStatus::Error(format!(
-                "{status}. Automatic recovery stopped; try Restart audio or reconnect the device"
+                "{status}. Automatic recovery stopped; use Reinitialize devices or reconnect the device"
             ));
         }
         status
@@ -144,7 +144,7 @@ impl AudioPassthrough {
         {
             self.recovery.failed(now);
             if self.recovery.exhausted() && !self.recovery_exhaustion_logged {
-                warn!("audio automatic recovery exhausted after 3 attempts; use Restart audio or reconnect the device");
+                warn!("audio automatic recovery exhausted after 3 attempts; use Reinitialize devices or reconnect the device");
                 self.recovery_exhaustion_logged = true;
             }
             if self.recovery.take_ready(now) {
@@ -170,24 +170,21 @@ impl AudioPassthrough {
         self.diagnostics.clone()
     }
 
-    pub fn start(
-        &mut self,
-        video_device_name: &str,
-        input_index: i32,
-        output_index: i32,
-        volume: f64,
-        muted: bool,
-    ) {
+    pub fn start(&mut self, video_device_name: &str, settings: &crate::settings::Settings) {
         self.stop();
         self.route = None;
         self.reset_recovery();
         self.diagnostics = Arc::new(AudioDiagnostics::new());
-        self.volume_ctrl.set_volume(volume);
-        self.volume_ctrl.set_muted(muted);
+        self.volume_ctrl.set_volume(settings.volume);
+        self.volume_ctrl.set_muted(settings.audio_muted);
 
         let host = platform::preferred_audio_host();
         let inputs = devices::enumerate_audio_inputs();
         let outputs = devices::enumerate_audio_outputs();
+        let mut route_settings = settings.clone();
+        devices::validate_audio_choices(&mut route_settings, &inputs, &outputs);
+        let input_index = route_settings.audio_input;
+        let output_index = route_settings.audio_output;
 
         info!("=== Starting Audio Pipeline ===");
         info!("discovered audio inputs: {:?}", inputs);
@@ -200,7 +197,7 @@ impl AudioPassthrough {
                 Err(error) => {
                     let msg = format!("audio input unavailable: {error}");
                     warn!("{msg}");
-                    self.diagnostics.set_status(AudioStatus::NoInput);
+                    self.diagnostics.set_status(AudioStatus::Error(msg));
                     return;
                 }
             };
@@ -210,7 +207,7 @@ impl AudioPassthrough {
             Err(error) => {
                 let msg = format!("audio output unavailable: {error}");
                 warn!("{msg}");
-                self.diagnostics.set_status(AudioStatus::NoOutput);
+                self.diagnostics.set_status(AudioStatus::Error(msg));
                 return;
             }
         };
@@ -410,6 +407,15 @@ impl AudioPassthrough {
         self.diagnostics.set_status(AudioStatus::Stopped);
         self.diagnostics.set_input_info(None);
         self.diagnostics.set_output_info(None);
+    }
+
+    pub fn wait_for_selection(&mut self, message: &str) {
+        self.stop();
+        self.route = None;
+        self.reset_recovery();
+        self.diagnostics = Arc::new(AudioDiagnostics::new());
+        self.diagnostics
+            .set_status(AudioStatus::Error(message.into()));
     }
 
     pub fn set_volume(&mut self, volume: f64) {

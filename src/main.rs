@@ -4,6 +4,7 @@ mod audio;
 mod capabilities;
 mod capture;
 mod color;
+mod device_refresh;
 mod devices;
 #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
 mod dx12_interop;
@@ -22,6 +23,8 @@ mod settings;
 mod theme;
 mod triple_buffer;
 mod ui;
+#[cfg(any(target_os = "windows", test))]
+mod usb_link;
 #[cfg(target_os = "windows")]
 mod vsr_interop;
 
@@ -231,9 +234,6 @@ fn main() {
         }
         return;
     }
-    if !settings.video_device.is_empty() && !std::env::args().any(|arg| arg.starts_with("--test")) {
-        capabilities::prime_device_capabilities(&settings.video_device);
-    }
     let audio_inputs = if cli.preview_active() {
         Vec::new()
     } else {
@@ -244,6 +244,16 @@ fn main() {
     } else {
         devices::enumerate_audio_outputs()
     };
+    devices::refresh_audio_choices(&mut settings, &audio_inputs, &audio_outputs);
+    let selected = devices::select_capture_devices(
+        &settings.video_device,
+        settings.audio_input,
+        &video_devices,
+        &audio_inputs,
+    );
+    if !cli.test_mode && !selected.video_device.is_empty() {
+        capabilities::prime_device_capabilities(&selected.video_device);
+    }
 
     info!("=== Audio & Video Diagnostics at Startup ===");
     info!("detected video capture devices ({}):", video_devices.len());
@@ -302,6 +312,7 @@ struct App {
     capture: Option<CaptureThread>,
     capture_restart_pending: bool,
     audio_restart_pending: Option<AudioRestart>,
+    device_refresh: Option<device_refresh::DeviceRefresh>,
     capture_recovery: recovery::RecoveryBackoff,
     audio: AudioPassthrough,
     latest_stats: Option<CaptureStats>,
@@ -346,6 +357,7 @@ impl App {
             capture: None,
             capture_restart_pending: false,
             audio_restart_pending: None,
+            device_refresh: None,
             capture_recovery: recovery::RecoveryBackoff::default(),
             audio: AudioPassthrough::new(),
             latest_stats: None,
@@ -379,7 +391,7 @@ impl App {
         #[cfg(target_os = "windows")]
         unsafe {
             use windows::core::PCWSTR;
-            use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+            use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
             use windows::Win32::System::LibraryLoader::GetModuleHandleW;
             use windows::Win32::UI::WindowsAndMessaging::{
                 LoadImageW, SendMessageW, HICON, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE,
@@ -402,7 +414,7 @@ impl App {
 
                 // 4. Load the embedded icon layout
                 if let Ok(handle) = LoadImageW(
-                    h_instance,
+                    Some(HINSTANCE(h_instance.0)),
                     icon_name,
                     IMAGE_ICON,
                     0, // Allow OS to handle ideal bounds sampling
@@ -416,14 +428,14 @@ impl App {
                         SendMessageW(
                             hwnd,
                             WM_SETICON,
-                            WPARAM(ICON_SMALL as usize),
-                            LPARAM(h_icon.0 as isize),
+                            Some(WPARAM(ICON_SMALL as usize)),
+                            Some(LPARAM(h_icon.0 as isize)),
                         );
                         SendMessageW(
                             hwnd,
                             WM_SETICON,
-                            WPARAM(ICON_BIG as usize),
-                            LPARAM(h_icon.0 as isize),
+                            Some(WPARAM(ICON_BIG as usize)),
+                            Some(LPARAM(h_icon.0 as isize)),
                         );
                     }
                 }
@@ -542,12 +554,10 @@ impl ApplicationHandler<AppEvent> for App {
                 match &event.logical_key {
                     Key::Named(NamedKey::Escape) => {
                         if let Some(ui) = &mut self.ui {
-                            if ui.is_menu_open() {
-                                if let Some(settings) = ui.close_menu_and_apply() {
-                                    self.apply_settings(settings);
-                                }
-                            } else {
-                                ui.open_menu(&self.settings);
+                            if let Some(settings) =
+                                ui.toggle_menu(&self.settings, || window.request_redraw())
+                            {
+                                self.apply_settings(settings);
                             }
                         }
                         if self.ui.as_ref().is_some_and(|ui| ui.is_menu_open()) {
@@ -570,9 +580,10 @@ impl ApplicationHandler<AppEvent> for App {
         // and goes stale (wrong scale factor after a monitor change, unknown
         // pointer position) if it only sees them some of the time.
         if let Some(ui) = &mut self.ui {
-            if ui.on_window_event(&window, &event) {
-                window.request_redraw();
-            }
+            // The returned bool describes input ownership, not drawing. This
+            // app has no competing pointer/typing handler; lifecycle events
+            // below must still be processed when egui consumes input.
+            let _consumed = ui.on_window_event(&window, &event, || window.request_redraw());
         }
 
         match event {
@@ -622,14 +633,16 @@ impl ApplicationHandler<AppEvent> for App {
                             audio_outputs: &self.audio_outputs,
                             is_fullscreen: self.is_fullscreen,
                             audio_status: &audio_status,
+                            devices_busy: self.device_refresh.is_some(),
                         },
                     );
                     let toggle_fullscreen = prepared_ui.output.toggle_fullscreen;
                     let exit_requested = prepared_ui.output.exit_requested;
                     let apply_settings = prepared_ui.output.apply_settings.clone();
-                    let restart_capture = prepared_ui.output.restart_capture;
-                    let restart_audio = prepared_ui.output.restart_audio;
-                    if let Some(live) = &prepared_ui.output.live_video {
+                    let reinitialize_devices = prepared_ui.output.reinitialize_devices.clone();
+                    if let Some(live) = &prepared_ui.output.live_settings {
+                        self.audio.set_volume(live.volume);
+                        self.audio.set_muted(live.audio_muted);
                         renderer.set_picture_settings(
                             live.brightness,
                             live.contrast,
@@ -652,20 +665,8 @@ impl ApplicationHandler<AppEvent> for App {
                     if let Some(settings) = apply_settings {
                         self.apply_settings(settings);
                     }
-                    if restart_capture {
-                        self.capture_recovery.reset();
-                        self.audio.reset_recovery();
-                        self.queue_capture_restart(Some(AudioRestart::Previous));
-                    } else if restart_audio {
-                        info!("audio restart requested from settings");
-                        self.audio.reset_recovery();
-                        if self.audio.uses_directshow() || self.capture_restart_pending {
-                            self.queue_capture_restart(Some(AudioRestart::Previous));
-                        } else if self.audio.has_route() {
-                            self.audio.restart_previous();
-                        } else {
-                            self.start_audio();
-                        }
+                    if let Some(settings) = reinitialize_devices {
+                        self.reinitialize_devices(settings);
                     }
                     if exit_requested {
                         if let Some(capture) = &mut self.capture {
@@ -790,15 +791,18 @@ impl ApplicationHandler<AppEvent> for App {
                 self.audio_restart_pending = Some(AudioRestart::Previous);
                 if self.capture_recovery.exhausted() {
                     let message = self.latest_error.get_or_insert_default();
-                    message
-                        .push_str(". Automatic recovery stopped; use Reconnect capture to retry.");
+                    message.push_str(
+                        ". Automatic recovery stopped; use Reinitialize devices to retry.",
+                    );
                 }
             }
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
         }
-        if self.capture.is_none()
+        self.poll_device_refresh();
+        if self.device_refresh.is_none()
+            && self.capture.is_none()
             && (self.capture_restart_pending || self.capture_recovery.take_ready(Instant::now()))
         {
             self.capture_restart_pending = false;
@@ -824,6 +828,7 @@ impl ApplicationHandler<AppEvent> for App {
         }
         let audio_status = self.audio.status();
         if !self.capture_restart_pending
+            && self.device_refresh.is_none()
             && self.audio_restart_pending.is_none()
             && self.audio.poll_health()
         {
@@ -886,6 +891,84 @@ impl ApplicationHandler<AppEvent> for App {
 }
 
 impl App {
+    fn remember_changed_audio_choices(&self, settings: &mut Settings) {
+        if settings.audio_input != self.settings.audio_input {
+            settings.audio_input_name = None;
+        }
+        if settings.audio_output != self.settings.audio_output {
+            settings.audio_output_name = None;
+        }
+        devices::remember_audio_choices(settings, &self.audio_inputs, &self.audio_outputs);
+    }
+
+    fn reinitialize_devices(&mut self, mut settings: Settings) {
+        if self.device_refresh.is_some() {
+            return;
+        }
+        if self.test_mode {
+            self.apply_settings(settings);
+            return;
+        }
+        settings.sanitize();
+        self.remember_changed_audio_choices(&mut settings);
+        self.settings = settings;
+        self.save_settings();
+        self.capture_recovery.reset();
+        self.audio.wait_for_selection("Reinitializing devices…");
+        self.audio_restart_pending = None;
+        self.queue_capture_restart(None);
+        self.latest_error = None;
+        let generation = capabilities::begin_device_refresh();
+        self.device_refresh = Some(device_refresh::DeviceRefresh::new(
+            self.settings.clone(),
+            generation,
+        ));
+        info!("device reinitialization requested; waiting for capture retirement");
+    }
+
+    fn poll_device_refresh(&mut self) {
+        let Some(task) = self.device_refresh.as_mut() else {
+            return;
+        };
+        let generation = task.generation;
+        let Some(result) = task.poll(
+            self.capture.is_none(),
+            device_refresh::DiscoveredDevices::scan,
+        ) else {
+            return;
+        };
+        self.device_refresh = None;
+        self.capture_restart_pending = false;
+        self.audio_restart_pending = None;
+        match result {
+            Ok(fresh) => {
+                capabilities::finish_device_refresh(
+                    generation,
+                    (!fresh.video.is_empty()).then_some((fresh.video, fresh.capabilities)),
+                );
+                self.video_devices = fresh.videos;
+                self.audio_inputs = fresh.inputs;
+                self.audio_outputs = fresh.outputs;
+                self.settings = fresh.settings;
+                if let Some(ui) = &mut self.ui {
+                    ui.refresh_device_settings(&self.settings);
+                }
+                self.save_settings();
+                info!("device reinitialization discovered {} video, {} audio inputs, {} audio outputs", self.video_devices.len(), self.audio_inputs.len(), self.audio_outputs.len());
+                self.start_audio();
+                self.start_capture();
+            }
+            Err(message) => {
+                capabilities::finish_device_refresh(generation, None);
+                self.audio.wait_for_selection(&message);
+                self.latest_error = Some(message);
+            }
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     fn save_settings(&self) {
         if !self.preview_mode {
             if let Err(error) = self.settings.save() {
@@ -912,6 +995,7 @@ impl App {
 
     fn apply_settings(&mut self, mut new_settings: Settings) {
         new_settings.sanitize();
+        self.remember_changed_audio_choices(&mut new_settings);
         let old_settings = self.settings.clone();
         self.settings = new_settings;
 
@@ -935,7 +1019,7 @@ impl App {
         if mute_changed {
             self.audio.set_muted(self.settings.audio_muted);
         }
-        if video_changed || audio_device_changed {
+        if (video_changed || audio_device_changed) && self.device_refresh.is_none() {
             let independent_audio_change = audio_device_changed
                 && !video_changed
                 && !self.audio.uses_directshow()
@@ -967,7 +1051,9 @@ impl App {
     }
 
     fn overlay_info(&self) -> OverlayInfo {
-        let status_message = if self.capture_restart_pending {
+        let status_message = if self.device_refresh.is_some() {
+            Some("Reinitializing devices…".into())
+        } else if self.capture_restart_pending {
             Some("Restarting capture...".into())
         } else if let Some(error_message) = self.latest_error.as_ref() {
             Some(error_message.clone())
@@ -1048,20 +1134,18 @@ impl App {
             return;
         }
 
-        let video_device = if self.settings.video_device.is_empty() {
-            self.video_devices.first().cloned().unwrap_or_default()
-        } else {
-            self.settings.video_device.clone()
-        };
+        let selection = devices::select_capture_devices(
+            &self.settings.video_device,
+            self.settings.audio_input,
+            &self.video_devices,
+            &self.audio_inputs,
+        );
+        let video_device = selection.video_device.clone();
 
         if video_device.is_empty() {
-            warn!("no video device configured or discovered");
-            self.start_test_capture(
-                capture_config.width,
-                capture_config.height,
-                capture_config.fps,
-                "No video device discovered, using test pattern fallback",
-            );
+            let message = selection.message().unwrap().to_string();
+            warn!("{message}");
+            self.latest_error = Some(message);
             return;
         }
 
@@ -1137,30 +1221,105 @@ impl App {
             return;
         }
 
-        if self.settings.video_device.is_empty() && self.video_devices.is_empty() {
-            info!("skipping audio passthrough because no video capture device is available");
+        let selection = devices::select_capture_devices(
+            &self.settings.video_device,
+            self.settings.audio_input,
+            &self.video_devices,
+            &self.audio_inputs,
+        );
+        if let Some(message) = selection.message() {
+            self.audio.wait_for_selection(message);
             return;
         }
 
-        let video_device = if self.settings.video_device.is_empty() {
-            self.video_devices.first().cloned().unwrap_or_default()
-        } else {
-            self.settings.video_device.clone()
-        };
-
-        self.audio.start(
-            &video_device,
-            self.settings.audio_input,
-            self.settings.audio_output,
-            self.settings.volume,
-            self.settings.audio_muted,
-        );
+        self.audio.start(&selection.video_device, &self.settings);
     }
 }
 
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn check_soft_reinitialize_without_capture_frames(proxy: EventLoopProxy<AppEvent>) {
+        let settings = Settings {
+            volume: 0.42,
+            brightness: 0.2,
+            ..Default::default()
+        };
+        let mut app = App::new(
+            settings.clone(),
+            false,
+            TestPatternMode::Nv12,
+            vec![],
+            vec![],
+            vec![],
+            proxy,
+        );
+        app.preview_mode = true; // The fixture must never write the user's saved settings.
+        app.reinitialize_devices(settings.clone());
+        assert!(app.device_refresh.is_some() && app.capture_restart_pending);
+        assert!(app.capture.is_none() && app.latest_stats.is_none());
+        let generation = app.device_refresh.as_ref().unwrap().generation;
+        app.reinitialize_devices(settings.clone());
+        assert_eq!(
+            app.device_refresh.as_ref().unwrap().generation,
+            generation,
+            "coalesce repeated clicks"
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.device_refresh = Some(device_refresh::DeviceRefresh::from_receiver(
+            generation, receiver,
+        ));
+        app.poll_device_refresh();
+        assert!(
+            app.device_refresh.is_some() && app.capture.is_none(),
+            "no pipeline may open before discovery completes"
+        );
+        sender
+            .send(device_refresh::DiscoveredDevices {
+                settings: settings.clone(),
+                videos: vec![],
+                inputs: vec![],
+                outputs: vec![],
+                video: "soft-refresh-card".into(),
+                capabilities: capabilities::DeviceCapabilities {
+                    modes: vec![capabilities::CaptureMode {
+                        width: 3840,
+                        height: 2160,
+                        format: settings::VideoFormat::Mjpeg,
+                        rate: 60.into(),
+                    }],
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        app.poll_device_refresh();
+        assert!(app.device_refresh.is_none() && !app.capture_restart_pending);
+        assert!(
+            app.capture.is_none() && app.latest_stats.is_none(),
+            "empty discovery must not open a substitute device"
+        );
+        assert_eq!(app.settings, settings);
+        assert_eq!(
+            capabilities::get_device_capabilities("soft-refresh-card").modes[0].width,
+            3840
+        );
+        app.reinitialize_devices(settings);
+        let generation = app.device_refresh.as_ref().unwrap().generation;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(sender);
+        app.device_refresh = Some(device_refresh::DeviceRefresh::from_receiver(
+            generation, receiver,
+        ));
+        app.poll_device_refresh();
+        assert!(app.device_refresh.is_none() && app.capture.is_none());
+        assert!(app
+            .latest_error
+            .as_ref()
+            .unwrap()
+            .contains("discovery failed"));
+    }
 
     #[test]
     fn preview_defaults_invalid_values_and_duplicate_flags_are_bounded() {

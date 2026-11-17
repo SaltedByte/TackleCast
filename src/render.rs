@@ -63,6 +63,7 @@ impl ActiveScaleFilter {
 }
 
 pub struct Renderer {
+    instance: wgpu::Instance,
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -123,13 +124,13 @@ impl Renderer {
 
         // Prefer DX12 on Windows so that CUDA ↔ DX12 zero-copy interop works.
         // Fall back to all backends if DX12 isn't available.
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: if cfg!(windows) {
                 wgpu::Backends::DX12
             } else {
                 wgpu::Backends::all()
             },
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(window.clone()))
         });
         let surface = instance
             .create_surface(window.clone())
@@ -142,18 +143,17 @@ impl Renderer {
                 force_fallback_adapter: false,
             })
             .await
-            .ok_or(RenderError::AdapterUnavailable)?;
+            .map_err(|_| RenderError::AdapterUnavailable)?;
 
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("tacklecast-device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
-                    memory_hints: wgpu::MemoryHints::Performance,
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("tacklecast-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::Performance,
+
+                ..Default::default()
+            })
             .await
             .map_err(RenderError::RequestDevice)?;
 
@@ -244,7 +244,7 @@ impl Renderer {
             label: Some("tacklecast-video-sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -263,8 +263,8 @@ impl Renderer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tacklecast-video-pipeline-layout"),
-            bind_group_layouts: &[&video_bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&video_bind_group_layout)],
+            immediate_size: 0,
         });
 
         let video_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -289,11 +289,19 @@ impl Renderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
-        let egui_renderer = EguiRenderer::new(&device, surface_format, None, 1, false);
+        let egui_renderer = EguiRenderer::new(
+            &device,
+            surface_format,
+            egui_wgpu::RendererOptions {
+                msaa_samples: 1,
+                dithering: false,
+                ..Default::default()
+            },
+        );
 
         let initial_active = match scale_filter {
             ScaleFilter::Bilinear => ActiveScaleFilter::Bilinear,
@@ -304,6 +312,7 @@ impl Renderer {
         };
 
         Ok(Self {
+            instance,
             window,
             surface,
             device,
@@ -360,7 +369,10 @@ impl Renderer {
 
         // Drain in-flight GPU work and release shared upscale textures before
         // DXGI swapchain buffer resizing to prevent NvPresent64 presentation faults.
-        self.device.poll(wgpu::Maintain::Wait);
+        if let Err(error) = self.device.poll(wgpu::PollType::wait_indefinitely()) {
+            tracing::warn!("GPU wait before resizing failed: {error}");
+            return;
+        }
         self.upscale_textures = None;
         #[cfg(target_os = "windows")]
         if let Some(vsr) = &mut self.vsr_context {
@@ -379,7 +391,10 @@ impl Renderer {
         if filter != ScaleFilter::RtxVsr {
             if let Some(vsr) = &mut self.vsr_context {
                 if vsr.resources.is_some() {
-                    self.device.poll(wgpu::Maintain::Wait);
+                    if let Err(error) = self.device.poll(wgpu::PollType::wait_indefinitely()) {
+                        tracing::warn!("GPU wait before changing filter failed: {error}");
+                        return;
+                    }
                     vsr.resources = None;
                 }
             }
@@ -680,13 +695,23 @@ impl Renderer {
         }
 
         let frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                self.device.poll(wgpu::Maintain::Wait);
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            status
+            @ (wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated) => {
+                self.device
+                    .poll(wgpu::PollType::wait_indefinitely())
+                    .map_err(RenderError::Poll)?;
                 self.upscale_textures = None;
                 #[cfg(target_os = "windows")]
                 if let Some(vsr) = &mut self.vsr_context {
                     vsr.resources = None;
+                }
+                if matches!(status, wgpu::CurrentSurfaceTexture::Lost) {
+                    self.surface = self
+                        .instance
+                        .create_surface(self.window.clone())
+                        .map_err(RenderError::CreateSurface)?;
                 }
                 self.surface.configure(&self.device, &self.config);
                 // Flush any staged write_texture/write_buffer calls so they
@@ -694,12 +719,11 @@ impl Renderer {
                 self.queue.submit(std::iter::empty());
                 return Ok(());
             }
-            Err(wgpu::SurfaceError::Timeout) => {
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
                 self.queue.submit(std::iter::empty());
                 return Ok(());
             }
-            Err(wgpu::SurfaceError::OutOfMemory) => return Err(RenderError::OutOfMemory),
-            Err(error) => return Err(RenderError::Surface(error)),
+            wgpu::CurrentSurfaceTexture::Validation => return Err(RenderError::SurfaceValidation),
         };
 
         let view = frame
@@ -826,9 +850,13 @@ impl Renderer {
                                 let vsr_res = vsr_ctx.resources.as_ref().unwrap();
                                 let mut pass =
                                     pass1_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                        multiview_mask: None,
+
                                         label: Some("tacklecast-vsr-yuv-to-rgb-pass"),
                                         color_attachments: &[Some(
                                             wgpu::RenderPassColorAttachment {
+                                                depth_slice: None,
+
                                                 view: &vsr_res.input_view,
                                                 resolve_target: None,
                                                 ops: wgpu::Operations {
@@ -860,9 +888,13 @@ impl Renderer {
                                 let vsr_res = vsr_ctx.resources.as_ref().unwrap();
                                 let mut pass =
                                     encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                        multiview_mask: None,
+
                                         label: Some("tacklecast-vsr-rcas-surface-pass"),
                                         color_attachments: &[Some(
                                             wgpu::RenderPassColorAttachment {
+                                                depth_slice: None,
+
                                                 view: &view,
                                                 resolve_target: None,
                                                 ops: wgpu::Operations {
@@ -929,8 +961,12 @@ impl Renderer {
                     // Pass 1: YUV -> RGB native resolution texture
                     {
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            multiview_mask: None,
+
                             label: Some("tacklecast-fsr-yuv-to-rgb-pass"),
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                depth_slice: None,
+
                                 view: &textures.native_rgb_view,
                                 resolve_target: None,
                                 ops: wgpu::Operations {
@@ -958,8 +994,12 @@ impl Renderer {
                     // Pass 2: EASU upscale pass
                     {
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            multiview_mask: None,
+
                             label: Some("tacklecast-fsr-easu-pass"),
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                depth_slice: None,
+
                                 view: &textures.easu_output_view,
                                 resolve_target: None,
                                 ops: wgpu::Operations {
@@ -980,8 +1020,12 @@ impl Renderer {
                     // Pass 3: RCAS sharpening pass onto surface view with letterbox clear
                     {
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            multiview_mask: None,
+
                             label: Some("tacklecast-fsr-rcas-surface-pass"),
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                depth_slice: None,
+
                                 view: &view,
                                 resolve_target: None,
                                 ops: wgpu::Operations {
@@ -1049,8 +1093,12 @@ impl Renderer {
                     .write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    multiview_mask: None,
+
                     label: Some("tacklecast-clear-pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        depth_slice: None,
+
                         view: &view,
                         resolve_target: None,
                         ops: wgpu::Operations {
@@ -1085,8 +1133,12 @@ impl Renderer {
             };
 
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                multiview_mask: None,
+
                 label: Some("tacklecast-clear-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    depth_slice: None,
+
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -1102,8 +1154,12 @@ impl Renderer {
 
         if let Some(ui) = ui.as_ref() {
             let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                multiview_mask: None,
+
                 label: Some("tacklecast-egui-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    depth_slice: None,
+
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -1190,8 +1246,8 @@ impl Renderer {
         let video_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("tacklecast-video-intermediate-pipeline-layout"),
-                bind_group_layouts: &[video_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(video_bind_group_layout)],
+                immediate_size: 0,
             });
         let yuv_to_rgb_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("tacklecast-yuv-to-rgb-pipeline"),
@@ -1215,7 +1271,7 @@ impl Renderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -1250,8 +1306,8 @@ impl Renderer {
 
         let easu_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tacklecast-fsr-easu-pipeline-layout"),
-            bind_group_layouts: &[&easu_bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&easu_bind_group_layout)],
+            immediate_size: 0,
         });
 
         let easu_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1276,7 +1332,7 @@ impl Renderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -1305,8 +1361,8 @@ impl Renderer {
 
         let rcas_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tacklecast-fsr-rcas-pipeline-layout"),
-            bind_group_layouts: &[&rcas_bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&rcas_bind_group_layout)],
+            immediate_size: 0,
         });
 
         let rcas_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1331,7 +1387,7 @@ impl Renderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -1339,7 +1395,7 @@ impl Renderer {
             label: Some("tacklecast-fsr-easu-sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -1467,9 +1523,9 @@ impl Renderer {
 pub enum RenderError {
     AdapterUnavailable,
     CreateSurface(wgpu::CreateSurfaceError),
-    OutOfMemory,
     RequestDevice(wgpu::RequestDeviceError),
-    Surface(wgpu::SurfaceError),
+    Poll(wgpu::PollError),
+    SurfaceValidation,
     SurfaceFormatUnavailable,
 }
 
@@ -1478,9 +1534,9 @@ impl Display for RenderError {
         match self {
             Self::AdapterUnavailable => write!(f, "no suitable GPU adapter found"),
             Self::CreateSurface(error) => write!(f, "failed to create surface: {error}"),
-            Self::OutOfMemory => write!(f, "GPU ran out of memory"),
             Self::RequestDevice(error) => write!(f, "failed to request device: {error}"),
-            Self::Surface(error) => write!(f, "surface error: {error}"),
+            Self::Poll(error) => write!(f, "GPU wait failed: {error}"),
+            Self::SurfaceValidation => write!(f, "surface validation failed"),
             Self::SurfaceFormatUnavailable => write!(f, "surface reported no usable formats"),
         }
     }
