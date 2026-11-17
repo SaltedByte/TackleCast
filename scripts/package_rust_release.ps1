@@ -3,7 +3,10 @@ param(
     [switch]$Zip,
     [switch]$SkipGpuDlls,
     [switch]$RequireGpuDlls,
-    [string]$CudaDllDir
+    [string]$CudaDllDir,
+    [string]$FrameGenDir,
+    [switch]$RequireFrameGen,
+    [string]$VcRuntimeDir
 )
 
 Set-StrictMode -Version Latest
@@ -77,9 +80,7 @@ try {
     }
     Copy-Item (Join-Path $PSScriptRoot 'windows-dependencies.json') (Join-Path $licensesDir 'dependency-sources.json')
 
-    if (Test-Path -LiteralPath $settingsSrc) {
-        Copy-Item -LiteralPath $settingsSrc -Destination (Join-Path $outDir "tacklecast_settings.json")
-    }
+    # Portable packages start with defaults; never copy developer device/settings files.
 
     $dllPatterns = @(
         "avcodec-*.dll",
@@ -177,6 +178,45 @@ try {
             Copy-Item (Join-Path $selectedGpuDir 'licenses\*') $licensesDir -Force
         }
     }
+    $framegenBundled = $false
+    if (-not $FrameGenDir) {
+        $candidateRife = Join-Path $root '.deps\rife'
+        if (Test-Path -LiteralPath $candidateRife) { $FrameGenDir = $candidateRife }
+    }
+    if ($FrameGenDir) {
+        & (Join-Path $PSScriptRoot 'bundle_framegen.ps1') -Source $FrameGenDir -Package $outDir
+        $framegenBundled = $true
+    } elseif ($RequireFrameGen) {
+        throw 'The complete pinned RIFE runtime/model bundle is required. Set FrameGenDir.'
+    }
+    if (-not $VcRuntimeDir) {
+        $vsRoots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ } | Select-Object -Unique
+        $crtCandidates = foreach ($base in $vsRoots) {
+            Get-ChildItem -Path (Join-Path $base 'Microsoft Visual Studio\*\*\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT') -Directory -ErrorAction SilentlyContinue
+        }
+        $VcRuntimeDir = $crtCandidates |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'msvcp140_1.dll') } |
+            Sort-Object { [version](Get-Item (Join-Path $_.FullName 'vcruntime140.dll')).VersionInfo.FileVersionRaw } -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+    }
+    if (-not $VcRuntimeDir) { throw 'Set VcRuntimeDir to the licensed x64 release VC CRT redistribution directory.' }
+    foreach ($name in @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll', 'msvcp140_1.dll')) {
+        Ensure-Exists (Join-Path $VcRuntimeDir $name) "Missing app-local C++ runtime: $name"
+    }
+    $crtFiles = @(Get-ChildItem -LiteralPath $VcRuntimeDir -Filter '*.dll' -File)
+    foreach ($dll in $crtFiles) {
+        $signature = Get-AuthenticodeSignature -LiteralPath $dll.FullName
+        if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft') {
+            throw "Invalid Microsoft runtime signature: $($dll.Name)"
+        }
+        Copy-Item -LiteralPath $dll.FullName -Destination $outDir
+    }
+    @(
+        'Microsoft Visual C++ release runtime DLLs are redistributed app-locally from Visual Studio x64 CRT Redist.'
+        'Keep these files with the application. These components remain subject to Microsoft license terms.'
+        'Deployment and servicing: https://learn.microsoft.com/en-us/cpp/windows/deployment-in-visual-cpp'
+        'Redistribution terms: https://visualstudio.microsoft.com/license-terms/'
+    ) | Set-Content -LiteralPath (Join-Path $licensesDir 'Microsoft-VC-Runtime.txt') -Encoding UTF8
     $commit = git -C $root rev-parse HEAD
     if ($LASTEXITCODE -ne 0) { throw 'Cannot record the source commit.' }
     @{
@@ -185,6 +225,8 @@ try {
         platform = 'windows-x86_64'
         working_tree_changes = [bool](git -C $root status --porcelain)
         gpu_runtime_bundled = ($gpuDllsCopied.Count -eq 2)
+        framegen_bundled = $framegenBundled
+        vc_runtime_bundled = @($crtFiles | ForEach-Object { @{ file = $_.Name; version = $_.VersionInfo.FileVersion; sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() } })
     } | ConvertTo-Json | Set-Content (Join-Path $outDir 'build-info.json')
 
     if ($gpuDllsCopied.Count -gt 0) {
@@ -214,54 +256,10 @@ the CUDA Toolkit installed. Otherwise the app falls back to software decode.
 "@
     }
 
-    $readmePath = Join-Path $outDir "README.txt"
-    @"
-TackleCast
-==========
-
-Requirements: Windows 10/11 64-bit. Everything needed is in this folder - no
-installer, nothing to put on PATH. Keep the files together.
-
-Running it
-----------
-1. Run TackleCast.exe.
-2. Press Escape to open settings; pick your capture device, resolution, and FPS.
-3. Press F11 for fullscreen. Escape closes the menu.
-
-The mouse cursor hides after 3 seconds of stillness while the menu is closed.
-The display is kept awake while frames are arriving and the window is visible.
-
-Settings are saved to tacklecast_settings.json next to the exe when you exit.
-Deleting that file resets everything to defaults.
-$gpuNote
-
-Scaling filters
----------------
-Settings has Video, Picture, Audio, and Display tabs in TackleCast's original
-coral/navy colors. Scaling choices are Bilinear, Bicubic, and Lanczos.
-Picture sliders update live, with no backdrop dimming while a slider is active.
-Color Space and Color Range can use source metadata or manual overrides.
-Auto labels identify any default explicitly. BT.2020 selects a matrix, not HDR.
-
-Capture modes
--------------
-Resolution, frame rate, and pixel format are matched to the selected device.
-Fractional nominal rates remain distinct from measured delivered FPS.
-Auto shows the opened format, for example Auto (NV12). Manual format requests
-are checked against the opened stream; resolution/FPS are not silently lowered.
-If mode discovery fails, the UI reports the failure rather than inventing modes.
-
-If something goes wrong
------------------------
-- Log files are in the logs\ folder, newest last. They record the negotiated
-  capture format, decode path, frame rate, and any errors. Send the newest one.
-- A 30-second summary line reports rendered/uploaded FPS and GPU temperature.
-- If capture fails, first check the card appears in Windows Camera or Device
-  Manager, and that nothing else (OBS, Camera app, a browser tab) is already
-  using it - most capture cards allow only one consumer at a time.
-- If the picture is black but FPS is counting up, try a different resolution or
-  frame rate; the log line starting "negotiated" shows what the card accepted.
-"@ | Set-Content -Path $readmePath -NoNewline
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'windows-package-readme.txt') -Destination (Join-Path $outDir 'README.txt')
+    if ($framegenBundled) {
+        Copy-Item -LiteralPath (Join-Path $root 'README-FrameGen.md') -Destination $outDir
+    }
 
     if ($Zip) {
         $zipPath = Join-Path $distRoot "$PackageName.zip"

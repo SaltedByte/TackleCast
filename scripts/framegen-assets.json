@@ -1,0 +1,144 @@
+{
+  "schema": 1,
+  "backend": "RIFE via ONNX Runtime DirectML",
+  "onnxruntime": "1.24.4",
+  "directml": "1.15.4",
+  "models": [
+    "rife426fmh",
+    "rife46fmh"
+  ],
+  "resolutions": [
+    "1280x720",
+    "1920x1080",
+    "2560x1440"
+  ],
+  "source_pr": "https://github.com/SaltedByte/TackleCast/pull/28",
+  "sources": {
+    "runtime": "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.directml/1.24.4/microsoft.ml.onnxruntime.directml.1.24.4.nupkg",
+    "directml": "https://api.nuget.org/v3-flatcontainer/microsoft.ai.directml/1.15.4/microsoft.ai.directml.1.15.4.nupkg",
+    "weights": "https://github.com/hzwer/Practical-RIFE",
+    "network": "https://github.com/HolyWu/vs-rife"
+  },
+  "files": [
+    {
+      "path": "DirectML.dll",
+      "bytes": 18527776,
+      "sha256": "9c9e6d822561c6c41b90e6994b3e8857cf1d66dbfb1e0c4c799c7c89b4e92da1"
+    },
+    {
+      "path": "models/rife426fmh_1280x720.onnx",
+      "bytes": 16647033,
+      "sha256": "22116fd844ef3e86705ec03b009b88384200e48322fe2fc1e1d678b867a26c8c"
+    },
+    {
+      "path": "models/rife426fmh_1920x1080.onnx",
+      "bytes": 23175035,
+      "sha256": "24a63402163b6511cc189d13f3ee2f61edeb14206a7f1977608ea003fa2b0df1"
+    },
+    {
+      "path": "models/rife426fmh_2560x1440.onnx",
+      "bytes": 32314235,
+      "sha256": "18fa431aa3af55bb4ecbb833220c13d903cf496da8520429f945f5c1e5d4576e"
+    },
+    {
+      "path": "models/rife46fmh_1280x720.onnx",
+      "bytes": 15905876,
+      "sha256": "9a7b438a7a1667af273197705f6751164abe0377d133ca5cca07f5cdaf8486f7"
+    },
+    {
+      "path": "models/rife46fmh_1920x1080.onnx",
+      "bytes": 22126678,
+      "sha256": "390c2d4300a1e90acff614c39c3479c5e4fae389f9f07bdf290602b3a95a32d8"
+    },
+    {
+      "path": "models/rife46fmh_2560x1440.onnx",
+      "bytes": 31163478,
+      "sha256": "f9dd6712b0b811988d1a7726205c9f0b67d9b87e22913701016fa9af2684f9ad"
+    },
+    {
+      "path": "onnxruntime.dll",
+      "bytes": 17328152,
+      "sha256": "e7eedec6a6f26dc39dc948276a75ef6d2bee3fff944d874ceed0bbd3b97bff40"
+    },
+    {
+      "path": "onnxruntime_providers_shared.dll",
+      "bytes": 22040,
+      "sha256": "265c8daf29637cb259cac8be9f08f2cd45f3883f0f0e4949cbfddd5b4cbec3b6"
+    },
+    {
+      "path": "licenses/DirectML-LICENSE-CODE.txt",
+      "bytes": 1093,
+      "sha256": "903df5512f7d02609fed0c780a9b704f5a3eeb6e4d84ebe42a29845c81899a3c"
+    },
+    {
+      "path": "licenses/DirectML-LICENSE.txt",
+      "bytes": 10439,
+      "sha256": "a05138e3a085ff60a44881eedfa58dccb03ecc1d7b1f6ae888418e8c2fec4b8d"
+    },
+    {
+      "path": "licenses/DirectML-ThirdPartyNotices.txt",
+      "bytes": 4577,
+      "sha256": "2c95795c13ff48a58b6ed916f37901c23d964b5d9d601af422f17ad2172e7950"
+    },
+    {
+      "path": "licenses/ONNXRuntime-LICENSE",
+      "bytes": 1094,
+      "sha256": "c250d6278f0b47a6439fb7592b08b58a55eb9f535aa49a1db63211c3f982b674"
+    },
+    {
+      "path": "licenses/ONNXRuntime-ThirdPartyNotices.txt",
+      "bytes": 331175,
+      "sha256": "fb0af774b4d7cffc5b9d046f2aaeade2f37df2f80abf8033c95dfffcc77a8866"
+    },
+    {
+      "path": "licenses/Practical-RIFE-MIT.txt",
+      "bytes": 1062,
+      "sha256": "7932fb49341512b959b1744a6d9cbb39e5a1ec89da438a34d0454d5d8df9fecd"
+    },
+    {
+      "path": "licenses/RIFE-network-MIT.txt",
+      "bytes": 1084,
+      "sha256": "4ce9c78e38e4ef608e68197769652f21058888301245e00bef110418f4863771"
+    }
+  ],
+  "build": {
+    "python": "3.12",
+    "requirements": "scripts/rife/requirements-build.txt",
+    "inputs": {
+      "onnxruntime-directml-1.24.4.nupkg": {
+        "url": "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.directml/1.24.4/microsoft.ml.onnxruntime.directml.1.24.4.nupkg",
+        "sha256": "57e9f11b73437bef7a309496135d4c1f96b1a8e9ddba60013fa27bfc1d788681"
+      },
+      "directml-1.15.4.nupkg": {
+        "url": "https://api.nuget.org/v3-flatcontainer/microsoft.ai.directml/1.15.4/microsoft.ai.directml.1.15.4.nupkg",
+        "sha256": "4e7cb7ddce8cf837a7a75dc029209b520ca0101470fcdf275c1f49736a3615b9"
+      },
+      "flownet_v4.26.pkl": {
+        "url": "https://github.com/HolyWu/vs-rife/releases/download/model/flownet_v4.26.pkl",
+        "sha256": "45c7f74156704769dc9f85cfcaf8552e1e926f9399dcfa3a553dee88fac6f53f"
+      },
+      "flownet_v4.6.pkl": {
+        "url": "https://github.com/HolyWu/vs-rife/releases/download/model/flownet_v4.6.pkl",
+        "sha256": "008646e761f0e67cb77f0c6c44cfe3c3e5a05d9d9465311b9681ca650ce030db"
+      },
+      "Practical-RIFE-MIT.txt": {
+        "url": "https://raw.githubusercontent.com/hzwer/Practical-RIFE/bbfd2ea90910789a860ea3e2b32a240cd577b75e/LICENSE",
+        "sha256": "7932fb49341512b959b1744a6d9cbb39e5a1ec89da438a34d0454d5d8df9fecd"
+      }
+    },
+    "archives": {
+      "onnxruntime-directml-1.24.4.nupkg": {
+        "runtimes/win-x64/native/onnxruntime.dll": "onnxruntime.dll",
+        "runtimes/win-x64/native/onnxruntime_providers_shared.dll": "onnxruntime_providers_shared.dll",
+        "LICENSE": "licenses/ONNXRuntime-LICENSE",
+        "ThirdPartyNotices.txt": "licenses/ONNXRuntime-ThirdPartyNotices.txt"
+      },
+      "directml-1.15.4.nupkg": {
+        "bin/x64-win/DirectML.dll": "DirectML.dll",
+        "LICENSE-CODE.txt": "licenses/DirectML-LICENSE-CODE.txt",
+        "LICENSE.txt": "licenses/DirectML-LICENSE.txt",
+        "ThirdPartyNotices.txt": "licenses/DirectML-ThirdPartyNotices.txt"
+      }
+    }
+  }
+}

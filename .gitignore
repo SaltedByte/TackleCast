@@ -23,6 +23,10 @@ dist/
 # Logs (generated at runtime)
 logs/
 
+# Frame gen diagnostic clips and runtime files
+/recordings/
+/rife/
+
 # Claude
 .claude/
 

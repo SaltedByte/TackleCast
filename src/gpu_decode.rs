@@ -1219,9 +1219,9 @@ mod tests {
     #[test]
     #[ignore = "requires an NVIDIA GPU, DX12/CUDA interop and nvJPEG runtime"]
     fn hardware_nvjpeg_decodes_shared_frame() {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::DX12,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -1229,8 +1229,7 @@ mod tests {
         }))
         .expect("DX12 adapter must be available");
         let (device, _queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
-                .unwrap();
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
         let (_buffers, handles) =
             crate::dx12_interop::SharedGpuBuffers::try_new(&device, 16, 8).unwrap();
         let mut decoder =

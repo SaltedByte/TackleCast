@@ -153,8 +153,7 @@ impl SharedGpuBuffers {
 
         // Access the raw DX12 device via wgpu HAL.
         let raw_resources = unsafe {
-            device.as_hal::<Dx12, _, _>(|hal_device| {
-                let hal_device = hal_device?;
+            device.as_hal::<Dx12>().and_then(|hal_device| {
                 let raw_device: &ID3D12Device = hal_device.raw_device();
 
                 let mut sets = Vec::with_capacity(NUM_BUFFER_SETS);
@@ -255,10 +254,10 @@ fn create_shared_buffer_set(
     set_index: usize,
 ) -> Result<RawBufferSet, String> {
     let (y_resource, y_handle) =
-        create_shared_committed_buffer(device, y_size, &format!("Y-{set_index}"))?;
+        create_shared_committed_buffer(device, y_size, &format!("Y-{set_index}"), false)?;
 
     let (u_resource, u_handle) =
-        match create_shared_committed_buffer(device, uv_size, &format!("U-{set_index}")) {
+        match create_shared_committed_buffer(device, uv_size, &format!("U-{set_index}"), false) {
             Ok(result) => result,
             Err(e) => {
                 unsafe {
@@ -269,7 +268,7 @@ fn create_shared_buffer_set(
         };
 
     let (v_resource, v_handle) =
-        match create_shared_committed_buffer(device, uv_size, &format!("V-{set_index}")) {
+        match create_shared_committed_buffer(device, uv_size, &format!("V-{set_index}"), false) {
             Ok(result) => result,
             Err(e) => {
                 unsafe {
@@ -295,11 +294,14 @@ fn create_shared_buffer_set(
 }
 
 /// Create a single DX12 committed buffer with D3D12_HEAP_FLAG_SHARED and
-/// export an NT shared handle for CUDA import.
+/// export an NT shared handle for CUDA import. `unordered_access` adds
+/// D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, which DirectML requires for
+/// the buffers it reads and writes (frame-generation slots, RIFE backend).
 fn create_shared_committed_buffer(
     device: &ID3D12Device,
     size: u64,
     label: &str,
+    unordered_access: bool,
 ) -> Result<(ID3D12Resource, *mut c_void), String> {
     let heap_properties = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
@@ -322,7 +324,11 @@ fn create_shared_committed_buffer(
             Quality: 0,
         },
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        Flags: D3D12_RESOURCE_FLAG_NONE,
+        Flags: if unordered_access {
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+        } else {
+            D3D12_RESOURCE_FLAG_NONE
+        },
     };
 
     let mut resource: Option<ID3D12Resource> = None;
@@ -396,5 +402,98 @@ unsafe fn close_handle_ptr(handle: *mut c_void) {
         if let Err(e) = CloseHandle(HANDLE(handle)) {
             warn!("CloseHandle failed: {e}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generic shared buffers (frame generation)
+// ---------------------------------------------------------------------------
+
+/// An NT handle to a shared DX12 buffer, closed on drop. CUDA duplicates the
+/// reference when it imports the handle, so closing it afterwards is safe.
+pub struct SharedHandle {
+    pub handle: *mut c_void,
+    pub size: u64,
+}
+
+// SAFETY: NT handles are process-wide kernel object references.
+unsafe impl Send for SharedHandle {}
+
+impl Drop for SharedHandle {
+    fn drop(&mut self) {
+        unsafe {
+            close_handle_if_valid(&mut self.handle);
+        }
+    }
+}
+
+/// Create `count` shared DX12 committed buffers of `size` bytes, wrapped as
+/// wgpu buffers with `usage`, plus one NT handle per buffer for CUDA import.
+/// Returns None when wgpu is not running on DX12 or creation fails.
+pub fn create_shared_buffers(
+    device: &wgpu::Device,
+    count: usize,
+    size: u64,
+    usage: wgpu::BufferUsages,
+    label: &str,
+) -> Option<(Vec<wgpu::Buffer>, Vec<SharedHandle>)> {
+    let raw = unsafe {
+        device.as_hal::<Dx12>().and_then(|hal_device| {
+            let raw_device: &ID3D12Device = hal_device.raw_device();
+            let mut created: Vec<(ID3D12Resource, SharedHandle)> = Vec::with_capacity(count);
+            for i in 0..count {
+                match create_shared_committed_buffer(
+                    raw_device,
+                    size,
+                    &format!("{label}-{i}"),
+                    true,
+                ) {
+                    Ok((resource, handle)) => {
+                        created.push((resource, SharedHandle { handle, size }))
+                    }
+                    Err(e) => {
+                        warn!("failed to create shared DX12 buffer {label}-{i}: {e}");
+                        // Handles already created close via SharedHandle::drop.
+                        return None;
+                    }
+                }
+            }
+            Some(created)
+        })
+    }?;
+
+    let mut buffers = Vec::with_capacity(count);
+    let mut handles = Vec::with_capacity(count);
+    for (resource, handle) in raw {
+        let hal_buffer = unsafe { wgpu::hal::dx12::Device::buffer_from_raw(resource, size) };
+        let buffer = unsafe {
+            device.create_buffer_from_hal::<Dx12>(
+                hal_buffer,
+                &wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size,
+                    usage,
+                    mapped_at_creation: false,
+                },
+            )
+        };
+        buffers.push(buffer);
+        handles.push(handle);
+    }
+    info!("created {count} shared DX12 buffers '{label}' of {size} bytes");
+    Some((buffers, handles))
+}
+
+/// LUID of the DXGI adapter behind the wgpu device, used to pick the CUDA
+/// device that can import its shared resources.
+pub fn adapter_luid(device: &wgpu::Device) -> Option<[u8; 8]> {
+    unsafe {
+        device.as_hal::<Dx12>().map(|hal_device| {
+            let luid = hal_device.raw_device().GetAdapterLuid();
+            let mut bytes = [0_u8; 8];
+            bytes[..4].copy_from_slice(&luid.LowPart.to_le_bytes());
+            bytes[4..].copy_from_slice(&luid.HighPart.to_le_bytes());
+            bytes
+        })
     }
 }

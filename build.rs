@@ -1,4 +1,12 @@
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rerun-if-changed=src/usb_link_windows.c");
+        cc::Build::new()
+            .file("src/usb_link_windows.c")
+            .compile("tacklecast_usb_link");
+        println!("cargo:rustc-link-lib=setupapi");
+        println!("cargo:rustc-link-lib=cfgmgr32");
+    }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         println!("cargo:rerun-if-changed=src/capabilities/v4l2.c");
         cc::Build::new()

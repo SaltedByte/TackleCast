@@ -1,6 +1,6 @@
 [package]
 name = "tacklecast"
-version = "2.3.0"
+version = "3.0.0"
 edition = "2021"
 
 [build-dependencies]
@@ -13,9 +13,11 @@ winresource = "0.1.31"
 bytemuck = { version = "1", features = ["derive"] }
 cpal = "0.15"
 crossbeam-channel = "0.5"
-egui = "0.31"
-egui-wgpu = "0.31"
-egui-winit = "0.31"
+egui = "0.35"
+egui-components = "0.3.0"
+egui_extras = { version = "0.35", default-features = false }
+egui-wgpu = "0.35"
+egui-winit = "0.35"
 ffmpeg-next = "8"
 image = "0.25"
 instant = "0.1"
@@ -26,12 +28,12 @@ time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "time"] }
-wgpu = "24"
+wgpu = "29"
 winit = "0.30"
 libloading = { version = "0.8", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = [
+windows = { version = "0.62", features = [
   "Win32_Media_Audio",
   "Win32_Media_DirectShow",
   "Win32_Media_MediaFoundation",
@@ -40,6 +42,7 @@ windows = { version = "0.58", features = [
   "Win32_System_Diagnostics_Debug",
   "Win32_System_LibraryLoader",
   "Win32_System_Memory",
+  "Win32_System_Ole",
   "Win32_System_Power",
   "Win32_System_Variant",
   "Win32_Devices_FunctionDiscovery",
@@ -53,11 +56,18 @@ windows = { version = "0.58", features = [
   "Win32_Graphics_Dxgi_Common",
   "Win32_Graphics_Gdi",
   "Win32_Security",
+  "Win32_Security_Cryptography",
+  "Win32_Security_Cryptography_Catalog",
+  "Win32_Security_Cryptography_Sip",
+  "Win32_Security_WinTrust",
+  "Win32_System_Console",
 ] }
+# RIFE backend: ONNX Runtime loaded at run time from the `rife` folder.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "directml", "api-24"], optional = true }
 
 [features]
 default = ["gpu-decode"]
-gpu-decode = ["dep:libloading"]
+gpu-decode = ["dep:libloading", "dep:ort"]
 
 [profile.release]
 opt-level = 3
