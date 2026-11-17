@@ -28,6 +28,21 @@ Built for capture cards like the Genki ShadowCast, Elgato, AVerMedia, and other 
 - **Zero recording overhead** - purely a viewer
 - **Settings persistence** - remembers your device selections
 - **Diagnostic logging** - rotating log files for troubleshooting
+- **Frame generation (Windows, optional)** - 2x frame generation (30 -> 60 FPS) with RIFE on DirectML, see [README-FrameGen.md](README-FrameGen.md)
+
+## Frame Generation
+
+Optional 2x frame generation (30 -> 60 FPS) for 30 FPS console games, running on the GPU with RIFE. Off by default. Here's a preview in Red Dead Redemption 2 on a PS5 Pro:
+
+<p align="center">
+  <a href="https://youtu.be/O4NeOv-G_KU">
+    <img src="https://img.youtube.com/vi/O4NeOv-G_KU/maxresdefault.jpg" alt="TackleCast frame generation preview (RDR2, PS5 Pro)" width="720">
+  </a>
+  <br>
+  <a href="https://youtu.be/O4NeOv-G_KU"><b>▶ Watch the preview on YouTube</b></a>
+</p>
+
+Setup, settings, how it works and known issues: [README-FrameGen.md](README-FrameGen.md)
 
 ## Quick Start
 

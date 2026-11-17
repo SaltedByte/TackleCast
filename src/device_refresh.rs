@@ -44,7 +44,7 @@ impl DiscoveredDevices {
 }
 
 enum Phase {
-    Stopping(Settings),
+    Stopping(Box<Settings>),
     Discovering(Receiver<DiscoveredDevices>),
     Finished,
 }
@@ -66,7 +66,7 @@ impl DeviceRefresh {
     }
     pub fn new(settings: Settings, generation: u64) -> Self {
         Self {
-            phase: Phase::Stopping(settings),
+            phase: Phase::Stopping(Box::new(settings)),
             generation,
         }
     }
@@ -79,7 +79,7 @@ impl DeviceRefresh {
         match &self.phase {
             Phase::Stopping(_) if !capture_retired => None,
             Phase::Stopping(settings) => {
-                let settings = settings.clone();
+                let settings = (**settings).clone();
                 let (sender, receiver) = mpsc::channel();
                 self.phase = Phase::Discovering(receiver);
                 std::thread::spawn(move || {

@@ -319,6 +319,13 @@ pub enum CaptureSource {
     TestPattern {
         alternate_formats: bool,
         force_format: Option<PixelFormat>,
+        /// Moving-object pattern with exact frame pacing (frame generation
+        /// tests); ignores the two fields above and always produces NV12.
+        motion: bool,
+        /// Play a TackleCast clip recording (raw NV12 frames) at its recorded
+        /// timing, looping: real gameplay for repeatable frame-generation
+        /// pacing tests without a console. Overrides the fields above.
+        clip: Option<std::path::PathBuf>,
     },
     Device {
         device_name: String,
@@ -365,14 +372,28 @@ impl CaptureThread {
 
         let join_handle = thread::spawn(move || match config.source {
             CaptureSource::TestPattern {
+                clip: Some(clip), ..
+            } => run_clip_playback(
+                clip,
+                config.fps,
+                thread_stop_flag,
+                frame_producer,
+                stats_tx,
+                error_tx,
+                &event_proxy,
+            ),
+            CaptureSource::TestPattern {
                 alternate_formats,
                 force_format,
+                motion,
+                clip: None,
             } => run_test_pattern(
                 config.width,
                 config.height,
                 config.fps,
                 alternate_formats,
                 force_format,
+                motion,
                 thread_stop_flag,
                 frame_producer,
                 stats_tx,
@@ -504,6 +525,124 @@ impl Drop for CaptureThread {
     }
 }
 
+/// Play a clip recorded by TackleCast's clip recorder (`clip.json`,
+/// `index.csv`, `frame_NNNNN.nv12`) at its recorded arrival times, looping.
+fn run_clip_playback(
+    dir: std::path::PathBuf,
+    nominal: FrameRate,
+    stop_flag: Arc<AtomicBool>,
+    mut frame_producer: Producer<CaptureFrame>,
+    stats_tx: Sender<CaptureStats>,
+    error_tx: Sender<String>,
+    event_proxy: &EventLoopProxy<AppEvent>,
+) {
+    let fail = |message: String| {
+        warn!("clip playback: {message}");
+        let _ = error_tx.send(format!("Clip playback: {message}"));
+    };
+    let meta: serde_json::Value = match std::fs::read_to_string(dir.join("clip.json"))
+        .map_err(|e| e.to_string())
+        .and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string()))
+    {
+        Ok(v) => v,
+        Err(e) => return fail(format!("{}: {e}", dir.join("clip.json").display())),
+    };
+    let width = meta["width"].as_u64().unwrap_or(0) as u32;
+    let height = meta["height"].as_u64().unwrap_or(0) as u32;
+    if meta["format"].as_str() != Some("nv12") || width == 0 || height == 0 {
+        return fail("unsupported clip (expected NV12)".into());
+    }
+    let space = match meta["color_space"].as_str() {
+        Some("bt601") => ColorSpace::Bt601,
+        Some("bt2020") => ColorSpace::Bt2020,
+        _ => ColorSpace::Rec709,
+    };
+    let range = if meta["color_range"].as_str() == Some("full") {
+        ColorRange::Full
+    } else {
+        ColorRange::Limited
+    };
+    let frames: Vec<(u32, f64)> = match std::fs::read_to_string(dir.join("index.csv")) {
+        Ok(text) => text
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let mut parts = line.split(',');
+                let i = parts.next()?.trim().parse().ok()?;
+                let t_us: u64 = parts.next()?.trim().parse().ok()?;
+                Some((i, t_us as f64 / 1.0e6))
+            })
+            .collect(),
+        Err(e) => return fail(format!("index.csv: {e}")),
+    };
+    if frames.len() < 2 {
+        return fail("clip has fewer than two frames".into());
+    }
+    let t0 = frames[0].1;
+    let span = frames[frames.len() - 1].1 - t0;
+    let period = span / (frames.len() - 1) as f64;
+    info!(
+        "clip playback: {} ({width}x{height}, {} frames, {:.1} s, {:.2} FPS), looping",
+        dir.display(),
+        frames.len(),
+        span,
+        1.0 / period
+    );
+    let (w, h) = (width as usize, height as usize);
+    let started = Instant::now();
+    let mut loop_offset = 0.0_f64;
+    let mut last_stats_at = Instant::now();
+    let mut counter = 0_u32;
+    'outer: loop {
+        for (index, t) in &frames {
+            if stop_flag.load(Ordering::Relaxed) {
+                break 'outer;
+            }
+            let path = dir.join(crate::framegen::recorder::frame_file(*index));
+            let data = match std::fs::read(&path) {
+                Ok(d) if d.len() >= w * h * 3 / 2 => d,
+                Ok(_) => return fail(format!("{}: truncated", path.display())),
+                Err(e) => return fail(format!("{}: {e}", path.display())),
+            };
+            let deadline = started + Duration::from_secs_f64(loop_offset + (t - t0));
+            let now = Instant::now();
+            if deadline > now {
+                thread::sleep(deadline - now);
+            }
+            let mut y_data = data;
+            let u_data = y_data.split_off(w * h);
+            frame_producer.write(CaptureFrame::Cpu {
+                width,
+                height,
+                format: PixelFormat::Nv12,
+                color_info: ColorInfo {
+                    space: Some(space),
+                    range: Some(range),
+                    ..ColorInfo::default()
+                },
+                y_data,
+                u_data,
+                v_data: Vec::new(),
+            });
+            let _ = event_proxy.send_event(AppEvent::FrameReady);
+            counter += 1;
+            let elapsed = last_stats_at.elapsed();
+            if elapsed >= Duration::from_millis(300) {
+                let _ = stats_tx.send(CaptureStats {
+                    fps: counter as f32 / elapsed.as_secs_f32(),
+                    width,
+                    height,
+                    format_label: "Clip NV12".into(),
+                    nominal_rate: Some(nominal),
+                });
+                last_stats_at = Instant::now();
+                counter = 0;
+            }
+        }
+        loop_offset += span + period;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_test_pattern(
     width: u32,
@@ -511,12 +650,14 @@ fn run_test_pattern(
     fps: FrameRate,
     alternate_formats: bool,
     force_format: Option<PixelFormat>,
+    motion: bool,
     stop_flag: Arc<AtomicBool>,
     mut frame_producer: Producer<CaptureFrame>,
     stats_tx: Sender<CaptureStats>,
     event_proxy: &EventLoopProxy<AppEvent>,
 ) {
     let frame_interval = Duration::from_secs_f64(1.0 / fps.as_f64());
+    let pattern_started = Instant::now();
     let mut frame_index = 0_u64;
     let mut last_stats_at = Instant::now();
     let mut stats_frame_counter = 0_u32;
@@ -531,7 +672,11 @@ fn run_test_pattern(
             }
         });
 
-        let frame = generate_test_frame(width, height, frame_index, format);
+        let frame = if motion {
+            generate_motion_frame(width, height, frame_index)
+        } else {
+            generate_test_frame(width, height, frame_index, format)
+        };
         frame_producer.write(frame);
         let _ = event_proxy.send_event(AppEvent::FrameReady);
 
@@ -557,10 +702,81 @@ fn run_test_pattern(
             stats_frame_counter = 0;
         }
 
-        let spent = loop_started.elapsed();
-        if spent < frame_interval {
-            thread::sleep(frame_interval - spent);
+        if motion {
+            // Absolute deadlines: no drift, so 30 and 29.97 FPS stay exact.
+            let deadline = pattern_started + frame_interval.mul_f64(frame_index as f64);
+            let now = Instant::now();
+            if deadline > now {
+                thread::sleep(deadline - now);
+            }
+        } else {
+            let spent = loop_started.elapsed();
+            if spent < frame_interval {
+                thread::sleep(frame_interval - spent);
+            }
         }
+    }
+}
+
+/// NV12 frame with a textured box moving 16 px/frame and a band of bars
+/// scrolling 8 px/frame: easy to judge interpolation and pacing by eye.
+fn generate_motion_frame(width: u32, height: u32, frame_index: u64) -> CaptureFrame {
+    let (w, h) = (width as usize, height as usize);
+    let mut y_data = vec![0_u8; w * h];
+    let box_size = (h / 6).max(32);
+    let travel = w.saturating_sub(box_size).max(1);
+    let pos = (frame_index as usize * 16) % (2 * travel);
+    let box_x = if pos < travel { pos } else { 2 * travel - pos };
+    let box_y = h / 3;
+    let band_top = h * 3 / 4;
+    let scroll = frame_index as usize * 8;
+    for y in 0..h {
+        let row = &mut y_data[y * w..(y + 1) * w];
+        for (x, value) in row.iter_mut().enumerate() {
+            let background = 40 + (((x / 32) + (y / 32)) % 2) as u8 * 24;
+            let mut v = background;
+            if y >= band_top {
+                v = if ((x + scroll) / 24).is_multiple_of(2) {
+                    200
+                } else {
+                    70
+                };
+            }
+            if x >= box_x && x < box_x + box_size && y >= box_y && y < box_y + box_size {
+                let lx = x - box_x;
+                let ly = y - box_y;
+                v = if ((lx / 12) + (ly / 12)).is_multiple_of(2) {
+                    235
+                } else {
+                    120
+                };
+            }
+            *value = v;
+        }
+    }
+    let mut uv_data = vec![128_u8; w * (h / 2)];
+    for y in 0..h / 2 {
+        for x in 0..w / 2 {
+            let px = x * 2;
+            let py = y * 2;
+            if px >= box_x && px < box_x + box_size && py >= box_y && py < box_y + box_size {
+                uv_data[y * w + x * 2] = 90;
+                uv_data[y * w + x * 2 + 1] = 200;
+            }
+        }
+    }
+    CaptureFrame::Cpu {
+        width,
+        height,
+        format: PixelFormat::Nv12,
+        color_info: ColorInfo {
+            space: Some(ColorSpace::Rec709),
+            range: Some(ColorRange::Full),
+            ..ColorInfo::default()
+        },
+        y_data,
+        u_data: uv_data,
+        v_data: Vec::new(),
     }
 }
 

@@ -1,6 +1,27 @@
 //! Persisted, ordered performance-pill choices. No synthetic telemetry.
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    Hidden,
+    #[default]
+    Compact,
+    Custom,
+}
+
+impl Mode {
+    pub const ALL: [Self; 3] = [Self::Hidden, Self::Compact, Self::Custom];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hidden => "Hidden",
+            Self::Compact => "Compact",
+            Self::Custom => "Custom",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stat {
@@ -11,9 +32,13 @@ pub enum Stat {
     ScalingFilter,
     ColorSpace,
     ColorRange,
+    FrameGeneration,
+    UniqueFps,
+    GeneratedFps,
+    PresentedFps,
 }
 impl Stat {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 11] = [
         Self::Resolution,
         Self::DeliveredFps,
         Self::NominalFps,
@@ -21,16 +46,24 @@ impl Stat {
         Self::ScalingFilter,
         Self::ColorSpace,
         Self::ColorRange,
+        Self::FrameGeneration,
+        Self::UniqueFps,
+        Self::GeneratedFps,
+        Self::PresentedFps,
     ];
     pub fn label(self) -> &'static str {
         match self {
             Self::Resolution => "Resolution",
-            Self::DeliveredFps => "Delivered FPS",
-            Self::NominalFps => "Target / nominal FPS",
+            Self::DeliveredFps => "Capture FPS (Cap)",
+            Self::NominalFps => "Requested FPS (Req)",
             Self::PixelFormat => "Pixel format",
             Self::ScalingFilter => "Scaling filter",
             Self::ColorSpace => "Color space",
             Self::ColorRange => "Color range",
+            Self::FrameGeneration => "Frame generation",
+            Self::UniqueFps => "Source FPS (Src)",
+            Self::GeneratedFps => "Generated FPS (Gen)",
+            Self::PresentedFps => "Presented FPS (Out)",
         }
     }
 }
@@ -89,7 +122,7 @@ impl OverlayLayout {
                 .enumerate()
                 .map(|(i, stat)| StatChoice {
                     stat,
-                    enabled: detailed || i < 4,
+                    enabled: (detailed && i < 7) || i < 4,
                 })
                 .collect(),
         }

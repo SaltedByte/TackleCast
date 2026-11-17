@@ -1,6 +1,6 @@
 [package]
 name = "tacklecast"
-version = "2.3.0"
+version = "3.0.0"
 edition = "2021"
 
 [build-dependencies]
@@ -56,11 +56,18 @@ windows = { version = "0.62", features = [
   "Win32_Graphics_Dxgi_Common",
   "Win32_Graphics_Gdi",
   "Win32_Security",
+  "Win32_Security_Cryptography",
+  "Win32_Security_Cryptography_Catalog",
+  "Win32_Security_Cryptography_Sip",
+  "Win32_Security_WinTrust",
+  "Win32_System_Console",
 ] }
+# RIFE backend: ONNX Runtime loaded at run time from the `rife` folder.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "directml", "api-24"], optional = true }
 
 [features]
 default = ["gpu-decode"]
-gpu-decode = ["dep:libloading"]
+gpu-decode = ["dep:libloading", "dep:ort"]
 
 [profile.release]
 opt-level = 3

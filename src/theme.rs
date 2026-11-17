@@ -5,7 +5,6 @@ use egui::Color32;
 #[derive(Clone, Copy)]
 pub struct Palette {
     pub text_primary: Color32,
-    pub text_secondary: Color32,
     pub text_muted: Color32,
     pub accent: Color32,
     pub accent_hover: Color32,
@@ -27,7 +26,6 @@ impl Palette {
     pub fn for_theme(theme: Theme) -> Self {
         let classic = Self {
             text_primary: Color32::from_rgb(0xE0, 0xE0, 0xE0),
-            text_secondary: Color32::from_rgb(0x88, 0x99, 0xAA),
             text_muted: Color32::from_rgb(0x88, 0x99, 0xAA),
             accent: Color32::from_rgb(0xE9, 0x45, 0x60),
             accent_hover: Color32::from_rgb(0xF4, 0x6A, 0x81),
@@ -49,7 +47,6 @@ impl Palette {
             Theme::Classic => classic,
             Theme::Vice => Self {
                 text_primary: Color32::from_rgb(255, 244, 232),
-                text_secondary: Color32::from_rgb(221, 189, 206),
                 text_muted: Color32::from_rgb(188, 151, 177),
                 accent: Color32::from_rgb(255, 164, 182),
                 accent_hover: Color32::from_rgb(255, 195, 167),

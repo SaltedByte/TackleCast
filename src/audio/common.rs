@@ -74,6 +74,8 @@ pub struct AudioDiagnostics {
     output_info: RwLock<Option<AudioStreamInfo>>,
     underrun_counter: AtomicUsize,
     overrun_counter: AtomicUsize,
+    latency_trims: AtomicU64,
+    latency_trimmed_ms: AtomicU64,
     last_underrun_log: Mutex<Option<Instant>>,
     last_overrun_log: Mutex<Option<Instant>>,
 }
@@ -93,6 +95,8 @@ impl AudioDiagnostics {
             output_info: RwLock::new(None),
             underrun_counter: AtomicUsize::new(0),
             overrun_counter: AtomicUsize::new(0),
+            latency_trims: AtomicU64::new(0),
+            latency_trimmed_ms: AtomicU64::new(0),
             last_underrun_log: Mutex::new(None),
             last_overrun_log: Mutex::new(None),
         }
@@ -165,15 +169,25 @@ impl AudioDiagnostics {
         }
     }
 
+    /// Audio dropped by the latency limiter (called from the output callback,
+    /// so only counters; `log_activity` reports them).
+    pub fn record_latency_trim(&self, ms: usize) {
+        self.latency_trims.fetch_add(1, Ordering::Relaxed);
+        self.latency_trimmed_ms
+            .fetch_add(ms as u64, Ordering::Relaxed);
+    }
+
     pub fn log_activity(&self) {
         let elapsed = self.elapsed_ms();
         tracing::info!(
-            "audio activity: input_samples={}, nonzero_input_samples={}, output_samples={}, input_callback_age_ms={}, output_callback_age_ms={}, status={}",
+            "audio activity: input_samples={}, nonzero_input_samples={}, output_samples={}, input_callback_age_ms={}, output_callback_age_ms={}, latency_trims={} ({} ms dropped), status={}",
             self.input_samples.load(Ordering::Relaxed),
             self.nonzero_input_samples.load(Ordering::Relaxed),
             self.output_samples.load(Ordering::Relaxed),
             elapsed.saturating_sub(self.last_input_ms.load(Ordering::Relaxed).saturating_sub(1)),
             elapsed.saturating_sub(self.last_output_ms.load(Ordering::Relaxed).saturating_sub(1)),
+            self.latency_trims.load(Ordering::Relaxed),
+            self.latency_trimmed_ms.load(Ordering::Relaxed),
             self.status(),
         );
     }
@@ -569,6 +583,69 @@ impl AudioRingBuffer {
     }
 }
 
+impl AudioRingBuffer {
+    /// Discards up to `count` of the oldest samples (consumer side only).
+    pub fn skip(&self, count: usize) -> usize {
+        let read = self.read_index.load(Ordering::Relaxed);
+        let write = self.write_index.load(Ordering::Acquire);
+        let count = count.min(write.wrapping_sub(read));
+        if count > 0 {
+            self.read_index
+                .store(read.wrapping_add(count), Ordering::Release);
+        }
+        count
+    }
+}
+
+/// Keeps the audio delay low. Capture audio queues up in the ring buffer
+/// whenever the output starts later than the input (a Bluetooth headset can
+/// take half a second to open) or the two device clocks drift; without this
+/// that backlog stays for the whole session (0.57 s was measured). When more
+/// than `high` samples stay queued for `hold` samples of playback, the
+/// oldest audio is dropped down to `target`.
+pub struct AudioLatencyLimiter {
+    channels: usize,
+    target: usize,
+    high: usize,
+    hold: usize,
+    over_for: usize,
+}
+
+impl AudioLatencyLimiter {
+    pub const TARGET_MS: usize = 40;
+    pub const HIGH_MS: usize = 100;
+    pub const HOLD_MS: usize = 300;
+
+    pub fn new(sample_rate: u32, channels: u16) -> Self {
+        let channels = channels.max(1) as usize;
+        let per_ms = sample_rate as usize * channels / 1000;
+        Self {
+            channels,
+            target: Self::TARGET_MS * per_ms,
+            high: Self::HIGH_MS * per_ms,
+            hold: Self::HOLD_MS * per_ms,
+            over_for: 0,
+        }
+    }
+
+    /// Called once per output callback that consumes `requested` samples
+    /// with `available` queued. Returns how many samples to drop first
+    /// (whole frames, so channels stay aligned).
+    pub fn excess(&mut self, available: usize, requested: usize) -> usize {
+        if available <= self.high {
+            self.over_for = 0;
+            return 0;
+        }
+        self.over_for += requested;
+        if self.over_for < self.hold {
+            return 0;
+        }
+        self.over_for = 0;
+        let drop = available.saturating_sub(self.target + requested);
+        drop - drop % self.channels
+    }
+}
+
 /// Volume and mute controller that can be safely updated from any thread and read in the audio callback.
 #[derive(Clone)]
 pub struct VolumeController {
@@ -853,6 +930,44 @@ mod tests {
         assert_eq!(out[1], 0.6);
         assert_eq!(out[2], 0.0);
         assert_eq!(out[3], 0.0);
+    }
+
+    #[test]
+    fn latency_limiter_drops_a_lasting_backlog_to_the_target() {
+        // 48 kHz stereo: 96 samples per ms; 10 ms callbacks of 960 samples.
+        let mut limiter = AudioLatencyLimiter::new(48_000, 2);
+        // Within the limit: nothing dropped, however long.
+        for _ in 0..100 {
+            assert_eq!(limiter.excess(96 * 90, 960), 0);
+        }
+        // A 570 ms backlog (as measured): kept for 300 ms, then cut to 40 ms.
+        let backlog = 96 * 570;
+        for _ in 0..29 {
+            assert_eq!(limiter.excess(backlog, 960), 0);
+        }
+        let drop = limiter.excess(backlog, 960);
+        assert_eq!(drop % 2, 0);
+        assert_eq!(backlog - drop, 96 * 40 + 960);
+        // A short burst above the limit is left alone.
+        for _ in 0..5 {
+            assert_eq!(limiter.excess(96 * 150, 960), 0);
+        }
+        assert_eq!(limiter.excess(96 * 50, 960), 0);
+        for _ in 0..5 {
+            assert_eq!(limiter.excess(96 * 150, 960), 0);
+        }
+    }
+
+    #[test]
+    fn ring_buffer_skip_discards_oldest() {
+        let diag = Arc::new(AudioDiagnostics::new());
+        let ring = AudioRingBuffer::new(16, diag);
+        ring.push_samples(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(ring.skip(4), 4);
+        let mut out = [0.0; 4];
+        assert_eq!(ring.pop_samples(&mut out), 2);
+        assert_eq!(&out[..2], &[5.0, 6.0]);
+        assert_eq!(ring.skip(10), 0);
     }
 
     #[test]

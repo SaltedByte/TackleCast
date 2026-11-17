@@ -87,7 +87,9 @@ fn prune_old_logs(logs_dir: &Path) -> std::io::Result<()> {
         .collect();
 
     entries.sort_by_key(|entry| entry.metadata().and_then(|meta| meta.modified()).ok());
-    let remove_count = entries.len().saturating_sub(5);
+    // Keep a good history: replay / benchmark runs also write logs and
+    // must not push out the log of the last play session.
+    let remove_count = entries.len().saturating_sub(39);
     for entry in entries.into_iter().take(remove_count) {
         let _ = fs::remove_file(entry.path());
     }

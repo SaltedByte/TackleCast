@@ -1,7 +1,7 @@
-# TackleCast VI — local edition notes (draft)
+# TackleCast v3.VI — local edition notes (draft)
 
-This is a local, unannounced edition. The application/package version remains
-**2.3.0**; “VI” is display branding, not a version tag. No publication or release
+This is a local, unannounced edition. The application/package version is
+**3.0.0**, branded **v3.VI**. No publication or release
 is implied by this document.
 
 ## Interface
@@ -13,7 +13,7 @@ is implied by this document.
 - Display → Theme previews Vice or Classic immediately. Escape or clicking the
   backdrop saves the draft, including the theme. Classic retains the original
   UI palette; the runtime window icon follows the selected theme.
-- Video, Picture, Audio, and Display remain the four tabs. The settings list uses
+- Video, Picture, Audio, Frame Gen, and Display share the themed settings menu. The settings list uses
   roomier aligned label/control rows, bounded library controls and simple
   section headings. Every page shares fixed columns; Picture sliders and numeric
   fields also share their own columns. There are no per-setting subtitles.
@@ -31,30 +31,37 @@ is implied by this document.
   microphone. Explicit selections are preserved. No unique match prompts manual
   selection in Video and Audio. Playback output remains separate.
 
-## Performance pill
+## Performance overlay
 
-Display → On-screen overlay contains the master switch, four-corner position,
-and a collapsible **Customize statistics** editor. Drag the visible handle or
-use each row’s up/down buttons to reorder the whole statistic with its checkbox
-state intact. Changes preview while the menu is open and save on close.
+Display offers three modes: Hidden, Compact and Custom. New installations
+start in Compact. Hidden suppresses performance statistics; capture/reconnection
+errors remain visible independently.
 
-Available values are resolution, measured delivered FPS, target/nominal FPS,
-active capture pixel format, actual scaling-filter label (including renderer
-fallbacks), color space, and color range. Fractional nominal rates retain their
-exact ratio alongside their decimal display. No latency or decode-duration
-measurements are claimed. The compact default enables resolution, delivered
-FPS, target/nominal FPS, and pixel format. Scaling and color details are optional.
+Compact is a fixed top-left preset, with no statistics/position editor:
+`2560×1440 · 30 → 60 FPS · FG 2×` while interpolation is active, or
+`2560×1440 · 60 FPS` while off/paused. The arrow uses unique source FPS and
+application presented FPS, not transport FPS or measured panel refresh.
 
-Turning every statistic off hides the pill. Turning the master off does the
-same without losing selections. Capture/reconnection status remains separate
-and visible regardless of these choices; errors suppress stale performance data.
+Only Custom exposes the position selector and collapsible statistics editor.
+Resolution has no prefix. Capture/requested/unique/generated/presented rates use
+Cap/Req/Src/Gen/Out. Whole values omit decimal zeroes; fractional values retain
+up to two decimals. Requested rates are stored rationally without duplicating
+that ratio in the overlay. Fields retain their selected order, share one readable
+font size and wrap to available width, without forced two-field rows.
+
+Custom supports resolution, capture/requested rates, format, filter, color space,
+range, FG state and source/generated/presented rates. Drag the handle or use
+Up/Down to reorder rows with their checkbox state. All-off hides Custom's pill.
+Switching modes leaves the saved custom selections/order/corner intact.
 
 ## Saved-settings compatibility
 
-`theme` stores `vice` or `classic`. `show_overlay` remains the master switch.
-`overlay` stores a `corner` and an ordered `stats` list, with a statistic ID and
-an `enabled` flag for each row. On load, duplicate IDs retain the first entry;
-missing IDs are appended disabled. An explicitly empty list means all off.
+`theme` stores vice/classic. `overlay_mode` stores hidden/compact/custom.
+The old `show_overlay` flag is retained for compatibility and synchronized on
+save; older files without a mode migrate to Hidden when their master was off,
+or Custom when it was on, retaining their previous layout. `overlay` retains its
+corner and ordered stats list. Duplicate IDs keep their first entry; missing
+statistics append disabled. An explicitly empty custom list remains all off.
 
 For old files without `overlay`, the old compact preference becomes the new
 compact default; `detailed_overlay: true` enables all seven statistics. The old
@@ -68,7 +75,7 @@ Startup controls are honored **only** alongside an existing synthetic test flag
 
 - `--test-ui=video|picture|audio|display` opens the corresponding settings tab.
 - `--test-ui=overlay` opens Display, expands Customize statistics once, and
-  scrolls the editor into view. All seven rows fit at the default 1280×720 size.
+  scrolls the editor into view. The statistics editor scrolls to the additional frame-generation rows.
 - `--test-ui=none` leaves gameplay visible. Omitting the page does the same.
 - `--test-theme=classic|vice` optionally overrides the theme in memory.
 
@@ -98,3 +105,21 @@ checkbox/arrow/drag events have automated coverage. Synthetic rendering and
 screenshots are separate from physical capture-card validation. Windows icon
 behavior, real device negotiation/recovery, GPU-specific filter fallbacks, and
 long hardware sessions still need their platform/hardware checks from BUILD.md.
+
+## Experimental frame generation integration
+
+Frame Gen adds the optional2x RIFE backend from Wiktor's PR28, off by default,
+with4.26 and4.6 half-resolution-motion choices bundled for720p/1080p/1440p.
+The controls use the same shared columns, switches and selectors as VI's other
+pages, with no per-setting subtitles. It does not change the theme/banner,
+audio preview behavior or zero-capture-frame redraw scheduling.
+
+The performance pill now also offers frame-generation state, unique source FPS,
+generated FPS and presented FPS. These rows can be enabled, reordered and placed
+using the existing Display editor; new choices are disabled during migration.
+Delivered capture FPS retains its original meaning. Presented counters do not
+measure panel refresh or absolute latency. Capture errors still suppress stale
+statistics and remain visible when the overlay master is off.
+
+Local integration candidates are private and require owner testing before any
+GitHub publication. Previous candidates and source branches remain separate.

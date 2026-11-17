@@ -17,9 +17,12 @@ fn settings_pages_render_with_readable_controls() {
             (PreviewPage::Video, false),
             (PreviewPage::Picture, false),
             (PreviewPage::Audio, false),
+            (PreviewPage::FrameGen, false),
             (PreviewPage::Display, false),
             (PreviewPage::Overlay, false),
             (PreviewPage::Video, true),
+            (PreviewPage::None, false),
+            (PreviewPage::None, true),
         ] {
             let ctx = egui::Context::default();
             let mut renderer = egui_wgpu::Renderer::new(
@@ -32,12 +35,16 @@ fn settings_pages_render_with_readable_controls() {
             );
             let mut settings = Settings {
                 theme,
+                framegen_enabled: page == PreviewPage::FrameGen,
                 ..Default::default()
             };
+            if page == PreviewPage::Overlay {
+                settings.set_overlay_mode(crate::overlay::Mode::Custom);
+            }
             let applied = settings.clone();
             let videos = vec!["HD (ShadowCast 3)".to_owned()];
             capabilities::cache_test_device(&videos[0]);
-            if slow_usb {
+            if slow_usb && page != PreviewPage::None {
                 let mut caps = (*capabilities::get_device_capabilities(&videos[0])).clone();
                 caps.usb_warning = crate::usb_link::warning_for_speed(3);
                 capabilities::cache_test_capabilities(&videos[0], caps);
@@ -47,9 +54,15 @@ fn settings_pages_render_with_readable_controls() {
                 name: "ShadowCast 3".into(),
             }];
             let overlay = OverlayInfo {
-                width: None,
-                height: None,
-                fps: None,
+                width: Some(2560),
+                height: Some(1440),
+                fps: Some(60.0),
+                framegen: crate::framegen::FgDiagnostics {
+                    active: slow_usb && page == PreviewPage::None,
+                    unique_fps: 30.0,
+                    displayed_fps: 60.0,
+                    ..Default::default()
+                },
                 filter: ScaleFilter::Bilinear,
                 filter_label: "Bilinear".into(),
                 color_space: ColorSpace::Auto,
@@ -57,7 +70,8 @@ fn settings_pages_render_with_readable_controls() {
                 active_format: None,
                 nominal_rate: None,
                 color_info: ColorInfo::default(),
-                show_overlay: false,
+                show_overlay: page == PreviewPage::None,
+                mode: crate::overlay::Mode::Compact,
                 layout: Default::default(),
                 status_message: None,
                 status_is_alert: false,
@@ -71,8 +85,12 @@ fn settings_pages_render_with_readable_controls() {
                 is_fullscreen: false,
                 audio_status: "Capture unavailable",
                 devices_busy: false,
+                framegen: &crate::framegen::FgDiagnostics::default(),
+                framegen_forced: false,
+                recorder_status: "",
+                recorder_available: false,
             };
-            let mut tab = page.menu_tab().unwrap();
+            let mut tab = page.menu_tab().unwrap_or(MenuTab::Display);
             if page == PreviewPage::Overlay {
                 ctx.data_mut(|data| data.insert_temp(egui::Id::new("test_overlay_focus"), true));
             }
@@ -110,13 +128,17 @@ fn settings_pages_render_with_readable_controls() {
                     },
                     |root| {
                         configure_style(root.ctx(), theme);
-                        draw_menu(
-                            root.ctx(),
-                            &mut settings,
-                            &mut tab,
-                            &frame,
-                            &mut UiOutput::default(),
-                        );
+                        if page == PreviewPage::None {
+                            draw_overlay(root.ctx(), &overlay);
+                        } else {
+                            draw_menu(
+                                root.ctx(),
+                                &mut settings,
+                                &mut tab,
+                                &frame,
+                                &mut UiOutput::default(),
+                            );
+                        }
                     },
                 );
                 for (id, delta) in output.textures_delta.set {
@@ -126,7 +148,7 @@ fn settings_pages_render_with_readable_controls() {
                     .data(|data| {
                         data.get_temp::<Vec<WidgetGeometry>>(egui::Id::new("settings_geometry"))
                     })
-                    .unwrap();
+                    .unwrap_or_default();
                 for shape in &output.shapes {
                     if let egui::Shape::Circle(circle) = &shape.shape {
                         if geometry.iter().any(|widget| {
@@ -207,7 +229,7 @@ fn settings_pages_render_with_readable_controls() {
                 .data(|data| {
                     data.get_temp::<Vec<WidgetGeometry>>(egui::Id::new("settings_geometry"))
                 })
-                .unwrap();
+                .unwrap_or_default();
             // Each fully visible numeric field must contain bright text, not
             // merely a correctly allocated but blank or overpainted rectangle.
             for number in geometry.iter().filter(|record| record.role == "number") {
@@ -235,7 +257,15 @@ fn settings_pages_render_with_readable_controls() {
                 image::save_buffer(
                     directory.join(format!(
                         "{theme:?}-{page:?}{}.png",
-                        if slow_usb { "-USB2" } else { "" }
+                        if slow_usb {
+                            if page == PreviewPage::None {
+                                "-FG"
+                            } else {
+                                "-USB2"
+                            }
+                        } else {
+                            ""
+                        }
                     )),
                     &pixels,
                     width,

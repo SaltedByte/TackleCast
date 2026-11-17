@@ -2,7 +2,12 @@ use crate::capabilities;
 use crate::color::ColorInfo;
 use crate::devices::AudioDevice;
 use crate::frame_rate::FrameRate;
+use crate::framegen::FgDiagnostics;
 use crate::settings::{ColorRange, ColorSpace, ScaleFilter, Settings, Theme, VideoFormat};
+use crate::settings::{
+    FrameGenArtifactMode, FrameGenBackend, FrameGenDebugView, FrameGenMode, FrameGenTarget,
+    RifeModel,
+};
 use crate::theme::Palette;
 use egui::{Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Stroke};
 use egui_components as sc;
@@ -19,6 +24,7 @@ pub enum MenuTab {
     Video,
     Picture,
     Audio,
+    FrameGen,
     Display,
 }
 
@@ -28,6 +34,7 @@ pub enum PreviewPage {
     Video,
     Picture,
     Audio,
+    FrameGen,
     Display,
     Overlay,
 }
@@ -39,6 +46,7 @@ impl PreviewPage {
             Self::Video => Some(MenuTab::Video),
             Self::Picture => Some(MenuTab::Picture),
             Self::Audio => Some(MenuTab::Audio),
+            Self::FrameGen => Some(MenuTab::FrameGen),
             Self::Display | Self::Overlay => Some(MenuTab::Display),
         }
     }
@@ -60,6 +68,7 @@ pub struct OverlayInfo {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub fps: Option<f32>,
+    pub framegen: FgDiagnostics,
     pub filter: ScaleFilter,
     pub filter_label: String,
     pub color_space: ColorSpace,
@@ -68,6 +77,7 @@ pub struct OverlayInfo {
     pub nominal_rate: Option<FrameRate>,
     pub color_info: ColorInfo,
     pub show_overlay: bool,
+    pub mode: crate::overlay::Mode,
     pub layout: crate::overlay::OverlayLayout,
     pub status_message: Option<String>,
     pub status_is_alert: bool,
@@ -82,6 +92,10 @@ pub struct UiFrame<'a> {
     pub is_fullscreen: bool,
     pub audio_status: &'a str,
     pub devices_busy: bool,
+    pub framegen: &'a FgDiagnostics,
+    pub framegen_forced: bool,
+    pub recorder_status: &'a str,
+    pub recorder_available: bool,
 }
 
 pub struct PreparedUi {
@@ -100,6 +114,9 @@ pub struct UiOutput {
     pub video_adjustment_active: bool,
     pub toggle_fullscreen: bool,
     pub exit_requested: bool,
+    pub retry_framegen: bool,
+    /// Start recording a diagnostic clip (raw captured frames).
+    pub record_clip: bool,
     pub repaint_after: Duration,
 }
 
@@ -179,6 +196,8 @@ impl UiState {
             self.tab = tab;
         }
         if page == PreviewPage::Overlay {
+            self.draft_settings
+                .set_overlay_mode(crate::overlay::Mode::Custom);
             self.egui_ctx.data_mut(|data| {
                 data.insert_temp(egui::Id::new("test_overlay_focus"), true);
             });
@@ -228,7 +247,9 @@ impl UiState {
             if self.menu_open {
                 overlay.color_space = self.draft_settings.color_space;
                 overlay.color_range = self.draft_settings.color_range;
-                overlay.show_overlay = self.draft_settings.show_overlay;
+                overlay.show_overlay =
+                    self.draft_settings.overlay_mode() != crate::overlay::Mode::Hidden;
+                overlay.mode = self.draft_settings.overlay_mode();
                 overlay.layout = self.draft_settings.overlay.clone().unwrap_or_default();
             }
             draw_overlay(ctx, &overlay);
@@ -384,7 +405,12 @@ fn draw_overlay(ctx: &egui::Context, overlay: &OverlayInfo) {
     }
 
     use crate::overlay::Corner;
-    let (anchor, offset) = match overlay.layout.corner {
+    let corner = if overlay.mode == crate::overlay::Mode::Custom {
+        overlay.layout.corner
+    } else {
+        Corner::TopLeft
+    };
+    let (anchor, offset) = match corner {
         Corner::TopLeft => (Align2::LEFT_TOP, [12.0, 12.0]),
         Corner::TopRight => (Align2::RIGHT_TOP, [-12.0, 12.0]),
         Corner::BottomLeft => (Align2::LEFT_BOTTOM, [12.0, -12.0]),
@@ -410,17 +436,14 @@ fn draw_overlay(ctx: &egui::Context, overlay: &OverlayInfo) {
             .inner_margin(Margin::symmetric(12, 6))
             .show(ui, |ui| {
                 ui.set_max_width(max_width);
-                ui.spacing_mut().item_spacing.y = 3.0;
-                for (index, line) in text.unwrap_or_default().lines().enumerate() {
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(line)
-                                .font(FontId::monospace(if index == 0 { 13.0 } else { 11.0 }))
-                                .color(if index == 0 { color } else { p.text_secondary }),
-                        )
-                        .wrap(),
-                    );
-                }
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(text.unwrap_or_default())
+                            .font(FontId::monospace(12.0))
+                            .color(color),
+                    )
+                    .wrap(),
+                );
             });
     });
 }
@@ -739,6 +762,9 @@ fn draw_menu(
                                             });
                                         });
                                     }
+                                    MenuTab::FrameGen => {
+                                        framegen_tab(ui, draft, frame, output, text_scale);
+                                    }
                                     MenuTab::Display => {
                                         settings_section(
                                             ui,
@@ -780,11 +806,15 @@ fn draw_menu(
                                             "ON-SCREEN OVERLAY",
                                             text_scale,
                                             |ui| {
-                                                toggle_row(
-                                                    ui,
-                                                    "Show performance pill",
-                                                    &mut draft.show_overlay,
-                                                );
+                                                let mut mode = draft.overlay_mode();
+                                                settings_row(ui, "Overlay mode", |ui| {
+                                                    choice(ui, &mut mode,
+                                                        crate::overlay::Mode::ALL.into_iter()
+                                                            .map(|m| (m, m.label().into())).collect(),
+                                                        "Select mode".into());
+                                                });
+                                                draft.set_overlay_mode(mode);
+                                                if mode == crate::overlay::Mode::Custom {
                                                 let legacy = draft.detailed_overlay;
                                                 let layout =
                                                     draft.overlay.get_or_insert_with(|| {
@@ -819,6 +849,7 @@ fn draw_menu(
                                                             ctx.request_repaint();
                                                         }
                                                     }
+                                                }
                                                 }
                                             },
                                         );
@@ -930,7 +961,7 @@ fn edition_header(ui: &mut egui::Ui, theme: Theme) -> f32 {
     ui.painter().text(
         rect.left_top() + egui::vec2(14.0, 10.0),
         Align2::LEFT_TOP,
-        "TackleCast VI",
+        "TackleCast v3.VI",
         FontId::proportional(23.0),
         p.text_primary,
     );
@@ -1072,11 +1103,12 @@ fn tab_bar(ui: &mut egui::Ui, current_tab: &mut MenuTab, _text_scale: f32) {
         MenuTab::Video,
         MenuTab::Picture,
         MenuTab::Audio,
+        MenuTab::FrameGen,
         MenuTab::Display,
     ];
     let mut selected = tabs.iter().position(|tab| tab == current_tab).unwrap_or(0);
     sc::Tabs::new(&mut selected)
-        .tabs(["Video", "Picture", "Audio", "Display"])
+        .tabs(["Video", "Picture", "Audio", "Frame Gen", "Display"])
         .segmented()
         .show(ui);
     *current_tab = tabs[selected];
@@ -1492,8 +1524,31 @@ fn overlay_text(overlay: &OverlayInfo) -> Option<String> {
         return None;
     }
 
-    if !overlay.show_overlay {
+    if !overlay.show_overlay || overlay.mode == crate::overlay::Mode::Hidden {
         return None;
+    }
+
+    if overlay.mode == crate::overlay::Mode::Compact {
+        let resolution = match (overlay.width, overlay.height) {
+            (Some(w), Some(h)) => format!("{w}\u{00d7}{h}"),
+            _ => "\u{2014}".into(),
+        };
+        let fg = &overlay.framegen;
+        return Some(if fg.active && !fg.paused {
+            format!(
+                "{resolution} \u{00b7} {}\u{2009}\u{2192}\u{2009}{} FPS \u{00b7} FG 2\u{00d7}",
+                compact_rate(fg.unique_fps as f64),
+                compact_rate(fg.displayed_fps as f64)
+            )
+        } else {
+            format!(
+                "{resolution} \u{00b7} {} FPS",
+                overlay
+                    .fps
+                    .map(|rate| compact_rate(rate as f64))
+                    .unwrap_or_else(|| "\u{2014}".into())
+            )
+        });
     }
 
     use crate::overlay::Stat;
@@ -1508,11 +1563,11 @@ fn overlay_text(overlay: &OverlayInfo) -> Option<String> {
             Stat::DeliveredFps => overlay
                 .fps
                 .filter(|fps| fps.is_finite())
-                .map(|fps| format!("{fps:.1}"))
+                .map(|fps| compact_rate(fps as f64))
                 .unwrap_or_else(|| "—".into()),
             Stat::NominalFps => overlay
                 .nominal_rate
-                .map(|rate| format!("{rate} ({})", rate.key()))
+                .map(|rate| compact_rate(rate.as_f64()))
                 .unwrap_or_else(|| "unknown".into()),
             Stat::PixelFormat => overlay
                 .active_format
@@ -1527,34 +1582,230 @@ fn overlay_text(overlay: &OverlayInfo) -> Option<String> {
             }
             Stat::ColorSpace => overlay.color_info.space_label(overlay.color_space, height),
             Stat::ColorRange => overlay.color_info.range_label(overlay.color_range),
+            Stat::FrameGeneration => {
+                if overlay.framegen.active {
+                    if overlay.framegen.paused {
+                        "Paused".into()
+                    } else {
+                        "2\u{00d7}".into()
+                    }
+                } else {
+                    "Off".into()
+                }
+            }
+            Stat::UniqueFps => compact_rate(overlay.framegen.unique_fps as f64),
+            Stat::GeneratedFps => compact_rate(overlay.framegen.generated_fps as f64),
+            Stat::PresentedFps => compact_rate(overlay.framegen.displayed_fps as f64),
         };
         let label = match row.stat {
-            Stat::Resolution => "Video",
-            Stat::DeliveredFps => "FPS",
-            Stat::NominalFps => "Target",
+            Stat::Resolution => "",
+            Stat::DeliveredFps => "Cap",
+            Stat::NominalFps => "Req",
             Stat::PixelFormat => "Format",
             Stat::ScalingFilter => "Filter",
             Stat::ColorSpace => "Color",
             Stat::ColorRange => "Range",
+            Stat::FrameGeneration => "FG",
+            Stat::UniqueFps => "Src",
+            Stat::GeneratedFps => "Gen",
+            Stat::PresentedFps => "Out",
         };
-        cells.push(format!("{label}  {value}"));
+        cells.push(if label.is_empty() {
+            value
+        } else {
+            format!("{label} {value}")
+        });
     }
     if cells.is_empty() {
         return None;
     }
-    // Two values per line: a compact primary pair, followed by secondary data.
-    Some(
-        cells
-            .chunks(2)
-            .map(|row| row.join("  ·  "))
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
+    Some(cells.join(" \u{00b7} "))
+}
+
+fn compact_rate(rate: f64) -> String {
+    if !rate.is_finite() || rate < 0.0 {
+        return "\u{2014}".into();
+    }
+    let text = format!("{rate:.2}");
+    text.trim_end_matches('0').trim_end_matches('.').to_owned()
 }
 
 #[cfg(test)]
 #[path = "ui_render_tests.rs"]
 mod render_tests;
+
+fn framegen_tab(
+    ui: &mut egui::Ui,
+    draft: &mut Settings,
+    frame: &UiFrame<'_>,
+    output: &mut UiOutput,
+    text_scale: f32,
+) {
+    let diag = frame.framegen;
+    settings_section(ui, "EXPERIMENTAL FRAME GENERATION", text_scale, |ui| {
+        let was_enabled = draft.framegen_enabled;
+        toggle_row(ui, "Enable frame generation", &mut draft.framegen_enabled);
+        if draft.framegen_enabled && !was_enabled {
+            draft.framegen_mode = FrameGenMode::Double;
+        }
+        if frame.framegen_forced && !draft.framegen_enabled {
+            warning_text(ui, "Enabled for this test run", text_scale);
+        }
+        // The portable release ships RIFE. FRUC remains available to developer CLI tests.
+        if draft.framegen_backend != FrameGenBackend::Rife {
+            settings_row(ui, "Engine", |ui| {
+                if styled_button(ui, "Use bundled RIFE").clicked() {
+                    draft.framegen_backend = FrameGenBackend::Rife;
+                }
+            });
+        }
+        ui.add_enabled_ui(draft.framegen_enabled || frame.framegen_forced, |ui| {
+            settings_row(ui, "RIFE model", |ui| {
+                choice(
+                    ui,
+                    &mut draft.framegen_rife_model,
+                    [RifeModel::V426Half, RifeModel::V46Half]
+                        .into_iter()
+                        .map(|m| (m, m.to_string()))
+                        .collect(),
+                    "Select a bundled model".into(),
+                );
+            });
+            settings_row(ui, "Output target", |ui| {
+                choice(
+                    ui,
+                    &mut draft.framegen_target,
+                    [FrameGenTarget::Fps60, FrameGenTarget::AlwaysDouble]
+                        .into_iter()
+                        .map(|t| (t, t.to_string()))
+                        .collect(),
+                    "Select output target".into(),
+                );
+            });
+            toggle_row(ui, "Keep HUD steady", &mut draft.framegen_hud_guard);
+            settings_row(ui, "Artifact reduction", |ui| {
+                choice(
+                    ui,
+                    &mut draft.framegen_artifact_mode,
+                    [
+                        FrameGenArtifactMode::Off,
+                        FrameGenArtifactMode::Dynamic,
+                        FrameGenArtifactMode::Advanced,
+                    ]
+                    .into_iter()
+                    .map(|m| (m, m.to_string()))
+                    .collect(),
+                    "Select artifact reduction".into(),
+                );
+            });
+            if draft.framegen_artifact_mode != FrameGenArtifactMode::Off {
+                toggle_row(ui, "Protect static areas", &mut draft.framegen_fix_static);
+                toggle_row(ui, "Correct motion", &mut draft.framegen_fix_motion);
+                toggle_row(ui, "Correct edges", &mut draft.framegen_fix_edges);
+                toggle_row(
+                    ui,
+                    "Stabilize transitions",
+                    &mut draft.framegen_fix_transitions,
+                );
+            }
+        });
+    });
+    settings_section(ui, "STATUS", text_scale, |ui| {
+        settings_row(ui, "Frame generation", |ui| {
+            ui.add(egui::Label::new(&diag.state).wrap());
+        });
+        if diag.active {
+            for (label, value) in [
+                ("Unique source FPS", format!("{:.1}", diag.unique_fps)),
+                ("Generated FPS", format!("{:.1}", diag.generated_fps)),
+                ("Presented FPS", format!("{:.1}", diag.displayed_fps)),
+                (
+                    "Inference time",
+                    format!("{:.1} ms", diag.fruc_time.mean_ms),
+                ),
+                (
+                    "Scheduling delay",
+                    format!("{:.1} ms", diag.added_latency_ms),
+                ),
+            ] {
+                settings_row(ui, label, |ui| {
+                    ui.label(value);
+                });
+            }
+        }
+        if diag.state.starts_with("Unavailable") {
+            settings_row(ui, "Recovery", |ui| {
+                if styled_button(ui, "Retry frame generation").clicked() {
+                    output.retry_framegen = true;
+                }
+            });
+        }
+    });
+    egui::CollapsingHeader::new("Diagnostics").show(ui, |ui| {
+        settings_row(ui, "Generated view", |ui| {
+            choice(
+                ui,
+                &mut draft.framegen_debug_view,
+                [
+                    FrameGenDebugView::Final,
+                    FrameGenDebugView::RawFruc,
+                    FrameGenDebugView::CorrectionOverlay,
+                ]
+                .into_iter()
+                .map(|v| (v, v.to_string()))
+                .collect(),
+                "Select view".into(),
+            );
+        });
+        for (bit, label) in [
+            (crate::render::ZONE_TOP_LEFT, "Protect top left"),
+            (crate::render::ZONE_TOP_RIGHT, "Protect top right"),
+            (crate::render::ZONE_BOTTOM_LEFT, "Protect bottom left"),
+            (crate::render::ZONE_BOTTOM_RIGHT, "Protect bottom right"),
+        ] {
+            let mut selected = draft.framegen_manual_zones & bit != 0;
+            toggle_row(ui, label, &mut selected);
+            if selected {
+                draft.framegen_manual_zones |= bit;
+            } else {
+                draft.framegen_manual_zones &= !bit;
+            }
+        }
+        if draft.framegen_manual_zones != 0 {
+            settings_row(ui, "Region width (%)", |ui| {
+                slider_and_number(
+                    ui,
+                    &mut draft.framegen_manual_zone_width,
+                    5.0..=40.0,
+                    1.0,
+                    0,
+                );
+            });
+            settings_row(ui, "Region height (%)", |ui| {
+                slider_and_number(
+                    ui,
+                    &mut draft.framegen_manual_zone_height,
+                    5.0..=40.0,
+                    1.0,
+                    0,
+                );
+            });
+        }
+        settings_row(ui, "Record capture", |ui| {
+            ui.add_enabled_ui(frame.recorder_available, |ui| {
+                if styled_button(ui, "Record 10 seconds")
+                    .on_hover_text("Saves raw capture frames; may use several GB of disk space")
+                    .clicked()
+                {
+                    output.record_clip = true;
+                }
+            });
+        });
+        if !frame.recorder_status.is_empty() {
+            ui.add(egui::Label::new(frame.recorder_status).wrap());
+        }
+    });
+}
 
 #[cfg(test)]
 mod tests {
@@ -1611,6 +1862,10 @@ mod tests {
                                 is_fullscreen: false,
                                 audio_status: "Disconnected",
                                 devices_busy: false,
+                                framegen: &FgDiagnostics::default(),
+                                framegen_forced: false,
+                                recorder_status: "",
+                                recorder_available: false,
                             },
                             &mut UiOutput::default(),
                         );
@@ -1780,6 +2035,10 @@ mod tests {
                             is_fullscreen: false,
                             audio_status: "No capture audio selected",
                             devices_busy: false,
+                            framegen: &FgDiagnostics::default(),
+                            framegen_forced: false,
+                            recorder_status: "",
+                            recorder_available: false,
                         },
                     );
                     if let Some(live) = &output.output.live_settings {
@@ -1929,9 +2188,26 @@ mod tests {
         assert!(test.draws > before);
         test.click("Display");
         assert_eq!(test.ui.tab, MenuTab::Display);
-        let overlay_was_enabled = test.ui.draft_settings.show_overlay;
-        test.click_at(test.control("Show performance pill", "control").center());
-        assert_ne!(test.ui.draft_settings.show_overlay, overlay_was_enabled);
+        let custom_layout = test.ui.draft_settings.overlay.clone();
+        test.click("Compact");
+        test.click("Hidden");
+        assert_eq!(
+            test.ui.draft_settings.overlay_mode(),
+            crate::overlay::Mode::Hidden
+        );
+        test.click("Hidden");
+        test.click("Custom");
+        assert_eq!(
+            test.ui.draft_settings.overlay_mode(),
+            crate::overlay::Mode::Custom
+        );
+        assert_eq!(test.ui.draft_settings.overlay, custom_layout);
+        test.click("Custom");
+        test.click("Compact");
+        assert_eq!(
+            test.ui.draft_settings.overlay_mode(),
+            crate::overlay::Mode::Compact
+        );
         test.click("Classic");
         assert_eq!(test.ui.draft_settings.theme, Theme::Classic);
         test.click("Picture");
@@ -1945,6 +2221,18 @@ mod tests {
         test.click("Reset to defaults");
         assert_eq!(test.ui.draft_settings.brightness, 0.0);
         assert!(test.saw_undimmed_picture);
+        test.click("Frame Gen");
+        assert_eq!(test.ui.tab, MenuTab::FrameGen);
+        test.click_at(test.control("Enable frame generation", "control").center());
+        assert!(test.ui.draft_settings.framegen_enabled);
+        assert_eq!(test.ui.draft_settings.framegen_mode, FrameGenMode::Double);
+        let selected_model = test.ui.draft_settings.framegen_rife_model.to_string();
+        test.click(&selected_model);
+        test.click(&RifeModel::V46Half.to_string());
+        assert_eq!(
+            test.ui.draft_settings.framegen_rife_model,
+            RifeModel::V46Half
+        );
         test.click("Audio");
         let slider = test.control("Volume (%)", "slider");
         test.click_at(egui::pos2(
@@ -2029,7 +2317,7 @@ mod tests {
             .shapes
             .iter()
             .find_map(|shape| match &shape.shape {
-                egui::Shape::Text(text) if text.galley.job.text == "TackleCast VI" => {
+                egui::Shape::Text(text) if text.galley.job.text == "TackleCast v3.VI" => {
                     Some(text.pos)
                 }
                 _ => None,
@@ -2134,6 +2422,7 @@ mod tests {
         OverlayInfo {
             width: Some(1920),
             height: Some(1080),
+            framegen: FgDiagnostics::default(),
             fps: Some(59.8),
             filter: ScaleFilter::Bilinear,
             filter_label: "Bilinear (RTX VSR unavailable)".into(),
@@ -2143,25 +2432,165 @@ mod tests {
             nominal_rate: Some("60000/1001".parse().unwrap()),
             color_info: ColorInfo::default(),
             show_overlay: true,
+            mode: crate::overlay::Mode::Custom,
             layout: crate::overlay::OverlayLayout::default(),
             status_message: None,
             status_is_alert: false,
         }
     }
     #[test]
-    fn overlay_choices_control_order_exact_rate_and_real_fallback_label() {
+    fn compact_overlay_uses_unique_to_presented_fps_and_ignores_custom_choices() {
+        let mut overlay = sample();
+        overlay.mode = crate::overlay::Mode::Compact;
+        overlay.width = Some(2560);
+        overlay.height = Some(1440);
+        overlay.fps = Some(60.0); // Capture may carry duplicates of 30 unique frames.
+        for row in &mut overlay.layout.stats {
+            row.enabled = false;
+        }
+        assert_eq!(
+            overlay_text(&overlay).as_deref(),
+            Some("2560×1440 · 60 FPS")
+        );
+        overlay.framegen.active = true;
+        overlay.framegen.unique_fps = 30.0;
+        overlay.framegen.displayed_fps = 60.0;
+        assert_eq!(
+            overlay_text(&overlay).as_deref(),
+            Some("2560×1440 · 30 → 60 FPS · FG 2×")
+        );
+        overlay.framegen.paused = true;
+        assert_eq!(
+            overlay_text(&overlay).as_deref(),
+            Some("2560×1440 · 60 FPS")
+        );
+        overlay.framegen.paused = false;
+        overlay.framegen.active = false;
+        overlay.fps = Some(59.94);
+        assert_eq!(
+            overlay_text(&overlay).as_deref(),
+            Some("2560×1440 · 59.94 FPS")
+        );
+        overlay.mode = crate::overlay::Mode::Hidden;
+        assert_eq!(overlay_text(&overlay), None);
+        overlay.mode = crate::overlay::Mode::Custom;
+        assert_eq!(overlay_text(&overlay), None, "Custom all-off stays all-off");
+    }
+
+    #[test]
+    fn custom_overlay_keeps_short_labels_order_and_no_forced_rows() {
+        let mut overlay = sample();
+        for row in &mut overlay.layout.stats {
+            row.enabled = true;
+        }
+        overlay.fps = Some(30.0);
+        overlay.nominal_rate = Some("30".parse().unwrap());
+        overlay.framegen.unique_fps = 30.0;
+        overlay.framegen.generated_fps = 30.0;
+        overlay.framegen.displayed_fps = 60.0;
+        let text = overlay_text(&overlay).unwrap();
+        for expected in [
+            "1920×1080",
+            "Cap 30",
+            "Req 30",
+            "Src 30",
+            "Gen 30",
+            "Out 60",
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+        for obsolete in [
+            "Video ",
+            "30.0",
+            "30 (30)",
+            "Unique FPS",
+            "Presented FPS",
+            "\n",
+        ] {
+            assert!(!text.contains(obsolete), "{text}");
+        }
+        assert_eq!(compact_rate(f64::NAN), "—");
+        assert_eq!(compact_rate(f64::INFINITY), "—");
+    }
+
+    #[test]
+    fn only_custom_mode_exposes_statistics_and_position_controls() {
+        for mode in crate::overlay::Mode::ALL {
+            let ctx = egui::Context::default();
+            let mut settings = Settings::default();
+            settings.set_overlay_mode(mode);
+            let overlay = sample();
+            let frame = UiFrame {
+                overlay: &overlay,
+                settings: &Settings::default(),
+                video_devices: &[],
+                audio_inputs: &[],
+                audio_outputs: &[],
+                is_fullscreen: false,
+                audio_status: "",
+                devices_busy: false,
+                framegen: &FgDiagnostics::default(),
+                framegen_forced: false,
+                recorder_status: "",
+                recorder_available: false,
+            };
+            let mut text = String::new();
+            for _ in 0..3 {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1280.0, 720.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |root| {
+                        configure_style(root.ctx(), settings.theme);
+                        draw_menu(
+                            root.ctx(),
+                            &mut settings,
+                            &mut MenuTab::Display,
+                            &frame,
+                            &mut UiOutput::default(),
+                        );
+                    },
+                );
+                text = output
+                    .shapes
+                    .into_iter()
+                    .filter_map(|s| match s.shape {
+                        egui::Shape::Text(t) => Some(t.galley.job.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            assert!(text.contains("Overlay mode"));
+            assert_eq!(
+                text.contains("Customize statistics"),
+                mode == crate::overlay::Mode::Custom
+            );
+            assert_eq!(
+                text.contains("Position"),
+                mode == crate::overlay::Mode::Custom
+            );
+        }
+    }
+
+    #[test]
+    fn overlay_choices_control_order_fractional_rate_and_real_fallback_label() {
         let mut overlay = sample();
         overlay.layout.stats.reverse();
         let text = overlay_text(&overlay).unwrap();
-        assert!(text.starts_with("Format  NV12"));
-        assert!(text.contains("60000/1001"));
+        assert!(text.starts_with("Format NV12"));
+        assert!(text.contains("Req 59.94"));
         assert!(text.contains("59.8"));
         for row in &mut overlay.layout.stats {
             row.enabled = row.stat == crate::overlay::Stat::ScalingFilter;
         }
         assert_eq!(
             overlay_text(&overlay).unwrap(),
-            "Filter  Bilinear (RTX VSR unavailable)"
+            "Filter Bilinear (RTX VSR unavailable)"
         );
         for row in &mut overlay.layout.stats {
             row.enabled = false;
@@ -2176,6 +2605,7 @@ mod tests {
             (PreviewPage::Video, Some(MenuTab::Video)),
             (PreviewPage::Picture, Some(MenuTab::Picture)),
             (PreviewPage::Audio, Some(MenuTab::Audio)),
+            (PreviewPage::FrameGen, Some(MenuTab::FrameGen)),
             (PreviewPage::Display, Some(MenuTab::Display)),
             (PreviewPage::Overlay, Some(MenuTab::Display)),
         ] {
@@ -2187,6 +2617,7 @@ mod tests {
     fn overlay_preview_opens_editor_and_scrolls_all_rows_into_view() {
         let ctx = egui::Context::default();
         let mut settings = Settings::default();
+        settings.set_overlay_mode(crate::overlay::Mode::Custom);
         let applied = settings.clone();
         let overlay = sample();
         let frame = UiFrame {
@@ -2198,17 +2629,34 @@ mod tests {
             is_fullscreen: false,
             audio_status: "Not running",
             devices_busy: false,
+            framegen: &FgDiagnostics::default(),
+            framegen_forced: false,
+            recorder_status: "",
+            recorder_available: false,
         };
         let mut tab = MenuTab::Display;
         ctx.data_mut(|data| data.insert_temp(egui::Id::new("test_overlay_focus"), true));
         let mut visible = Vec::new();
-        for _ in 0..12 {
+        for pass in 0..28 {
             let output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
                         egui::vec2(1280.0, 720.0),
                     )),
+                    events: if pass == 12 {
+                        vec![
+                            egui::Event::PointerMoved(egui::pos2(600.0, 400.0)),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point,
+                                phase: egui::TouchPhase::Move,
+                                delta: egui::vec2(0.0, -600.0),
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ]
+                    } else {
+                        vec![]
+                    },
                     ..Default::default()
                 },
                 |root_ui| {
@@ -2223,19 +2671,21 @@ mod tests {
                     );
                 },
             );
-            visible = output
-                .shapes
-                .into_iter()
-                .filter_map(|shape| {
-                    if let egui::Shape::Text(text) = shape.shape {
-                        let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
-                        if shape.clip_rect.contains_rect(rect) {
-                            return Some(text.galley.job.text.clone());
+            visible.extend(
+                output
+                    .shapes
+                    .into_iter()
+                    .filter_map(|shape| {
+                        if let egui::Shape::Text(text) = shape.shape {
+                            let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                            if shape.clip_rect.contains_rect(rect) {
+                                return Some(text.galley.job.text.clone());
+                            }
                         }
-                    }
-                    None
-                })
-                .collect();
+                        None
+                    })
+                    .collect::<Vec<_>>(),
+            );
         }
         for stat in &crate::overlay::OverlayLayout::default().stats {
             assert!(
@@ -2253,6 +2703,7 @@ mod tests {
     fn display_menu_exposes_theme_and_collapsible_editor_in_headless_frame() {
         let ctx = egui::Context::default();
         let mut settings = Settings::default();
+        settings.set_overlay_mode(crate::overlay::Mode::Custom);
         let overlay = sample();
         let frame = UiFrame {
             overlay: &overlay,
@@ -2263,6 +2714,10 @@ mod tests {
             is_fullscreen: false,
             audio_status: "Not running",
             devices_busy: false,
+            framegen: &FgDiagnostics::default(),
+            framegen_forced: false,
+            recorder_status: "",
+            recorder_available: false,
         };
         let mut tab = MenuTab::Display;
         let mut texts = String::new();
@@ -2295,7 +2750,7 @@ mod tests {
                 }
             }
         }
-        assert!(texts.contains("TackleCast VI"), "{texts}");
+        assert!(texts.contains("TackleCast v3.VI"), "{texts}");
         assert!(texts.contains("Theme"), "{texts}");
         assert!(texts.contains("Customize statistics"), "{texts}");
     }
@@ -2413,7 +2868,7 @@ mod tests {
             .filter(|(text, _)| text == "::")
             .map(|(_, pos)| *pos)
             .collect();
-        assert_eq!(handles.len(), 7);
+        assert_eq!(handles.len(), Stat::ALL.len());
         let (from, to) = (handles[0], handles[6]);
         editor_frame(
             &ctx,
@@ -2468,6 +2923,10 @@ mod tests {
                             is_fullscreen: false,
                             audio_status: "Not running",
                             devices_busy: false,
+                            framegen: &FgDiagnostics::default(),
+                            framegen_forced: false,
+                            recorder_status: "",
+                            recorder_available: false,
                         },
                         &mut UiOutput::default(),
                     );
@@ -2565,6 +3024,10 @@ mod tests {
                     is_fullscreen: false,
                     audio_status: "Not running",
                     devices_busy: false,
+                    framegen: &FgDiagnostics::default(),
+                    framegen_forced: false,
+                    recorder_status: "",
+                    recorder_available: false,
                 };
                 let mut previous_size = None;
                 let mut label_left = None;
@@ -2576,6 +3039,7 @@ mod tests {
                     MenuTab::Video,
                     MenuTab::Picture,
                     MenuTab::Audio,
+                    MenuTab::FrameGen,
                     MenuTab::Display,
                 ] {
                     for pass in 0..3 {

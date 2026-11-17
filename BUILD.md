@@ -227,3 +227,86 @@ Create a version tag matching `Cargo.toml` (for example, `v2.2.0`) to release. T
 Manual dispatch requires an existing version tag and builds that tag's commit. Publication is off by default; enable the `publish` input only when you want a GitHub Release. Forks can validate and generate artifacts without publishing upstream releases. Build jobs have read-only repository access; only the publication job receives release-writing permissions.
 
 Both packages include `build-info.json` with their source commit and version, and dependency license/source information. Packaging always invokes Cargo before copying the executable, so an existing binary cannot silently bypass the build.
+
+## Frame generation
+
+The frame generation code lives in `src/framegen/`, `src/render_framegen.rs` and `src/render_framegen_fix.rs`, and builds with the normal steps above (default features). Nothing extra is needed at compile time:
+
+- RIFE: `onnxruntime.dll`, `onnxruntime_providers_shared.dll`, `DirectML.dll` and the models are loaded at runtime from a `rife` folder next to the exe. Take that folder from the release zip, or rebuild the models with `scripts/rife/export_models.py`.
+- NVIDIA FRUC: `nvcuda.dll` comes with the driver, `NvOFFRUC.dll` / `cudart64_110.dll` come from your own Optical Flow SDK 5.0.7 and can't be redistributed.
+
+`cargo test -- --ignored` also runs the GPU tests (needs a working wgpu adapter).
+
+## VI plus frame generation: complete portable Windows candidate
+
+The integrated candidate keeps VI's egui0.35/wgpu29/Windows0.62 stack. Frame
+Gen uses the same themed, aligned component controls as the other pages.
+Generated/unique/presented FPS and FG state are optional rows in the existing
+reorderable overlay. Existing VI layouts retain their order/enabled choices;
+new rows start disabled. Legacy PR28 diagnostic-overlay preferences migrate
+once into those rows. The separate diagnostic overlay is no longer drawn.
+
+The portable bundle includes RIFE4.26/4.6 half-resolution-motion models at720p,
+1080p and1440p, ONNX Runtime DirectML1.24.4 and DirectML1.15.4. Runtime/model/license
+bytes are pinned in `scripts/framegen-assets.json`. Prepare a verified asset
+folder with the manifest's paths, including its `licenses/` entries, and pass
+it as `-FrameGenDir` (or place it in `.deps/rife`). Model export is a build-time
+operation using `scripts/rife/export_models.py`; users do not run Python or
+download models. Preserve model dimensions/stems and verify ONNX graph/weight
+completeness before changing the asset manifest. Do not commit binary weights.
+
+```powershell
+. .\scripts\windows_build_environment.ps1
+.\scripts\package_rust_release.ps1 -PackageName TackleCast-VI-FrameGen-Test -RequireGpuDlls -RequireFrameGen -FrameGenDir C:\BuildAssets\rife -Zip
+python scripts/verify_package.py --package dist/TackleCast-VI-FrameGen-Test --require-gpu
+```
+
+Packaging checks every pinned asset before copying it and excludes other models.
+It also copies Microsoft's licensed release x64 CRT DLLs app-locally from the
+installed Visual Studio Redist directory (`-VcRuntimeDir` can select it), checks
+Microsoft signatures, and records versions/hashes in `build-info.json`. App-local
+CRT servicing belongs to each package update; test extraction on clean Windows
+as well as checking a developer PC with development DLL directories removed.
+No driver, Python, CUDA toolkit, NVIDIA Optical Flow SDK or TensorRT install is
+required for the bundled RIFE path. FRUC remains a developer-only CLI choice;
+manual SDK paths are not exposed in normal settings. Full-resolution-motion and
+4K model files are not included. Unsupported FG sizes leave normal video usable.
+
+Frame generation remains off by default. The existing half-period/adaptive
+scheduling and GPU composition path from PR28 are retained; no experimental
+DirectML graph capture or TensorRT changes from separate research are enabled.
+Internal scheduling delay is not total HDMI-to-screen latency. Validate model
+changes and reinitialization/resolution changes with actual device testing;
+unit and synthetic GPU tests do not establish physical latency or visual quality.
+
+## v3.VI overlay presets
+
+Package version3.0.0 is branded v3.VI. Overlay mode is Hidden/Compact/Custom;
+only Custom has the position/statistics editor. New settings default to Compact,
+while older saved masters migrate to Hidden/Custom and retain their layout.
+The Compact arrow reports unique-source to application-presented FPS; it must
+not use delivered capture FPS as its source when capture contains duplicates.
+Rates are formatted compactly; capture/requested fractions remain exact in the
+settings/capture pipeline. Recovery status remains independent of Hidden mode.
+The zero-capture-frame native test exercises all three selector choices and
+preserves the custom layout. Offscreen previews include Compact FG on/off in
+both themes, in addition to the settings pages and expanded Custom editor.
+
+## Automated bundled-model preparation
+
+Windows default-feature PR CI and the tagged Windows release build both run the
+same complete-payload preparation and require FG files during package verification.
+`python scripts/setup_framegen.py` downloads hash-pinned ONNX Runtime/DirectML
+NuGet packages, RIFE4.26/4.6 weights and the upstream license, then exports exactly
+the six supported models with the pinned CPU-only Python3.12 build requirements.
+Install those requirements in a build-only venv with
+`python -m pip install -r scripts/rife/requirements-build.txt`. There is no model
+export or Python requirement on the end user's PC. Every generated model/runtime/
+notice must match `scripts/framegen-assets.json` before installation into `.deps/rife`.
+The script verifies an existing cache before reusing it. `--verify-only` validates
+an existing output without downloads/export. `--output`/`--cache` support isolated
+build checks. Binary weights/models are not committed to Git.
+
+Release publication is still triggered only by an explicit version tag or manual
+release dispatch with publication enabled. Merging the feature PR into main runs
+CI, including package validation, without creating a tag or GitHub Release.
