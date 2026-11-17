@@ -6,9 +6,13 @@ It doubles the frame rate (30 -> 60). It's off by default; everything else works
 
 Here's a short preview of how it looks in RDR2:
 
-[![TackleCast FrameGen preview on YouTube](https://img.youtube.com/vi/O4NeOv-G_KU/hqdefault.jpg)](https://youtu.be/O4NeOv-G_KU)
-
-[Watch the preview on YouTube](https://youtu.be/O4NeOv-G_KU)
+<p align="center">
+  <a href="https://youtu.be/O4NeOv-G_KU">
+    <img src="https://img.youtube.com/vi/O4NeOv-G_KU/maxresdefault.jpg" alt="TackleCast frame generation preview (RDR2, PS5 Pro)" width="720">
+  </a>
+  <br>
+  <a href="https://youtu.be/O4NeOv-G_KU"><b>▶ Watch the preview on YouTube</b></a>
+</p>
 
 My setup, so you know what it was actually tested on:
 
