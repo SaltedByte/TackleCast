@@ -4,6 +4,12 @@ This is TackleCast 2.3.0 with frame generation built in. I play on a PS5 Pro thr
 
 It doubles the frame rate (30 -> 60). It's off by default; everything else works the same as normal TackleCast.
 
+Here's a short preview of how it looks in RDR2:
+
+[![TackleCast FrameGen preview on YouTube](https://img.youtube.com/vi/O4NeOv-G_KU/hqdefault.jpg)](https://youtu.be/O4NeOv-G_KU)
+
+[Watch the preview on YouTube](https://youtu.be/O4NeOv-G_KU)
+
 My setup, so you know what it was actually tested on:
 
 - PS5 Pro -> Unitek SAV2503 capture card (2560x1440 @ 30, NV12)
