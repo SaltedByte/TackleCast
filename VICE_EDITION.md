@@ -7,9 +7,9 @@ is implied by this document.
 ## Interface
 
 - Vice is the default theme: deep aubergine surfaces, warm text, peach/pink
-  accents, and an original coastal header confined to the settings menu.
-  The full-bleed header scales to the image's original aspect ratio so the entire
-  banner stays visible. Its height adapts to the menu width; settings scroll below.
+  accents, and a GTA VI skyline screenshot supplied by the owner, confined to the settings menu.
+  The full-bleed header trims excess sky and foreground water while retaining
+  the full skyline width at the existing 4:1 banner ratio. Its height adapts to the menu width; settings scroll below.
 - Display → Theme previews Vice or Classic immediately. Escape or clicking the
   backdrop saves the draft, including the theme. Classic retains the original
   UI palette; the runtime window icon follows the selected theme.

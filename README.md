@@ -4,147 +4,73 @@
   <img src="assets/icon.png" alt="TackleCast" width="128">
 </p>
 
-**A lightweight, GPU-accelerated capture card viewer for Windows and Linux.** No recording, no bloat, just your game on your screen.
+**Play your console on your PC screen.**
 
-Built for capture cards like the Genki ShadowCast, Elgato, AVerMedia, and other UVC-compliant devices. Written in Rust with a zero-copy GPU pipeline and low-latency audio passthrough.
+TackleCast is a lightweight capture card viewer for Windows and Linux. Connect your console through a USB capture card, open TackleCast, and play in a window or fullscreen, with sound through your PC's speakers or headphones.
 
-## Features
+Built for playing rather than managing a stream, it keeps your game front and center and puts picture, sound, and display settings a press of Escape away.
 
-- **GPU-accelerated rendering** via wgpu with a custom YUV-to-RGB shader
-- **NVIDIA GPU MJPEG decode on Windows** via nvJPEG/CUDA (automatic fallback to software decode)
-- **Zero-copy MJPEG pipeline on supported NVIDIA/Windows systems** - decoded frames stay on the GPU (CUDA to DX12 to wgpu)
-- **Low-latency audio passthrough** via WASAPI (Windows) and ALSA, including PipeWire/PulseAudio compatibility plugins (Linux)
-- **Robust audio resampling & channel conversion** - handles mono, stereo, and variable sample rates (e.g. PS4/PS5/Switch audio over USB capture cards)
-- **Audio mute toggle & UI status** - mute control with real-time audio connection status
-- **Cross-platform video capture** - DirectShow on Windows, V4L2 on Linux
-- **Device-supported modes** - resolutions, pixel formats, and frame rates reported by the selected card, including fractional rates
-- **Visible format negotiation** - Auto prefers NV12, then MJPEG at the selected resolution and FPS, and shows the format actually opened
-- **Color controls** - metadata-aware color space and range, with explicitly labeled defaults and manual overrides
-- **Live picture controls** - brightness, contrast, saturation, gamma, and reset
-- **Live FPS counter** with separate nominal and delivered frame rates
-- **Auto-detect capture cards** via DirectShow and V4L2
-- **Four-tab settings** - Video, Picture, Audio, and Display, retaining the coral/navy theme
-- **Fullscreen support** (F11 or toggle in settings)
-- **Zero recording overhead** - purely a viewer
-- **Settings persistence** - remembers your device selections
-- **Diagnostic logging** - rotating log files for troubleshooting
-- **Frame generation (Windows, optional)** - 2x frame generation (30 -> 60 FPS) with RIFE on DirectML, see [README-FrameGen.md](README-FrameGen.md)
+## What you can do
 
-## Frame Generation
+- **Play on your existing setup.** Use capture cards such as the Genki ShadowCast, Elgato, AVerMedia, and other compatible USB capture devices.
+- **Make the picture your own.** Adjust brightness, contrast, saturation, gamma, and scaling while previewing the result.
+- **Choose where you listen.** Select your capture card's audio and your preferred speakers or headphones, with volume and mute controls in the app.
+- **Try smoother motion.** Optional frame generation on Windows adds intermediate frames, turning supported 30 FPS capture into 60 FPS output.
+- **Keep the screen clean.** Choose a compact performance readout, customize the statistics you see, or hide them altogether.
+- **Pick your look.** Switch between the Vice and Classic themes. TackleCast remembers your settings for next time.
 
-Optional 2x frame generation (30 -> 60 FPS) for 30 FPS console games, running on the GPU with RIFE. Off by default. Here's a preview in Red Dead Redemption 2 on a PS5 Pro:
+## Getting started
 
-<p align="center">
-  <a href="https://youtu.be/O4NeOv-G_KU">
-    <img src="https://img.youtube.com/vi/O4NeOv-G_KU/maxresdefault.jpg" alt="TackleCast frame generation preview (RDR2, PS5 Pro)" width="720">
-  </a>
-  <br>
-  <a href="https://youtu.be/O4NeOv-G_KU"><b>▶ Watch the preview on YouTube</b></a>
-</p>
+You'll need a PC, a compatible capture card, and an HDMI source such as a console. Available resolutions and frame rates depend on your source, card, USB connection, and PC.
 
-Setup, settings, how it works and known issues: [README-FrameGen.md](README-FrameGen.md)
+1. Download the package for your system from [Releases](../../releases).
+2. Extract the entire archive. On Windows, open **TackleCast.exe**; on Linux, run **run.sh** from a terminal.
+3. Connect your console to the capture card over HDMI, then connect the card to your PC over USB.
+4. Press **Escape** to open settings. In **Video**, choose your capture card, resolution, and frame rate. **Auto** is a good starting point for Pixel Format.
+5. In **Audio**, check the capture input and choose your speakers or headphones. Select **Apply & close**, then press **F11** if you'd like fullscreen.
 
-## Quick Start
+Keep the extracted files together: the app uses the libraries and, where included, frame-generation models shipped with the package.
 
-1. Download the latest release from [Releases](../../releases/latest).
-   - **Windows**: Download `TackleCast-Windows-x86_64.zip`, extract anywhere, and double-click `TackleCast.exe`.
-   - **Linux**: Download `TackleCast-Linux-x86_64.tar.gz`, extract (`tar -xzvf TackleCast-Linux-x86_64.tar.gz`), and run `./run.sh`.
-2. Press **Escape** and choose your capture card under **Video**. Select a supported resolution and frame rate; leave Pixel Format on Auto or choose a supported format manually.
-3. Close the menu with **Escape** to apply capture changes. Auto then shows the opened format, such as `Auto (NV12)`. Press **F11** for fullscreen.
+## Everyday controls
 
-FFmpeg is bundled on both platforms. Windows packages also include the CUDA/nvJPEG runtime; GPU decoding needs a compatible NVIDIA GPU and driver. Official Linux archives target x86_64 Ubuntu 24.04 or newer and use your desktop's ALSA and Vulkan/OpenGL drivers.
-
-On Linux/X11, your desktop must also provide the X11 keyboard runtime. On Ubuntu/Debian, install it if needed with `sudo apt install libxkbcommon-x11-0`.
-
-### PS4 audio and video
-
-Connect the PS4's HDMI output to your capture card and the card to your PC over USB. For gameplay capture, clear **Settings > System > Enable HDCP** ([PlayStation guide](https://manuals.playstation.net/document/en/ps4/settings/hdcp.html)). Set **Settings > Sound and Screen > Audio Output Settings > Audio Format (Priority)** to **Linear PCM** ([PlayStation guide](https://manuals.playstation.net/document/en/ps4/settings/audiooutput.html)).
-
-In TackleCast, press Escape and select the capture card's audio input and your speakers/headphones as output. Check that audio is Connected and unmuted. Mono input is duplicated to stereo, and different input/output sample rates are converted. For the widest capture-card compatibility, use stereo PCM; surround conversion assumes the conventional speaker order described in [BUILD.md](BUILD.md).
-
-If sound is missing, check the selected input is the capture card rather than your microphone or desktop's default source, and inspect the input/output formats in `logs/`. Unit tests cover channel conversion and resampling; console-specific behavior still depends on the card and needs hardware validation.
-
-## Building from Source
-
-See [BUILD.md](BUILD.md) for platform dependencies, environment setup, tests, and packaging. After setting up the dependencies:
-
-```bash
-cargo build --release
-```
-
-## Controls
-
-| Action | Key |
+| Action | Control |
 |---|---|
-| Open/close settings | Escape |
-| Fullscreen | F11 |
+| Open or close settings | Escape |
+| Toggle fullscreen | F11 |
+| Save settings and return to your game | Apply & close |
+| Rediscover a reconnected capture card or audio device | Reinitialize devices |
 
-## Settings
+Settings are grouped into **Video**, **Picture**, **Audio**, **Frame Gen**, and **Display**. Picture adjustments preview live; closing the menu saves your choices and applies device changes.
 
-Press **Escape** to open the four-tab menu. Shorter tabs keep the same menu size and position; small windows can scroll.
+## Frame generation
 
-| Tab | Controls |
-|---|---|
-| Video | Capture device, supported resolution/FPS/format combinations, scaling filter, color space, and color range |
-| Picture | Live brightness, contrast, saturation, and gamma adjustments, plus Reset Picture to Defaults |
-| Audio | Input/output devices, mute, volume, and connection status |
-| Display | Fullscreen, performance overlay, detailed scaling/color information, and Exit |
+Some console games run at 30 FPS. TackleCast's optional frame generation creates an extra frame between captured frames to make motion look smoother at 60 FPS. It starts **off**; you can enable it in the **Frame Gen** tab on Windows.
 
-Picture, scaling, and color adjustments preview immediately. The backdrop clears while editing sliders or their numeric values so you can judge the live picture. Closing the menu saves the settings and applies capture/audio device changes.
+Frame generation changes how motion looks, not how quickly the game responds. It uses additional GPU resources, adds delay, and can produce visual artifacts during fast movement. Leave it off if you prefer the original presentation or prioritize responsiveness. Performance depends on your GPU and capture resolution.
 
-Capture errors and a 10-second absence of decoded frames trigger up to three recovery attempts, with delays of 3, 6, and 12 seconds. The interface remains responsive while the capture worker stops. Use **Video > Reconnect capture** to retry manually after reconnecting a card. A new capture session starts only after the previous worker finishes.
+[Watch the Red Dead Redemption 2 preview on PS5 Pro](https://youtu.be/O4NeOv-G_KU).
 
-Audio stream errors or five seconds without input/output callbacks also trigger up to three recovery attempts using the same audio endpoints. Silent samples count as normal activity. **Audio > Restart audio** retries the current routing without closing TackleCast; DirectShow audio also restarts its shared video capture session. Both recovery controls use the currently applied settings. A minute of stable operation restores the automatic retry budget. If recovery fails, a card/driver or HDMI-source reset may still be necessary. Logs include per-session sample activity, callback ages, and recovery attempts to help diagnose intermittent dropouts.
+## Compatibility and help
 
-The overlay separates the selected **nominal FPS** from **delivered FPS**. For example, a `59.94` nominal mode stays distinct from `60`, even when the short-term delivery counter is close to 60. Auto color labels include `default` when metadata is missing; manual overrides are available when the source's reported color information needs correcting.
+TackleCast runs on Windows and Linux. Frame generation is Windows-only and requires a compatible DirectX 12 GPU. NVIDIA hardware can also accelerate MJPEG decoding on Windows; other supported configurations use software decoding.
 
-## How It Works
+Linux release archives target x86_64 Ubuntu 24.04 or newer and require working desktop audio and graphics drivers. Capture-card compatibility varies, and physical hardware testing has been broader on Windows.
 
-TackleCast has a three-tier decode pipeline that automatically selects the best path for your hardware:
+If the picture or sound is missing, check your HDMI and USB connections and the selected video/audio devices, then try **Reinitialize devices**. Some consoles require HDMI content protection to be disabled for gameplay capture. For example, on PS4, clear **Settings > System > Enable HDCP**; stereo **Linear PCM** audio is a useful compatibility starting point.
 
-| Tier | Path | When |
-|---|---|---|
-| Zero-copy | nvJPEG decode to shared DX12 buffer to wgpu | NVIDIA GPU with CUDA support (Windows) |
-| GPU decode + readback | nvJPEG decode to host memory to wgpu | CUDA available, DX12 interop unavailable |
-| Software decode | ffmpeg CPU decode to wgpu | Linux or no CUDA/nvJPEG available |
-
-Auto selects a format from the card's supported modes at the requested resolution and frame rate. It tries NV12 first, then MJPEG, then other supported formats. Manual format selections are strict; capture does not silently reduce resolution or frame rate. The menu shows the actual format after negotiation. The overlay distinguishes the nominal mode from measured frame delivery.
-
-Color Auto follows stream/frame metadata. When metadata is missing, the UI labels the fallback as a default rather than presenting it as detected information. BT.2020 selects a conversion matrix; it does not implement HDR tone mapping.
-
-## Architecture
-
-```
-src/
-  main.rs          - winit event loop, app state, settings
-  capture.rs       - DirectShow / V4L2 capture via ffmpeg-next, strict mode negotiation
-  capabilities/    - Native DirectShow / V4L2 mode discovery
-  frame_rate.rs    - Rational nominal frame rates
-  color.rs         - Color metadata and explicit defaults
-  gpu_decode.rs    - NVIDIA nvJPEG GPU MJPEG decode (feature-gated: gpu-decode)
-  dx12_interop.rs  - DX12 shared buffers for CUDA/wgpu zero-copy (feature-gated: gpu-decode)
-  render.rs        - wgpu DX12/Vulkan renderer, YUV->RGB WGSL shader
-  audio/           - Audio passthrough via cpal (WASAPI on Windows, PipeWire/ALSA on Linux)
-  devices.rs       - Cross-platform video + audio device enumeration
-  settings.rs      - JSON settings load/save
-  ui.rs            - egui overlay and settings menu
-  logger.rs        - Rotating file logger via tracing
-```
-
-## Known Limitations
-
-- **MJPEG GPU decoding requires Windows and a compatible NVIDIA GPU/runtime.** Linux and other GPUs use software decoding with the same wgpu rendering path.
-- **Reported modes do not guarantee sustained throughput.** The HDMI source, USB connection, capture-card encoder, and PC can limit delivery. Capture cards and laptops may also throttle under sustained load; compare delivered FPS with nominal FPS in the overlay.
-- **Linux physical capture needs broader hardware validation.** Native V4L2 discovery is implemented, and Linux tests, shader checks, and packaged synthetic rendering have passed. The latest ShadowCast hardware checks were performed on Windows.
-- **FSR and HDR tone mapping are not included.** Scaling options are Bilinear, Bicubic, and Lanczos; BT.2020 is a color conversion matrix. Saved `fsr1` selections load as Bilinear while preserving other settings.
-- Webcams may partially work but are not officially supported.
+For bugs or feature requests, [open an issue](https://github.com/SaltedByte/TackleCast/issues). Include your capture-card model, operating system, chosen capture mode, and the latest file from the app's **logs** folder.
 
 ## Acknowledgments
 
-- **[@NeverForgetful](https://www.youtube.com/@NeverForgetful)** - Testing and QA
-- **[@ajmine03](https://github.com/ajmine03)** - Linux support and audio contributions
-- **[@Vinny-TS](https://github.com/Vinny-TS)** - Capture settings, color controls, and settings UI contributions
+- **[Wiktor Stawski (@wiktorstawski)](https://github.com/wiktorstawski)** — Frame-generation implementation and research, contributed in [PR #28](https://github.com/SaltedByte/TackleCast/pull/28).
+- **[@NeverForgetful](https://www.youtube.com/@NeverForgetful)** — Testing and QA.
+- **[@ajmine03](https://github.com/ajmine03)** — Linux support and audio contributions.
+- **[@Vinny-TS](https://github.com/Vinny-TS)** — Capture settings, color controls, and settings UI contributions.
+
+## For contributors
+
+See [BUILD.md](BUILD.md) for building, testing, and packaging, and [the frame-generation notes](README-FrameGen.md) for the implementation background.
 
 ## License
 
-MIT
+TackleCast is open source under the [MIT license](LICENSE). Bundled third-party components retain their respective licenses.

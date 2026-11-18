@@ -974,8 +974,18 @@ fn vice_header_texture(ctx: &egui::Context) -> egui::TextureHandle {
         return texture;
     }
     let image = image::load_from_memory(include_bytes!("../assets/vice-header.png"))
-        .expect("embedded Vice header PNG")
-        .to_rgba8();
+        .expect("embedded Vice header PNG");
+    // Frame the skyline at the existing 4:1 banner ratio, retaining the source
+    // file intact. Trim mostly sky and foreground water, never the city width.
+    let crop_height = (image.width() / 4).min(image.height()).max(1);
+    let crop_top = (image.height() * 22 / 100).min(image.height() - crop_height);
+    let image = image.crop_imm(0, crop_top, image.width(), crop_height);
+    let image = if image.width() > 2048 {
+        image.thumbnail(2048, 512)
+    } else {
+        image
+    }
+    .to_rgba8();
     let pixels = egui::ColorImage::from_rgba_unmultiplied(
         [image.width() as usize, image.height() as usize],
         image.as_raw(),
