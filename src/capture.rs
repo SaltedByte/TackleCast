@@ -163,7 +163,23 @@ fn read_capture_packet<T>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
     Nv12,
+    // The software path normalizes MJPEG 4:2:0 to NV12.
+    #[cfg_attr(
+        not(all(target_os = "windows", feature = "gpu-decode")),
+        allow(dead_code)
+    )]
+    Yuvj420p,
     Yuvj422p,
+}
+
+impl PixelFormat {
+    pub fn chroma_dimensions(self, width: u32, height: u32) -> (u32, u32) {
+        match self {
+            Self::Nv12 => (width / 2, height / 2),
+            Self::Yuvj420p => (width.div_ceil(2), height.div_ceil(2)),
+            Self::Yuvj422p => (width.div_ceil(2), height),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -180,12 +196,13 @@ pub enum CaptureFrame {
     },
     /// Frame data lives in a shared DX12/CUDA GPU buffer (zero-copy path).
     /// The renderer knows where the actual buffers are; this just carries
-    /// the dimensions and which double-buffer set to read from.
+    /// the layout, dimensions and which buffer set to read from.
     #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
     Gpu {
         width: u32,
         height: u32,
         buffer_index: usize,
+        format: PixelFormat,
         color_info: ColorInfo,
     },
 }
@@ -283,7 +300,7 @@ impl CaptureFrame {
         match self {
             Self::Cpu { format, .. } => Some(*format),
             #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
-            Self::Gpu { .. } => Some(PixelFormat::Yuvj422p), // nvJPEG always outputs YUV 4:2:2
+            Self::Gpu { format, .. } => Some(*format),
         }
     }
 }
@@ -688,6 +705,7 @@ fn run_test_pattern(
             let measured_fps = stats_frame_counter as f32 / elapsed.as_secs_f32();
             let format_label = match format {
                 PixelFormat::Nv12 => "Test NV12",
+                PixelFormat::Yuvj420p => "Test YUV420",
                 PixelFormat::Yuvj422p => "Test YUV422",
             }
             .to_string();
@@ -1327,6 +1345,10 @@ fn run_device_capture_inner(
                         // for this packet, keep GPU decode active for the next one.
                         // The back slot is untouched and still holds its buffers.
                     }
+                    Err(e @ crate::gpu_decode::GpuDecodeError::UnsupportedImage(_)) => {
+                        warn!("nvJPEG falling back to software decode: {e}");
+                        gpu_decoder = None;
+                    }
                     Err(e) => {
                         // CUDA or nvJPEG error — count consecutive failures.
                         gpu_errors += 1;
@@ -1544,13 +1566,19 @@ fn extract_supported_frame_with_format(
     height: u32,
 ) -> Result<CaptureFrame, String> {
     let y_data = copy_plane(frame, 0, width as usize, height as usize);
-    let u_data = match format {
-        PixelFormat::Nv12 => copy_plane(frame, 1, width as usize, (height / 2) as usize),
-        PixelFormat::Yuvj422p => copy_plane(frame, 1, (width / 2) as usize, height as usize),
-    };
-    let v_data = match format {
-        PixelFormat::Nv12 => Vec::new(),
-        PixelFormat::Yuvj422p => copy_plane(frame, 2, (width / 2) as usize, height as usize),
+    let (chroma_width, chroma_height) = format.chroma_dimensions(width, height);
+    let chroma_height = chroma_height as usize;
+    let (u_data, v_data) = if format == PixelFormat::Nv12 {
+        (
+            copy_plane(frame, 1, width as usize, chroma_height),
+            Vec::new(),
+        )
+    } else {
+        let chroma_width = chroma_width as usize;
+        (
+            copy_plane(frame, 1, chroma_width, chroma_height),
+            copy_plane(frame, 2, chroma_width, chroma_height),
+        )
     };
 
     Ok(CaptureFrame::Cpu {
@@ -1744,9 +1772,9 @@ fn generate_test_frame(
     format: PixelFormat,
 ) -> CaptureFrame {
     let y_len = (width * height) as usize;
-    let chroma_width = (width / 2) as usize;
-    let chroma_height_420 = (height / 2) as usize;
-    let chroma_height_422 = height as usize;
+    let (chroma_width, chroma_height) = format.chroma_dimensions(width, height);
+    let chroma_width = chroma_width as usize;
+    let chroma_height = chroma_height as usize;
     let mut y_data = vec![0_u8; y_len];
 
     for y in 0..height as usize {
@@ -1766,14 +1794,14 @@ fn generate_test_frame(
 
     match format {
         PixelFormat::Nv12 => {
-            let mut uv_data = vec![0_u8; chroma_width * chroma_height_420 * 2];
-            for y in 0..chroma_height_420 {
+            let mut uv_data = vec![0_u8; chroma_width * chroma_height * 2];
+            for y in 0..chroma_height {
                 for x in 0..chroma_width {
                     let index = (y * chroma_width + x) * 2;
                     let x_phase = ((x as f32 / chroma_width as f32) * PI * 2.0
                         + frame_index as f32 * 0.03)
                         .sin();
-                    let y_phase = ((y as f32 / chroma_height_420 as f32) * PI * 2.0
+                    let y_phase = ((y as f32 / chroma_height as f32) * PI * 2.0
                         + frame_index as f32 * 0.05)
                         .cos();
                     uv_data[index] = ((x_phase * 0.5 + 0.5) * 255.0) as u8;
@@ -1795,17 +1823,17 @@ fn generate_test_frame(
                 v_data: Vec::new(),
             }
         }
-        PixelFormat::Yuvj422p => {
-            let mut u_data = vec![0_u8; chroma_width * chroma_height_422];
-            let mut v_data = vec![0_u8; chroma_width * chroma_height_422];
+        PixelFormat::Yuvj420p | PixelFormat::Yuvj422p => {
+            let mut u_data = vec![0_u8; chroma_width * chroma_height];
+            let mut v_data = vec![0_u8; chroma_width * chroma_height];
 
-            for y in 0..chroma_height_422 {
+            for y in 0..chroma_height {
                 for x in 0..chroma_width {
                     let index = y * chroma_width + x;
                     let x_phase = ((x as f32 / chroma_width as f32) * PI * 2.0
                         + frame_index as f32 * 0.06)
                         .sin();
-                    let y_phase = ((y as f32 / chroma_height_422 as f32) * PI * 2.0
+                    let y_phase = ((y as f32 / chroma_height as f32) * PI * 2.0
                         + frame_index as f32 * 0.02)
                         .cos();
                     u_data[index] = ((x_phase * 0.5 + 0.5) * 255.0) as u8;
@@ -2004,6 +2032,18 @@ mod tests {
     }
 
     #[test]
+    fn mjpeg_420_uses_half_height_chroma_at_4k() {
+        assert_eq!(
+            PixelFormat::Yuvj420p.chroma_dimensions(3840, 2160),
+            (1920, 1080)
+        );
+        assert_eq!(
+            PixelFormat::Yuvj422p.chroma_dimensions(3840, 2160),
+            (1920, 2160)
+        );
+    }
+
+    #[test]
     fn software_decoder_handles_capture_mjpeg() {
         let codec =
             codec::decoder::find(codec::Id::MJPEG).expect("FFmpeg must include MJPEG decoding");
@@ -2011,12 +2051,22 @@ mod tests {
             .decoder()
             .video()
             .unwrap();
-        let packet = ffmpeg::Packet::copy(include_bytes!("../assets/tests/nvjpeg-422.jpg"));
-        decoder.send_packet(&packet).unwrap();
-        let mut frame = Video::empty();
-        decoder.receive_frame(&mut frame).unwrap();
-        assert_eq!((frame.width(), frame.height()), (16, 8));
-        assert_eq!(frame.format(), ffmpeg::format::Pixel::YUVJ422P);
+        for (jpeg, expected_format) in [
+            (
+                include_bytes!("../assets/tests/nvjpeg-422.jpg").as_slice(),
+                ffmpeg::format::Pixel::YUVJ422P,
+            ),
+            (
+                include_bytes!("../assets/tests/nvjpeg-420.jpg").as_slice(),
+                ffmpeg::format::Pixel::YUVJ420P,
+            ),
+        ] {
+            decoder.send_packet(&ffmpeg::Packet::copy(jpeg)).unwrap();
+            let mut frame = Video::empty();
+            decoder.receive_frame(&mut frame).unwrap();
+            assert_eq!((frame.width(), frame.height()), (16, 8));
+            assert_eq!(frame.format(), expected_format);
+        }
     }
 
     #[test]

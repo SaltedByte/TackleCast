@@ -476,8 +476,9 @@ impl Renderer {
                 width,
                 height,
                 buffer_index,
+                format,
                 ..
-            } => self.upload_gpu_frame(*width, *height, *buffer_index),
+            } => self.upload_gpu_frame(*width, *height, *format, *buffer_index),
         }
     }
 
@@ -552,20 +553,21 @@ impl Renderer {
                     &mut self.pad_scratch,
                 );
             }
-            PixelFormat::Yuvj422p => {
+            PixelFormat::Yuvj420p | PixelFormat::Yuvj422p => {
+                let (chroma_width, chroma_height) = format.chroma_dimensions(width, height);
                 upload_plane_r8(
                     &self.queue,
                     &video_frame.u_texture,
-                    width / 2,
-                    height,
+                    chroma_width,
+                    chroma_height,
                     u_data,
                     &mut self.pad_scratch,
                 );
                 upload_plane_r8(
                     &self.queue,
                     &video_frame.v_texture,
-                    width / 2,
-                    height,
+                    chroma_width,
+                    chroma_height,
                     v_data,
                     &mut self.pad_scratch,
                 );
@@ -589,7 +591,13 @@ impl Renderer {
     }
 
     #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
-    fn upload_gpu_frame(&mut self, width: u32, height: u32, buffer_index: usize) {
+    fn upload_gpu_frame(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        buffer_index: usize,
+    ) {
         let Some(shared) = &self.shared_gpu_buffers else {
             tracing::warn!("GPU frame received but no shared buffers initialized");
             return;
@@ -600,9 +608,7 @@ impl Renderer {
             return;
         }
 
-        let format = PixelFormat::Yuvj422p; // nvJPEG always outputs YUV 4:2:2
-
-        // Rebuild textures if dimensions changed
+        // Rebuild textures if the dimensions or chroma layout changed.
         let needs_rebuild = self
             .video_frame
             .as_ref()
@@ -627,85 +633,33 @@ impl Renderer {
         };
 
         let buf_set = &shared.0[buffer_index];
-        let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-
-        // GPU-side copy: shared buffer → Y texture
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("tacklecast-gpu-copy-encoder"),
             });
 
-        let y_bytes_per_row = align_up(width, alignment);
-        encoder.copy_buffer_to_texture(
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buf_set.y_buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(y_bytes_per_row),
-                    rows_per_image: Some(height),
+        for (buffer, texture) in [
+            (&buf_set.y_buffer, &video_frame.y_texture),
+            (&buf_set.u_buffer, &video_frame.u_texture),
+            (&buf_set.v_buffer, &video_frame.v_texture),
+        ] {
+            encoder.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(align_up(
+                            texture.width(),
+                            wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
+                        )),
+                        rows_per_image: Some(texture.height()),
+                    },
                 },
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &video_frame.y_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-
-        // GPU-side copy: shared buffer → U texture (half-width, full-height for 4:2:2)
-        let chroma_width = width / 2;
-        let uv_bytes_per_row = align_up(chroma_width, alignment);
-        encoder.copy_buffer_to_texture(
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buf_set.u_buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(uv_bytes_per_row),
-                    rows_per_image: Some(height),
-                },
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &video_frame.u_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: chroma_width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-
-        // GPU-side copy: shared buffer → V texture
-        encoder.copy_buffer_to_texture(
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buf_set.v_buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(uv_bytes_per_row),
-                    rows_per_image: Some(height),
-                },
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &video_frame.v_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: chroma_width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
+                texture.as_image_copy(),
+                texture.size(),
+            );
+        }
 
         self.queue.submit(std::iter::once(encoder.finish()));
     }
@@ -1590,7 +1544,7 @@ struct VideoUniforms {
 impl VideoUniforms {
     fn format_mode_for(format: PixelFormat) -> u32 {
         match format {
-            PixelFormat::Nv12 => 0,
+            PixelFormat::Nv12 | PixelFormat::Yuvj420p => 0,
             PixelFormat::Yuvj422p => 1,
         }
     }
@@ -1617,10 +1571,7 @@ impl VideoFrameResources {
         format: PixelFormat,
     ) -> Self {
         let y_texture = create_plane_texture(device, width, height, "y");
-        let (chroma_width, chroma_height) = match format {
-            PixelFormat::Nv12 => (width / 2, height / 2),
-            PixelFormat::Yuvj422p => (width / 2, height),
-        };
+        let (chroma_width, chroma_height) = format.chroma_dimensions(width, height);
         let u_texture = create_plane_texture(device, chroma_width, chroma_height, "u");
         let v_texture = create_plane_texture(device, chroma_width, chroma_height, "v");
 

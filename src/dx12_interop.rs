@@ -43,6 +43,8 @@ pub struct PlaneBufferSet {
 /// buffers. Lives as long as the decode session. Contains no kernel resources.
 #[derive(Debug, Clone, Copy)]
 pub struct SharedBufferLayout {
+    pub width: u32,
+    pub height: u32,
     /// Row pitch for Y plane (aligned to COPY_BYTES_PER_ROW_ALIGNMENT).
     pub y_pitch: u32,
     /// Row pitch for U/V planes (aligned).
@@ -113,16 +115,18 @@ pub struct ImportHandles {
 // Construction
 // ---------------------------------------------------------------------------
 
-/// Calculate buffer sizes for YUV 4:2:2 planes at the given dimensions.
+/// Reserve enough space for either 4:2:0 or 4:2:2 before the first JPEG arrives.
 /// Each row is aligned to `COPY_BYTES_PER_ROW_ALIGNMENT` (256 bytes) because
 /// wgpu's `copy_buffer_to_texture` requires aligned `bytes_per_row`.
 fn plane_sizes(width: u32, height: u32) -> SharedBufferLayout {
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let y_pitch = (width + align - 1) & !(align - 1);
-    let uv_pitch = ((width / 2) + align - 1) & !(align - 1);
+    let uv_pitch = (width.div_ceil(2) + align - 1) & !(align - 1);
     let y_size = (y_pitch as u64) * (height as u64);
     let uv_size = (uv_pitch as u64) * (height as u64);
     SharedBufferLayout {
+        width,
+        height,
         y_pitch,
         uv_pitch,
         y_size,

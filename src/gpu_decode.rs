@@ -426,6 +426,7 @@ pub enum GpuDecodeError {
     Cuda(&'static str, CUresult),
     Nvjpeg(&'static str, NvjpegStatus),
     InvalidData(String),
+    UnsupportedImage(String),
 }
 
 impl std::fmt::Display for GpuDecodeError {
@@ -434,6 +435,7 @@ impl std::fmt::Display for GpuDecodeError {
             Self::Cuda(op, code) => write!(f, "CUDA {op} failed (error {code})"),
             Self::Nvjpeg(op, code) => write!(f, "nvJPEG {op} failed (error {code})"),
             Self::InvalidData(msg) => write!(f, "invalid JPEG data: {msg}"),
+            Self::UnsupportedImage(msg) => write!(f, "unsupported JPEG image: {msg}"),
         }
     }
 }
@@ -503,8 +505,7 @@ pub struct NvjpegDecoder {
     // Current allocation dimensions
     alloc_width: u32,
     alloc_height: u32,
-    // Whether first frame has been validated
-    validated: bool,
+    last_image: Option<(u32, u32, PixelFormat)>,
 }
 
 /// Returns true if this decoder is using zero-copy shared buffers.
@@ -654,7 +655,7 @@ impl NvjpegDecoder {
                 },
                 alloc_width: w,
                 alloc_height: h,
-                validated: false,
+                last_image: None,
             })
         }
     }
@@ -832,9 +833,6 @@ impl NvjpegDecoder {
             // ImportHandleSet::drop(). Successfully imported ones were nulled
             // so Drop is a no-op for them.
 
-            let alloc_width = 2560_u32; // will be validated on first frame
-            let alloc_height = 1440_u32;
-
             info!(
                 "nvJPEG GPU decoder initialized in zero-copy mode ({} buffer sets, Y={}B UV={}B)",
                 sets.len(),
@@ -853,9 +851,9 @@ impl NvjpegDecoder {
                     sets,
                     current_index: 0,
                 },
-                alloc_width,
-                alloc_height,
-                validated: false,
+                alloc_width: import_handles.layout.width,
+                alloc_height: import_handles.layout.height,
+                last_image: None,
             })
         }
     }
@@ -883,18 +881,30 @@ impl NvjpegDecoder {
         // Inject standard Huffman tables if the UVC device omitted them.
         let jpeg_data = ensure_dht(jpeg_data);
 
-        // Query image info on first frame
-        let (width, height) = if !self.validated {
-            let info = self.get_image_info(&jpeg_data)?;
-            info!(
-                "nvJPEG first frame: {}x{}, subsampling={:?}, components={}",
-                info.0, info.1, info.2, info.3
-            );
-            self.validated = true;
-            (info.0, info.1)
-        } else {
-            (self.alloc_width, self.alloc_height)
+        // MJPEG frames are independent, so inspect each header before writing planes.
+        let (width, height, subsampling, components) = self.get_image_info(&jpeg_data)?;
+        let format = match (subsampling, components) {
+            (NvjpegChromaSubsampling::Css420, 3) => PixelFormat::Yuvj420p,
+            (NvjpegChromaSubsampling::Css422, 3) => PixelFormat::Yuvj422p,
+            _ => {
+                return Err(GpuDecodeError::UnsupportedImage(format!(
+                    "{subsampling:?} with {components} components"
+                )));
+            }
         };
+        let image = (width, height, format);
+        if self.last_image != Some(image) {
+            let event = if self.last_image.is_none() {
+                "first frame"
+            } else {
+                "layout changed"
+            };
+            info!(
+                "nvJPEG {event}: {width}x{height}, subsampling={subsampling:?}, components={components}"
+            );
+            self.last_image = Some(image);
+        }
+        let (chroma_width, chroma_height) = format.chroma_dimensions(width, height);
 
         // Reallocate if dimensions changed (owned mode only)
         self.ensure_buffers(width, height)?;
@@ -908,7 +918,7 @@ impl NvjpegDecoder {
                 d_u.ptr,
                 d_v.ptr,
                 width as usize,
-                (width / 2) as usize,
+                chroma_width as usize,
             ),
             DecodeMode::Shared {
                 sets,
@@ -971,6 +981,7 @@ impl NvjpegDecoder {
                     width,
                     height,
                     buffer_index,
+                    format,
                 };
                 Ok(())
             }
@@ -985,7 +996,7 @@ impl NvjpegDecoder {
                 // buffers → `out`. The host_bufs are fixed staging memory for
                 // cuMemcpyDtoH, sized by ensure_buffers().
                 let y_size = (width * height) as usize;
-                let uv_size = ((width / 2) * height) as usize;
+                let uv_size = (chroma_width * chroma_height) as usize;
 
                 let idx = *host_index;
                 let len = host_bufs.len();
@@ -1025,7 +1036,7 @@ impl NvjpegDecoder {
 
                 // Copy staging → out, reusing out's existing plane capacity.
                 let (y_data, u_data, v_data) =
-                    out.reshape_cpu(width, height, PixelFormat::Yuvj422p, y_size, uv_size);
+                    out.reshape_cpu(width, height, format, y_size, uv_size);
                 y_data.copy_from_slice(&buf.y[..y_size]);
                 u_data.copy_from_slice(&buf.u[..uv_size]);
                 v_data.copy_from_slice(&buf.v[..uv_size]);
@@ -1071,6 +1082,9 @@ impl NvjpegDecoder {
             _ => NvjpegChromaSubsampling::CssUnknown,
         };
 
+        if widths[0] <= 0 || heights[0] <= 0 {
+            return Err(GpuDecodeError::InvalidData("invalid dimensions".into()));
+        }
         Ok((widths[0] as u32, heights[0] as u32, css, n_components))
     }
 
@@ -1082,14 +1096,10 @@ impl NvjpegDecoder {
         }
 
         match &mut self.mode {
-            DecodeMode::Shared { .. } => {
-                // Shared buffers are pre-allocated at a fixed size.
-                // If the actual frame dimensions differ, update tracking but
-                // don't reallocate — the buffers are large enough for up to 2560x1440.
-                self.alloc_width = width;
-                self.alloc_height = height;
-                Ok(())
-            }
+            DecodeMode::Shared { .. } => Err(GpuDecodeError::UnsupportedImage(format!(
+                "{width}x{height} does not match the {}x{} shared buffers",
+                self.alloc_width, self.alloc_height
+            ))),
             DecodeMode::Owned {
                 d_y,
                 d_u,
@@ -1103,32 +1113,24 @@ impl NvjpegDecoder {
                 );
 
                 let y_size = (width * height) as usize;
-                let uv_size = ((width / 2) * height) as usize;
-
-                // Free old device buffers
-                unsafe {
-                    (self.cuda.cu_mem_free)(d_y.ptr);
-                    (self.cuda.cu_mem_free)(d_u.ptr);
-                    (self.cuda.cu_mem_free)(d_v.ptr);
+                // Reserve space for either layout so changes in subsampling alone
+                // don't require reallocating. Keep the old allocation on failure.
+                let uv_size = (width.div_ceil(2) * height) as usize;
+                let mut new_ptrs = [0; 3];
+                for (index, size) in [y_size, uv_size, uv_size].into_iter().enumerate() {
+                    let res = unsafe { (self.cuda.cu_mem_alloc)(&mut new_ptrs[index], size) };
+                    if res != CUDA_SUCCESS {
+                        for ptr in &new_ptrs[..index] {
+                            unsafe { (self.cuda.cu_mem_free)(*ptr) };
+                        }
+                        return Err(GpuDecodeError::Cuda("cuMemAlloc (resize)", res));
+                    }
                 }
 
-                // Allocate new device buffers
-                let alloc = |cuda: &CudaLib,
-                             size: usize,
-                             name: &'static str|
-                 -> Result<DeviceBuffer, GpuDecodeError> {
-                    let mut ptr: CUdeviceptr = 0;
-                    let res = unsafe { (cuda.cu_mem_alloc)(&mut ptr, size) };
-                    if res != CUDA_SUCCESS {
-                        Err(GpuDecodeError::Cuda(name, res))
-                    } else {
-                        Ok(DeviceBuffer { ptr })
-                    }
-                };
-
-                *d_y = alloc(&self.cuda, y_size, "cuMemAlloc (Y)")?;
-                *d_u = alloc(&self.cuda, uv_size, "cuMemAlloc (U)")?;
-                *d_v = alloc(&self.cuda, uv_size, "cuMemAlloc (V)")?;
+                for (buffer, new_ptr) in [d_y, d_u, d_v].into_iter().zip(new_ptrs) {
+                    let old_ptr = std::mem::replace(&mut buffer.ptr, new_ptr);
+                    unsafe { (self.cuda.cu_mem_free)(old_ptr) };
+                }
 
                 // Resize both host buffer sets
                 for buf in host_bufs.iter_mut() {
@@ -1188,32 +1190,42 @@ impl Drop for NvjpegDecoder {
 mod tests {
     use super::*;
 
-    fn jpeg_fixture() -> Vec<u8> {
-        // Known 4:2:2 MJPEG fixture matching the capture pipeline's plane layout.
-        include_bytes!("../assets/tests/nvjpeg-422.jpg").to_vec()
-    }
+    const JPEG_420: &[u8] = include_bytes!("../assets/tests/nvjpeg-420.jpg");
+    const JPEG_422: &[u8] = include_bytes!("../assets/tests/nvjpeg-422.jpg");
 
     #[test]
     #[ignore = "requires an NVIDIA GPU, compatible driver and nvJPEG runtime"]
     fn hardware_nvjpeg_decodes_owned_frame() {
         let mut decoder = NvjpegDecoder::try_new().expect("NVIDIA decode must initialize");
         let mut frame = CaptureFrame::empty();
-        decoder.decode_into(&jpeg_fixture(), &mut frame).unwrap();
-        let CaptureFrame::Cpu {
-            width,
-            height,
-            y_data,
-            u_data,
-            v_data,
-            ..
-        } = frame
-        else {
-            panic!("owned decoding must return CPU planes");
-        };
-        assert_eq!((width, height), (16, 8));
-        assert_eq!(y_data.len(), 16 * 8);
-        assert!(y_data.iter().any(|sample| *sample > 0));
-        assert!(!u_data.is_empty() && !v_data.is_empty());
+        for (jpeg, expected_format, expected_chroma_height) in [
+            (JPEG_422, PixelFormat::Yuvj422p, 8),
+            (JPEG_420, PixelFormat::Yuvj420p, 4),
+            (JPEG_422, PixelFormat::Yuvj422p, 8),
+        ] {
+            decoder.decode_into(jpeg, &mut frame).unwrap();
+            let CaptureFrame::Cpu {
+                width,
+                height,
+                format,
+                y_data,
+                u_data,
+                v_data,
+                ..
+            } = &frame
+            else {
+                panic!("owned decoding must return CPU planes");
+            };
+            assert_eq!((*width, *height, *format), (16, 8, expected_format));
+            assert_eq!(y_data.len(), 16 * 8);
+            assert!(y_data.iter().any(|sample| *sample > 0));
+            assert_eq!(u_data.len(), 8 * expected_chroma_height);
+            assert_eq!(v_data.len(), 8 * expected_chroma_height);
+            if expected_format == PixelFormat::Yuvj420p {
+                assert!(u_data[0] < 48 && u_data[24] > 208);
+                assert!(v_data[0] > 208 && v_data[24] < 48);
+            }
+        }
     }
 
     #[test]
@@ -1228,21 +1240,55 @@ mod tests {
             ..Default::default()
         }))
         .expect("DX12 adapter must be available");
-        let (device, _queue) =
+        let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
-        let (_buffers, handles) =
+        let (buffers, handles) =
             crate::dx12_interop::SharedGpuBuffers::try_new(&device, 16, 8).unwrap();
         let mut decoder =
             NvjpegDecoder::try_new_shared(handles).expect("CUDA must import the shared buffers");
         let mut frame = CaptureFrame::empty();
-        decoder.decode_into(&jpeg_fixture(), &mut frame).unwrap();
-        assert!(matches!(
-            frame,
-            CaptureFrame::Gpu {
-                width: 16,
-                height: 8,
-                ..
-            }
-        ));
+        decoder.decode_into(JPEG_422, &mut frame).unwrap();
+        assert_eq!(frame.format(), Some(PixelFormat::Yuvj422p));
+        decoder.decode_into(JPEG_420, &mut frame).unwrap();
+        let CaptureFrame::Gpu {
+            width,
+            height,
+            buffer_index,
+            format,
+            ..
+        } = frame
+        else {
+            panic!("shared decoding must return the GPU buffer index");
+        };
+        assert_eq!((width, height, format), (16, 8, PixelFormat::Yuvj420p));
+
+        // Check the first and last written rows via DX12. The vertical variation
+        // in the JPEG makes a missing or incorrectly pitched row visible.
+        let planes = &buffers.0[buffer_index];
+        let pitch = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64;
+        let plane_size = pitch * 4;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 2 * plane_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(&planes.u_buffer, 0, &readback, 0, plane_size);
+        encoder.copy_buffer_to_buffer(&planes.v_buffer, 0, &readback, plane_size, plane_size);
+        queue.submit([encoder.finish()]);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                tx.send(result).unwrap();
+            });
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        rx.recv().unwrap().unwrap();
+        let bytes = readback.slice(..).get_mapped_range();
+        let last_row = (pitch * 3) as usize;
+        assert!(bytes[0] < 48 && bytes[last_row] > 208);
+        assert!(bytes[plane_size as usize] > 208 && bytes[plane_size as usize + last_row] < 48);
     }
 }
