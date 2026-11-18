@@ -4,6 +4,11 @@
   <img src="assets/icon.png" alt="TackleCast" width="128">
 </p>
 
+<p align="center">
+  <a href="https://github.com/SaltedByte/TackleCast/releases/latest"><strong>⬇ Download Now</strong></a><br>
+  Latest release for Windows and Linux
+</p>
+
 **Play your console on your PC screen.**
 
 TackleCast is a lightweight capture card viewer for Windows and Linux. Connect your console through a USB capture card, open TackleCast, and play in a window or fullscreen, with sound through your PC's speakers or headphones.
