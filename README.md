@@ -1,5 +1,9 @@
 # TackleCast
-
+[![Release](https://img.shields.io/github/v/release/SaltedByte/TackleCast)](https://github.com/SaltedByte/TackleCast/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/SaltedByte/TackleCast/total)](https://github.com/SaltedByte/TackleCast/releases)
+[![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-blue)](#compatibility-and-help)
+[![CI](https://img.shields.io/github/actions/workflow/status/SaltedByte/TackleCast/ci.yml?branch=main&label=CI)](https://github.com/SaltedByte/TackleCast/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/SaltedByte/TackleCast)](LICENSE)
 <p align="center">
   <img src="assets/icon.png" alt="TackleCast" width="128">
 </p>
