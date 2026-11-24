@@ -9,6 +9,7 @@ use crate::settings::{
     RifeModel,
 };
 use crate::theme::Palette;
+use crate::updater::{UpdateAction, UpdateStatus};
 use egui::{Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Stroke};
 use egui_components as sc;
 use egui_extras::{Size, StripBuilder};
@@ -96,6 +97,7 @@ pub struct UiFrame<'a> {
     pub framegen_forced: bool,
     pub recorder_status: &'a str,
     pub recorder_available: bool,
+    pub update_status: &'a UpdateStatus,
 }
 
 pub struct PreparedUi {
@@ -117,6 +119,8 @@ pub struct UiOutput {
     pub retry_framegen: bool,
     /// Start recording a diagnostic clip (raw captured frames).
     pub record_clip: bool,
+    /// User-triggered action from the update footer button or status banner.
+    pub update_action: Option<UpdateAction>,
     pub repaint_after: Duration,
 }
 
@@ -874,22 +878,43 @@ fn draw_menu(
                             ),
                         );
                         ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add(
-                                    sc::Button::outline(if frame.devices_busy {
-                                        "Reinitializing…"
-                                    } else {
-                                        "Reinitialize devices"
-                                    })
-                                    .small()
-                                    .disabled(frame.devices_busy),
-                                )
-                                .clicked()
-                            {
-                                output.reinitialize_devices = Some(draft.clone());
-                            }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if !frame.update_status.is_idle() {
+                            draw_update_banner(ui, frame.update_status, output, text_scale);
+                            ui.add_space(4.0);
+                        }
+                        let update_busy = frame.update_status.is_busy();
+                        let update_label = if matches!(frame.update_status, UpdateStatus::Checking)
+                        {
+                            "Checking…"
+                        } else {
+                            "Check for updates"
+                        };
+                        if menu_width < 460.0 {
+                            ui.horizontal_wrapped(|ui| {
+                                if ui
+                                    .add(
+                                        sc::Button::outline(if frame.devices_busy {
+                                            "Reinitializing…"
+                                        } else {
+                                            "Reinitialize devices"
+                                        })
+                                        .small()
+                                        .disabled(frame.devices_busy),
+                                    )
+                                    .clicked()
+                                {
+                                    output.reinitialize_devices = Some(draft.clone());
+                                }
+                                if ui
+                                    .add(
+                                        sc::Button::outline(update_label)
+                                            .small()
+                                            .disabled(update_busy),
+                                    )
+                                    .clicked()
+                                {
+                                    output.update_action = Some(UpdateAction::Check);
+                                }
                                 if ui
                                     .add(
                                         sc::Button::primary("Apply & close")
@@ -901,7 +926,46 @@ fn draw_menu(
                                     output.apply_settings = Some(draft.clone());
                                 }
                             });
-                        });
+                        } else {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(
+                                        sc::Button::outline(if frame.devices_busy {
+                                            "Reinitializing…"
+                                        } else {
+                                            "Reinitialize devices"
+                                        })
+                                        .small()
+                                        .disabled(frame.devices_busy),
+                                    )
+                                    .clicked()
+                                {
+                                    output.reinitialize_devices = Some(draft.clone());
+                                }
+                                if ui
+                                    .add(
+                                        sc::Button::outline(update_label)
+                                            .small()
+                                            .disabled(update_busy),
+                                    )
+                                    .clicked()
+                                {
+                                    output.update_action = Some(UpdateAction::Check);
+                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui
+                                        .add(
+                                            sc::Button::primary("Apply & close")
+                                                .small()
+                                                .disabled(frame.devices_busy),
+                                        )
+                                        .clicked()
+                                    {
+                                        output.apply_settings = Some(draft.clone());
+                                    }
+                                });
+                            });
+                        }
                     });
                 });
         });
@@ -920,6 +984,173 @@ fn draw_menu(
                 output.apply_settings = Some(draft.clone());
             }
         });
+}
+
+/// Renders the inline update status and action banner above the settings footer.
+fn draw_update_banner(
+    ui: &mut egui::Ui,
+    status: &UpdateStatus,
+    output: &mut UiOutput,
+    text_scale: f32,
+) {
+    let p = Palette::current(ui.ctx());
+    let font_size = 12.5 * text_scale;
+    Frame::new()
+        .fill(p.card_bg)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            match status {
+                UpdateStatus::Idle => {}
+                UpdateStatus::Checking => {
+                    ui.label(
+                        RichText::new("Checking GitHub for the latest release…")
+                            .size(font_size)
+                            .color(p.text_muted),
+                    );
+                }
+                UpdateStatus::UpToDate { current } => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!("Up to date (v{current})"))
+                                .size(font_size)
+                                .color(p.text_primary),
+                        );
+                        if ui.add(sc::Button::outline("Dismiss").small()).clicked() {
+                            output.update_action = Some(UpdateAction::Dismiss);
+                        }
+                    });
+                }
+                UpdateStatus::Available {
+                    version,
+                    html_url,
+                    can_self_update,
+                    fallback_reason,
+                } => {
+                    ui.vertical(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new(format!("Update available: v{version}"))
+                                    .size(font_size)
+                                    .color(p.accent),
+                            );
+                            if *can_self_update {
+                                if ui
+                                    .add(sc::Button::primary("Download update").small())
+                                    .clicked()
+                                {
+                                    output.update_action = Some(UpdateAction::Download);
+                                }
+                                if ui
+                                    .add(sc::Button::outline("Release notes").small())
+                                    .clicked()
+                                {
+                                    output.update_action =
+                                        Some(UpdateAction::OpenReleasePage(html_url.clone()));
+                                }
+                            } else if ui
+                                .add(sc::Button::primary("Open release page").small())
+                                .clicked()
+                            {
+                                output.update_action =
+                                    Some(UpdateAction::OpenReleasePage(html_url.clone()));
+                            }
+                            if ui.add(sc::Button::outline("Dismiss").small()).clicked() {
+                                output.update_action = Some(UpdateAction::Dismiss);
+                            }
+                        });
+                        if let Some(reason) = fallback_reason {
+                            ui.label(
+                                RichText::new(reason)
+                                    .size(11.5 * text_scale)
+                                    .color(p.text_muted),
+                            );
+                        }
+                    });
+                }
+                UpdateStatus::Downloading {
+                    version,
+                    downloaded,
+                    total,
+                } => {
+                    ui.vertical(|ui| {
+                        let label = match total {
+                            Some(total) if *total > 0 => format!(
+                                "Downloading v{version}… {} / {}",
+                                format_mb(*downloaded),
+                                format_mb(*total)
+                            ),
+                            _ => format!("Downloading v{version}… {}", format_mb(*downloaded)),
+                        };
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(label).size(font_size).color(p.text_primary));
+                            if ui.add(sc::Button::outline("Cancel").small()).clicked() {
+                                output.update_action = Some(UpdateAction::Cancel);
+                            }
+                        });
+                        let progress = total
+                            .filter(|t| *t > 0)
+                            .map(|t| (*downloaded as f32 / t as f32).clamp(0.0, 1.0))
+                            .unwrap_or(0.0);
+                        ui.add(
+                            egui::ProgressBar::new(progress)
+                                .desired_height(6.0)
+                                .fill(p.accent),
+                        );
+                    });
+                }
+                UpdateStatus::Verifying { version } => {
+                    ui.label(
+                        RichText::new(format!("Verifying SHA-256 checksum for v{version}…"))
+                            .size(font_size)
+                            .color(p.text_muted),
+                    );
+                }
+                UpdateStatus::Extracting { version } => {
+                    ui.label(
+                        RichText::new(format!("Staging v{version}…"))
+                            .size(font_size)
+                            .color(p.text_muted),
+                    );
+                }
+                UpdateStatus::ReadyToRestart { version } => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!("v{version} is verified and ready to install."))
+                                .size(font_size)
+                                .color(p.accent),
+                        );
+                        if ui
+                            .add(sc::Button::primary("Restart to apply").small())
+                            .clicked()
+                        {
+                            output.update_action = Some(UpdateAction::RestartToApply);
+                        }
+                        if ui.add(sc::Button::outline("Dismiss").small()).clicked() {
+                            output.update_action = Some(UpdateAction::Dismiss);
+                        }
+                    });
+                }
+                UpdateStatus::Failed { message } => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(message).size(font_size).color(p.warning));
+                        if ui.add(sc::Button::outline("Retry").small()).clicked() {
+                            output.update_action = Some(UpdateAction::Check);
+                        }
+                        if ui.add(sc::Button::outline("Dismiss").small()).clicked() {
+                            output.update_action = Some(UpdateAction::Dismiss);
+                        }
+                    });
+                }
+            }
+        });
+}
+
+/// Formats a byte count in megabytes for download progress display.
+fn format_mb(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
 }
 
 fn edition_header(ui: &mut egui::Ui, theme: Theme) -> f32 {
@@ -1876,6 +2107,7 @@ mod tests {
                                 framegen_forced: false,
                                 recorder_status: "",
                                 recorder_available: false,
+                                update_status: &UpdateStatus::Idle,
                             },
                             &mut UiOutput::default(),
                         );
@@ -2049,6 +2281,7 @@ mod tests {
                             framegen_forced: false,
                             recorder_status: "",
                             recorder_available: false,
+                            update_status: &UpdateStatus::Idle,
                         },
                     );
                     if let Some(live) = &output.output.live_settings {
@@ -2543,6 +2776,7 @@ mod tests {
                 framegen_forced: false,
                 recorder_status: "",
                 recorder_available: false,
+                update_status: &UpdateStatus::Idle,
             };
             let mut text = String::new();
             for _ in 0..3 {
@@ -2643,6 +2877,7 @@ mod tests {
             framegen_forced: false,
             recorder_status: "",
             recorder_available: false,
+            update_status: &UpdateStatus::Idle,
         };
         let mut tab = MenuTab::Display;
         ctx.data_mut(|data| data.insert_temp(egui::Id::new("test_overlay_focus"), true));
@@ -2728,6 +2963,7 @@ mod tests {
             framegen_forced: false,
             recorder_status: "",
             recorder_available: false,
+            update_status: &UpdateStatus::Idle,
         };
         let mut tab = MenuTab::Display;
         let mut texts = String::new();
@@ -2937,6 +3173,7 @@ mod tests {
                             framegen_forced: false,
                             recorder_status: "",
                             recorder_available: false,
+                            update_status: &UpdateStatus::Idle,
                         },
                         &mut UiOutput::default(),
                     );
@@ -3038,6 +3275,7 @@ mod tests {
                     framegen_forced: false,
                     recorder_status: "",
                     recorder_available: false,
+                    update_status: &UpdateStatus::Idle,
                 };
                 let mut previous_size = None;
                 let mut label_left = None;
@@ -3333,5 +3571,128 @@ mod tests {
             overlay.status_message.as_deref(),
             Some("Reconnecting capture…")
         );
+    }
+
+    #[test]
+    fn update_footer_and_banner_render_all_states() {
+        let states: Vec<(UpdateStatus, &str)> = vec![
+            (UpdateStatus::Idle, "Check for updates"),
+            (
+                UpdateStatus::Checking,
+                "Checking GitHub for the latest release…",
+            ),
+            (
+                UpdateStatus::UpToDate {
+                    current: "3.0.0".into(),
+                },
+                "Up to date (v3.0.0)",
+            ),
+            (
+                UpdateStatus::Available {
+                    version: "3.1.0".into(),
+                    html_url: "https://github.com/SaltedByte/TackleCast/releases/tag/v3.1.0".into(),
+                    can_self_update: true,
+                    fallback_reason: None,
+                },
+                "Download update",
+            ),
+            (
+                UpdateStatus::Available {
+                    version: "3.1.0".into(),
+                    html_url: "https://github.com/SaltedByte/TackleCast/releases/tag/v3.1.0".into(),
+                    can_self_update: false,
+                    fallback_reason: Some("Portable release required".into()),
+                },
+                "Open release page",
+            ),
+            (
+                UpdateStatus::Downloading {
+                    version: "3.1.0".into(),
+                    downloaded: 10 * 1024 * 1024,
+                    total: Some(50 * 1024 * 1024),
+                },
+                "Downloading v3.1.0…",
+            ),
+            (
+                UpdateStatus::Verifying {
+                    version: "3.1.0".into(),
+                },
+                "Verifying SHA-256 checksum",
+            ),
+            (
+                UpdateStatus::Extracting {
+                    version: "3.1.0".into(),
+                },
+                "Staging v3.1.0…",
+            ),
+            (
+                UpdateStatus::ReadyToRestart {
+                    version: "3.1.0".into(),
+                },
+                "Restart to apply",
+            ),
+            (
+                UpdateStatus::Failed {
+                    message: "Offline".into(),
+                },
+                "Offline",
+            ),
+        ];
+
+        for (status, expected) in states {
+            let ctx = egui::Context::default();
+            let mut settings = Settings::default();
+            let overlay = sample();
+            let frame = UiFrame {
+                overlay: &overlay,
+                settings: &Settings::default(),
+                video_devices: &[],
+                audio_inputs: &[],
+                audio_outputs: &[],
+                is_fullscreen: false,
+                audio_status: "",
+                devices_busy: false,
+                framegen: &FgDiagnostics::default(),
+                framegen_forced: false,
+                recorder_status: "",
+                recorder_available: false,
+                update_status: &status,
+            };
+            let mut text = String::new();
+            for _ in 0..2 {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1280.0, 720.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |root| {
+                        configure_style(root.ctx(), settings.theme);
+                        draw_menu(
+                            root.ctx(),
+                            &mut settings,
+                            &mut MenuTab::Display,
+                            &frame,
+                            &mut UiOutput::default(),
+                        );
+                    },
+                );
+                text = output
+                    .shapes
+                    .into_iter()
+                    .filter_map(|s| match s.shape {
+                        egui::Shape::Text(t) => Some(t.galley.job.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            assert!(
+                text.contains(expected),
+                "expected '{expected}' in rendered settings menu for {status:?}, got:\n{text}"
+            );
+        }
     }
 }
