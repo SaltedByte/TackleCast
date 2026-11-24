@@ -878,18 +878,7 @@ fn draw_menu(
                             ),
                         );
                         ui.add_space(6.0);
-                        if !frame.update_status.is_idle() {
-                            draw_update_banner(ui, frame.update_status, output, text_scale);
-                            ui.add_space(4.0);
-                        }
-                        let update_busy = frame.update_status.is_busy();
-                        let update_label = if matches!(frame.update_status, UpdateStatus::Checking)
-                        {
-                            "Checking…"
-                        } else {
-                            "Check for updates"
-                        };
-                        if menu_width < 460.0 {
+                        if menu_width < 520.0 {
                             ui.horizontal_wrapped(|ui| {
                                 if ui
                                     .add(
@@ -905,16 +894,7 @@ fn draw_menu(
                                 {
                                     output.reinitialize_devices = Some(draft.clone());
                                 }
-                                if ui
-                                    .add(
-                                        sc::Button::outline(update_label)
-                                            .small()
-                                            .disabled(update_busy),
-                                    )
-                                    .clicked()
-                                {
-                                    output.update_action = Some(UpdateAction::Check);
-                                }
+                                draw_update_button(ui, frame.update_status, output);
                                 if ui
                                     .add(
                                         sc::Button::primary("Apply & close")
@@ -942,16 +922,7 @@ fn draw_menu(
                                 {
                                     output.reinitialize_devices = Some(draft.clone());
                                 }
-                                if ui
-                                    .add(
-                                        sc::Button::outline(update_label)
-                                            .small()
-                                            .disabled(update_busy),
-                                    )
-                                    .clicked()
-                                {
-                                    output.update_action = Some(UpdateAction::Check);
-                                }
+                                draw_update_button(ui, frame.update_status, output);
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if ui
                                         .add(
@@ -986,166 +957,122 @@ fn draw_menu(
         });
 }
 
-/// Renders the inline update status and action banner above the settings footer.
-fn draw_update_banner(
-    ui: &mut egui::Ui,
-    status: &UpdateStatus,
-    output: &mut UiOutput,
-    text_scale: f32,
-) {
-    let p = Palette::current(ui.ctx());
-    let font_size = 12.5 * text_scale;
-    Frame::new()
-        .fill(p.card_bg)
-        .stroke(Stroke::new(1.0, p.border))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(10, 8))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            match status {
-                UpdateStatus::Idle => {}
-                UpdateStatus::Checking => {
-                    ui.label(
-                        RichText::new("Checking GitHub for the latest release…")
-                            .size(font_size)
-                            .color(p.text_muted),
-                    );
+/// Renders the mutating update button in the settings footer.
+fn draw_update_button(ui: &mut egui::Ui, status: &UpdateStatus, output: &mut UiOutput) {
+    match status {
+        UpdateStatus::Idle => {
+            if ui
+                .add(sc::Button::outline("Check for updates").small())
+                .clicked()
+            {
+                output.update_action = Some(UpdateAction::Check);
+            }
+        }
+        UpdateStatus::Checking => {
+            ui.add(sc::Button::outline("Checking…").small().disabled(true));
+        }
+        UpdateStatus::UpToDate { current } => {
+            if ui
+                .add(sc::Button::outline(format!("Up to date (v{current}) · Dismiss")).small())
+                .on_hover_text("Click to dismiss")
+                .clicked()
+            {
+                output.update_action = Some(UpdateAction::Dismiss);
+            }
+        }
+        UpdateStatus::Available {
+            version,
+            html_url,
+            can_self_update,
+            fallback_reason,
+        } => {
+            if *can_self_update {
+                if ui
+                    .add(sc::Button::primary(format!("Update to v{version}")).small())
+                    .on_hover_text(format!("Download and stage v{version}"))
+                    .clicked()
+                {
+                    output.update_action = Some(UpdateAction::Download);
                 }
-                UpdateStatus::UpToDate { current } => {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            RichText::new(format!("Up to date (v{current})"))
-                                .size(font_size)
-                                .color(p.text_primary),
-                        );
-                        if ui.add(sc::Button::outline("Dismiss").small()).clicked() {
-                            output.update_action = Some(UpdateAction::Dismiss);
-                        }
-                    });
-                }
-                UpdateStatus::Available {
-                    version,
-                    html_url,
-                    can_self_update,
-                    fallback_reason,
-                } => {
-                    ui.vertical(|ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                RichText::new(format!("Update available: v{version}"))
-                                    .size(font_size)
-                                    .color(p.accent),
-                            );
-                            if *can_self_update {
-                                if ui
-                                    .add(sc::Button::primary("Download update").small())
-                                    .clicked()
-                                {
-                                    output.update_action = Some(UpdateAction::Download);
-                                }
-                                if ui
-                                    .add(sc::Button::outline("Release notes").small())
-                                    .clicked()
-                                {
-                                    output.update_action =
-                                        Some(UpdateAction::OpenReleasePage(html_url.clone()));
-                                }
-                            } else if ui
-                                .add(sc::Button::primary("Open release page").small())
-                                .clicked()
-                            {
-                                output.update_action =
-                                    Some(UpdateAction::OpenReleasePage(html_url.clone()));
-                            }
-                            if ui.add(sc::Button::outline("Dismiss").small()).clicked() {
-                                output.update_action = Some(UpdateAction::Dismiss);
-                            }
-                        });
-                        if let Some(reason) = fallback_reason {
-                            ui.label(
-                                RichText::new(reason)
-                                    .size(11.5 * text_scale)
-                                    .color(p.text_muted),
-                            );
-                        }
-                    });
-                }
-                UpdateStatus::Downloading {
-                    version,
-                    downloaded,
-                    total,
-                } => {
-                    ui.vertical(|ui| {
-                        let label = match total {
-                            Some(total) if *total > 0 => format!(
-                                "Downloading v{version}… {} / {}",
-                                format_mb(*downloaded),
-                                format_mb(*total)
-                            ),
-                            _ => format!("Downloading v{version}… {}", format_mb(*downloaded)),
-                        };
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new(label).size(font_size).color(p.text_primary));
-                            if ui.add(sc::Button::outline("Cancel").small()).clicked() {
-                                output.update_action = Some(UpdateAction::Cancel);
-                            }
-                        });
-                        let progress = total
-                            .filter(|t| *t > 0)
-                            .map(|t| (*downloaded as f32 / t as f32).clamp(0.0, 1.0))
-                            .unwrap_or(0.0);
-                        ui.add(
-                            egui::ProgressBar::new(progress)
-                                .desired_height(6.0)
-                                .fill(p.accent),
-                        );
-                    });
-                }
-                UpdateStatus::Verifying { version } => {
-                    ui.label(
-                        RichText::new(format!("Verifying SHA-256 checksum for v{version}…"))
-                            .size(font_size)
-                            .color(p.text_muted),
-                    );
-                }
-                UpdateStatus::Extracting { version } => {
-                    ui.label(
-                        RichText::new(format!("Staging v{version}…"))
-                            .size(font_size)
-                            .color(p.text_muted),
-                    );
-                }
-                UpdateStatus::ReadyToRestart { version } => {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            RichText::new(format!("v{version} is verified and ready to install."))
-                                .size(font_size)
-                                .color(p.accent),
-                        );
-                        if ui
-                            .add(sc::Button::primary("Restart to apply").small())
-                            .clicked()
-                        {
-                            output.update_action = Some(UpdateAction::RestartToApply);
-                        }
-                        if ui.add(sc::Button::outline("Dismiss").small()).clicked() {
-                            output.update_action = Some(UpdateAction::Dismiss);
-                        }
-                    });
-                }
-                UpdateStatus::Failed { message } => {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(message).size(font_size).color(p.warning));
-                        if ui.add(sc::Button::outline("Retry").small()).clicked() {
-                            output.update_action = Some(UpdateAction::Check);
-                        }
-                        if ui.add(sc::Button::outline("Dismiss").small()).clicked() {
-                            output.update_action = Some(UpdateAction::Dismiss);
-                        }
-                    });
+            } else {
+                let tooltip = fallback_reason
+                    .as_deref()
+                    .unwrap_or("Open GitHub release page");
+                if ui
+                    .add(sc::Button::primary(format!("Get v{version}")).small())
+                    .on_hover_text(tooltip)
+                    .clicked()
+                {
+                    output.update_action = Some(UpdateAction::OpenReleasePage(html_url.clone()));
                 }
             }
-        });
+            if ui.add(sc::Button::outline("Dismiss").small()).clicked() {
+                output.update_action = Some(UpdateAction::Dismiss);
+            }
+        }
+        UpdateStatus::Downloading {
+            version,
+            downloaded,
+            total,
+        } => {
+            let label = match total {
+                Some(total) if *total > 0 => {
+                    let pct = ((*downloaded as f64 / *total as f64) * 100.0)
+                        .clamp(0.0, 100.0)
+                        .round() as u32;
+                    format!("Downloading v{version} ({pct}%) · Cancel")
+                }
+                _ => format!(
+                    "Downloading v{version} ({}) · Cancel",
+                    format_mb(*downloaded)
+                ),
+            };
+            if ui
+                .add(sc::Button::outline(label).small())
+                .on_hover_text("Click to cancel download")
+                .clicked()
+            {
+                output.update_action = Some(UpdateAction::Cancel);
+            }
+        }
+        UpdateStatus::Verifying { version } => {
+            ui.add(
+                sc::Button::outline(format!("Verifying v{version}…"))
+                    .small()
+                    .disabled(true),
+            );
+        }
+        UpdateStatus::Extracting { version } => {
+            ui.add(
+                sc::Button::outline(format!("Staging v{version}…"))
+                    .small()
+                    .disabled(true),
+            );
+        }
+        UpdateStatus::ReadyToRestart { version } => {
+            if ui
+                .add(sc::Button::primary(format!("Restart to update (v{version})")).small())
+                .clicked()
+            {
+                output.update_action = Some(UpdateAction::RestartToApply);
+            }
+            if ui.add(sc::Button::outline("Dismiss").small()).clicked() {
+                output.update_action = Some(UpdateAction::Dismiss);
+            }
+        }
+        UpdateStatus::Failed { message } => {
+            if ui
+                .add(sc::Button::outline("Update failed · Retry").small())
+                .on_hover_text(message)
+                .clicked()
+            {
+                output.update_action = Some(UpdateAction::Check);
+            }
+            if ui.add(sc::Button::outline("Dismiss").small()).clicked() {
+                output.update_action = Some(UpdateAction::Dismiss);
+            }
+        }
+    }
 }
 
 /// Formats a byte count in megabytes for download progress display.
@@ -3574,18 +3501,15 @@ mod tests {
     }
 
     #[test]
-    fn update_footer_and_banner_render_all_states() {
+    fn update_footer_button_mutates_across_all_states() {
         let states: Vec<(UpdateStatus, &str)> = vec![
             (UpdateStatus::Idle, "Check for updates"),
-            (
-                UpdateStatus::Checking,
-                "Checking GitHub for the latest release…",
-            ),
+            (UpdateStatus::Checking, "Checking…"),
             (
                 UpdateStatus::UpToDate {
                     current: "3.0.0".into(),
                 },
-                "Up to date (v3.0.0)",
+                "Up to date (v3.0.0) · Dismiss",
             ),
             (
                 UpdateStatus::Available {
@@ -3594,7 +3518,7 @@ mod tests {
                     can_self_update: true,
                     fallback_reason: None,
                 },
-                "Download update",
+                "Update to v3.1.0",
             ),
             (
                 UpdateStatus::Available {
@@ -3603,7 +3527,7 @@ mod tests {
                     can_self_update: false,
                     fallback_reason: Some("Portable release required".into()),
                 },
-                "Open release page",
+                "Get v3.1.0",
             ),
             (
                 UpdateStatus::Downloading {
@@ -3611,13 +3535,13 @@ mod tests {
                     downloaded: 10 * 1024 * 1024,
                     total: Some(50 * 1024 * 1024),
                 },
-                "Downloading v3.1.0…",
+                "Downloading v3.1.0 (20%) · Cancel",
             ),
             (
                 UpdateStatus::Verifying {
                     version: "3.1.0".into(),
                 },
-                "Verifying SHA-256 checksum",
+                "Verifying v3.1.0…",
             ),
             (
                 UpdateStatus::Extracting {
@@ -3629,13 +3553,13 @@ mod tests {
                 UpdateStatus::ReadyToRestart {
                     version: "3.1.0".into(),
                 },
-                "Restart to apply",
+                "Restart to update (v3.1.0)",
             ),
             (
                 UpdateStatus::Failed {
                     message: "Offline".into(),
                 },
-                "Offline",
+                "Update failed · Retry",
             ),
         ];
 

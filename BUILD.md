@@ -310,3 +310,37 @@ build checks. Binary weights/models are not committed to Git.
 Release publication is still triggered only by an explicit version tag or manual
 release dispatch with publication enabled. Merging the feature PR into main runs
 CI, including package validation, without creating a tag or GitHub Release.
+
+## Manual GitHub Releases updater
+
+The settings footer includes a manual **Check for updates** control that
+mutates in place across states (`Check for updates` → `Checking…` →
+`Update to vX.Y.Z` / `Up to date (vX.Y.Z) · Dismiss` / download progress /
+`Restart to update`). No network requests occur on startup or in the background.
+
+- Checks query `https://api.github.com/repos/<repo>/releases/latest` over
+  HTTPS-only (`ureq` with `https_only(true)`), skip drafts and prereleases, and
+  compare strict `MAJOR.MINOR.PATCH` tags against `Cargo.toml`. API and
+  `.sha256` responses are size-bounded.
+- The target repository defaults to `SaltedByte/TackleCast`. Set
+  `TACKLECAST_UPDATE_REPO=owner/repo` at compile time to test end-to-end
+  against a fork release without modifying source files.
+- Automatic in-place updates require a writable portable package
+  (`build-info.json` next to the executable plus a write probe) and matching
+  platform archive + `.sha256` assets hosted on `github.com` or
+  `*.githubusercontent.com`. Source/dev builds and read-only directories fall
+  back to opening the validated GitHub release page (`ShellExecuteW` on Windows,
+  `xdg-open` on Linux).
+- Before extraction, the archive is verified against the release `.sha256` file
+  (verifying transport integrity matching `release.yml`, not offline
+  code-signing). Extraction rejects path traversal and escaping symlinks,
+  stages into `.update-staging/`, and launches the staged binary with
+  `--apply-update` after waiting for the current process to exit.
+- `--apply-update` overlay-copies release files with `.update-backup/` rollback
+  on copy failure, preserving `tacklecast_settings.json`, `logs/`, and
+  user-added files such as `NvOFFRUC.dll`. Obsolete files removed in a newer
+  release are not deleted automatically. Stale `.update-staging/` and
+  `.update-backup/` folders are removed on the next normal launch.
+- Unit tests cover semver parsing, `.sha256` parsing, URL/host/size validation,
+  safe `.zip` and `.tar.gz` extraction (including symlinks and Unix modes),
+  overlay apply/rollback, and all mutating footer button states.

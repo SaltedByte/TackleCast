@@ -218,11 +218,6 @@ pub enum UpdateStatus {
 }
 
 impl UpdateStatus {
-    /// Returns `true` when no banner should be shown.
-    pub fn is_idle(&self) -> bool {
-        matches!(self, Self::Idle)
-    }
-
     /// Returns `true` while a network or staging operation is in progress.
     pub fn is_busy(&self) -> bool {
         matches!(
@@ -528,9 +523,15 @@ struct GitHubAsset {
     size: u64,
 }
 
-/// Builds a configured `ureq::Agent` with TackleCast's timeout and TLS settings.
+/// Maximum response body size accepted for GitHub API release metadata (1 MiB).
+const MAX_API_RESPONSE_BYTES: u64 = 1024 * 1024;
+
+/// Maximum response body size accepted for a `.sha256` checksum asset (64 KiB).
+const MAX_CHECKSUM_BYTES: u64 = 64 * 1024;
+
+/// Builds a configured `ureq::Agent` with TackleCast's HTTPS-only and timeout settings.
 fn http_agent(timeout: Option<Duration>) -> ureq::Agent {
-    let mut builder = ureq::Agent::config_builder();
+    let mut builder = ureq::Agent::config_builder().https_only(true);
     if let Some(t) = timeout {
         builder = builder.timeout_global(Some(t));
     } else {
@@ -539,6 +540,84 @@ fn http_agent(timeout: Option<Duration>) -> ureq::Agent {
             .timeout_recv_body(Some(Duration::from_secs(60)));
     }
     builder.build().into()
+}
+
+/// Reads at most `max_bytes` from `reader` and decodes it as UTF-8.
+fn read_bounded_utf8<R: Read>(reader: R, max_bytes: u64, label: &str) -> Result<String, String> {
+    let mut buf = Vec::new();
+    reader
+        .take(max_bytes + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("Failed reading {label}: {e}"))?;
+    if buf.len() as u64 > max_bytes {
+        return Err(format!("{label} exceeded maximum allowed size."));
+    }
+    String::from_utf8(buf).map_err(|e| format!("Invalid UTF-8 in {label}: {e}"))
+}
+
+/// Validates that `url` is a safe HTTPS URL on `github.com` or `*.githubusercontent.com`.
+fn validate_https_download_url(url: &str) -> Result<(), String> {
+    if url.is_empty()
+        || url
+            .bytes()
+            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return Err("Refusing download URL with control or whitespace characters.".into());
+    }
+    let Some(rest) = url.strip_prefix("https://") else {
+        return Err(format!("Refusing non-HTTPS download URL: {url}"));
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') || authority.contains(':') {
+        return Err(format!(
+            "Refusing download URL with unexpected authority: {url}"
+        ));
+    }
+    let host = authority.to_ascii_lowercase();
+    let trusted = host == "github.com"
+        || (host.ends_with(".githubusercontent.com")
+            && host.len() > ".githubusercontent.com".len());
+    if !trusted {
+        return Err(format!("Refusing download URL from untrusted host: {host}"));
+    }
+    Ok(())
+}
+
+/// Validates that `url` is a safe GitHub Releases web page URL for `expected_repo`.
+fn validate_github_release_url(url: &str, expected_repo: &str) -> Result<(), String> {
+    if url.is_empty()
+        || url.bytes().any(|b| {
+            b.is_ascii_control()
+                || b.is_ascii_whitespace()
+                || matches!(
+                    b,
+                    b'"' | b'\''
+                        | b'<'
+                        | b'>'
+                        | b'`'
+                        | b'\\'
+                        | b'|'
+                        | b'&'
+                        | b';'
+                        | b'$'
+                        | b'%'
+                        | b'^'
+                )
+        })
+    {
+        return Err("Refusing release URL with unsafe characters.".into());
+    }
+    let expected_prefix = format!(
+        "https://github.com/{}/releases/",
+        expected_repo.to_ascii_lowercase()
+    );
+    let normalized = url.to_ascii_lowercase();
+    if !normalized.starts_with(&expected_prefix) {
+        return Err(format!(
+            "Refusing release URL outside {expected_repo}: {url}"
+        ));
+    }
+    Ok(())
 }
 
 /// Queries GitHub's `/releases/latest` endpoint and evaluates whether an update is available.
@@ -556,21 +635,23 @@ fn fetch_latest_release(repo: &str, current_str: &str) -> Result<CheckOutcome, S
         .call()
         .map_err(format_http_error)?;
 
-    let body = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| format!("Failed reading GitHub response: {e}"))?;
+    let body = read_bounded_utf8(
+        response.body_mut().as_reader(),
+        MAX_API_RESPONSE_BYTES,
+        "GitHub release response",
+    )?;
 
     let install_mode = current_exe_dir()
         .map(|dir| detect_install_mode(&dir))
         .unwrap_or_else(InstallMode::ExternalOnly);
 
-    evaluate_release_json(&body, current, current_platform_asset(), install_mode)
+    evaluate_release_json(&body, repo, current, current_platform_asset(), install_mode)
 }
 
 /// Parses a GitHub latest-release JSON payload and determines the check outcome.
 fn evaluate_release_json(
     json: &str,
+    repo: &str,
     current: SemVer,
     platform_spec: Option<PlatformAssetSpec>,
     install_mode: InstallMode,
@@ -597,6 +678,8 @@ fn evaluate_release_json(
         });
     }
 
+    validate_github_release_url(&release.html_url, repo)?;
+
     let (download_plan, fallback_reason) = match (platform_spec, install_mode) {
         (None, _) => (
             None,
@@ -607,17 +690,21 @@ fn evaluate_release_json(
             let archive = release.assets.iter().find(|a| a.name == spec.archive_name);
             let checksum = release.assets.iter().find(|a| a.name == spec.checksum_name);
             match (archive, checksum) {
-                (Some(arch), Some(sum)) => (
-                    Some(DownloadPlan {
-                        archive_name: arch.name.clone(),
-                        archive_url: arch.browser_download_url.clone(),
-                        checksum_url: sum.browser_download_url.clone(),
-                        expected_size: (arch.size > 0).then_some(arch.size),
-                        kind: spec.kind,
-                        install_dir,
-                    }),
-                    None,
-                ),
+                (Some(arch), Some(sum)) => {
+                    validate_https_download_url(&arch.browser_download_url)?;
+                    validate_https_download_url(&sum.browser_download_url)?;
+                    (
+                        Some(DownloadPlan {
+                            archive_name: arch.name.clone(),
+                            archive_url: arch.browser_download_url.clone(),
+                            checksum_url: sum.browser_download_url.clone(),
+                            expected_size: (arch.size > 0).then_some(arch.size),
+                            kind: spec.kind,
+                            install_dir,
+                        }),
+                        None,
+                    )
+                }
                 (None, _) => (
                     None,
                     Some(format!(
@@ -723,6 +810,12 @@ fn download_and_stage(
     if cancel.load(Ordering::Relaxed) {
         let _ = fs::remove_dir_all(&staging_dir);
         send(WorkerMessage::Cancelled);
+        return;
+    }
+
+    if let Err(err) = validate_https_download_url(&plan.archive_url) {
+        let _ = fs::remove_dir_all(&staging_dir);
+        send(WorkerMessage::Failed(err));
         return;
     }
 
@@ -855,16 +948,18 @@ fn download_and_stage(
 
 /// Downloads and parses the `.sha256` checksum asset for `archive_name`.
 fn fetch_checksum(url: &str, archive_name: &str, user_agent: &str) -> Result<String, String> {
+    validate_https_download_url(url)?;
     let agent = http_agent(Some(API_TIMEOUT));
     let mut response = agent
         .get(url)
         .header("User-Agent", user_agent)
         .call()
         .map_err(format_http_error)?;
-    let text = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| format!("Failed reading checksum file: {e}"))?;
+    let text = read_bounded_utf8(
+        response.body_mut().as_reader(),
+        MAX_CHECKSUM_BYTES,
+        "checksum file",
+    )?;
     parse_sha256_file(&text, archive_name)
         .ok_or_else(|| format!("Checksum file did not contain a valid SHA-256 for {archive_name}."))
 }
@@ -1412,6 +1507,7 @@ fn move_with_retries(from: &Path, to: &Path) -> Result<(), String> {
 
 /// Copies a regular file (preserving Unix permissions) or recreates a symlink.
 fn copy_entry(src: &Path, dst: &Path) -> Result<(), String> {
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let meta = fs::symlink_metadata(src)
         .map_err(|e| format!("Failed reading metadata for {}: {e}", src.display()))?;
 
@@ -1549,20 +1645,34 @@ pub fn cleanup_stale_update_dirs() {
 
 /// Opens a validated GitHub release URL in the user's default web browser.
 pub fn open_release_page(url: &str) -> Result<(), String> {
-    if !url.starts_with("https://github.com/") {
-        return Err(format!("Refusing to open non-GitHub URL: {url}"));
-    }
+    validate_github_release_url(url, update_repo())?;
 
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("Failed opening browser: {e}"))
+        use windows::core::{w, HSTRING, PCWSTR};
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let wide_url = HSTRING::from(url);
+        // SAFETY: `ShellExecuteW` receives valid NUL-terminated UTF-16 strings and
+        // returns an `HINSTANCE` whose numeric value > 32 indicates success.
+        let result = unsafe {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                &wide_url,
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if (result.0 as isize) <= 32 {
+            return Err(format!(
+                "Failed opening browser (ShellExecuteW code {}).",
+                result.0 as isize
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -1674,6 +1784,7 @@ mod tests {
 
         let portable = evaluate_release_json(
             json,
+            DEFAULT_UPDATE_REPO,
             current,
             Some(spec),
             InstallMode::PortableWritable(PathBuf::from("/tmp/install")),
@@ -1690,6 +1801,7 @@ mod tests {
 
         let dev = evaluate_release_json(
             json,
+            DEFAULT_UPDATE_REPO,
             current,
             Some(spec),
             InstallMode::ExternalOnly("dev build".into()),
@@ -1702,6 +1814,57 @@ mod tests {
             }
             CheckOutcome::UpToDate { .. } => panic!("expected available update"),
         }
+    }
+
+    #[test]
+    fn url_validation_rejects_shell_chars_http_and_untrusted_hosts() {
+        assert!(validate_github_release_url(
+            "https://github.com/SaltedByte/TackleCast/releases/tag/v3.1.0",
+            "SaltedByte/TackleCast"
+        )
+        .is_ok());
+        assert!(validate_github_release_url(
+            "https://github.com/saltedbyte/tacklecast/releases/tag/v3.1.0",
+            "SaltedByte/TackleCast"
+        )
+        .is_ok());
+        assert!(validate_github_release_url(
+            "https://github.com/SaltedByte/TackleCast/releases/tag/v3.1.0&calc.exe",
+            "SaltedByte/TackleCast"
+        )
+        .is_err());
+        assert!(validate_github_release_url(
+            "https://github.com/OtherUser/TackleCast/releases/tag/v3.1.0",
+            "SaltedByte/TackleCast"
+        )
+        .is_err());
+        assert!(validate_github_release_url(
+            "http://github.com/SaltedByte/TackleCast/releases/tag/v3.1.0",
+            "SaltedByte/TackleCast"
+        )
+        .is_err());
+
+        assert!(validate_https_download_url(
+            "https://github.com/SaltedByte/TackleCast/releases/download/v3.1.0/TackleCast-Windows-x86_64.zip"
+        )
+        .is_ok());
+        assert!(validate_https_download_url(
+            "https://objects.githubusercontent.com/github-production-release-asset/foo"
+        )
+        .is_ok());
+        assert!(validate_https_download_url(
+            "http://github.com/SaltedByte/TackleCast/releases/download/v3.1.0/a.zip"
+        )
+        .is_err());
+        assert!(validate_https_download_url("https://github.com@evil.example/a.zip").is_err());
+        assert!(validate_https_download_url("https://evil.example/a.zip").is_err());
+    }
+
+    #[test]
+    fn bounded_utf8_reader_rejects_oversized_payloads() {
+        let ok = read_bounded_utf8(&b"hello"[..], 5, "test").unwrap();
+        assert_eq!(ok, "hello");
+        assert!(read_bounded_utf8(&b"hello!"[..], 5, "test").is_err());
     }
 
     #[test]

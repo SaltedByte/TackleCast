@@ -48,6 +48,7 @@ Keep the extracted files together: the app uses the libraries and, where include
 | Toggle fullscreen | F11 |
 | Save settings and return to your game | Apply & close |
 | Rediscover a reconnected capture card or audio device | Reinitialize devices |
+| Check for a newer release | Check for updates |
 
 Settings are grouped into **Video**, **Picture**, **Audio**, **Frame Gen**, and **Display**. Picture adjustments preview live; closing the menu saves your choices and applies device changes.
 
