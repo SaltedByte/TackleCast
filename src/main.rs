@@ -24,6 +24,7 @@ mod settings;
 mod theme;
 mod triple_buffer;
 mod ui;
+mod updater;
 #[cfg(any(target_os = "windows", test))]
 mod usb_link;
 #[cfg(target_os = "windows")]
@@ -80,6 +81,8 @@ pub enum AppEvent {
     FrameReady,
     /// The frame generation worker has results or status for the UI thread.
     FrameGenEvent,
+    /// The background updater worker has new status or download progress.
+    UpdateEvent,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -217,6 +220,9 @@ impl CliArgs {
 }
 
 fn main() {
+    if let Some(exit_code) = updater::maybe_run_apply_update_from_args() {
+        std::process::exit(exit_code);
+    }
     #[cfg(target_os = "windows")]
     if capabilities::handle_probe_args() {
         return;
@@ -273,6 +279,9 @@ fn main() {
     let _ = unsafe { SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(APP_ID)) };
 
     let cli = CliArgs::parse();
+    if !cli.test_mode && !cli.preview_active() && cli.bench_seconds.is_none() {
+        updater::cleanup_stale_update_dirs();
+    }
     let mut settings = Settings::load();
     if let Some(theme) = cli.preview_theme {
         settings.theme = theme;
@@ -421,6 +430,8 @@ struct App {
     framegen: framegen::FrameGenController,
     /// Diagnostic clip recorder (raw captured frames for `--fg-replay`).
     recorder: framegen::recorder::ClipRecorder,
+    /// Manual GitHub Releases self-updater controller.
+    updater: updater::UpdateController,
     /// Frame generation was forced on from the command line (not saved).
     force_framegen: bool,
     /// False for automated runs (bench) so the user's settings are untouched.
@@ -467,6 +478,10 @@ impl App {
         let factory = framegen::platform_backend_factory(Box::new(move || {
             let _ = waker_proxy.send_event(AppEvent::FrameGenEvent);
         }));
+        let update_proxy = event_proxy.clone();
+        let updater = updater::UpdateController::new(move || {
+            let _ = update_proxy.send_event(AppEvent::UpdateEvent);
+        });
         let bench = cli.bench_seconds.map(|seconds| Bench {
             started: Instant::now(),
             duration: Duration::from_secs_f64(seconds.clamp(5.0, 3600.0)),
@@ -484,6 +499,7 @@ impl App {
         Self {
             framegen: framegen::FrameGenController::new(fg_config, factory),
             recorder: Default::default(),
+            updater,
             force_framegen: cli.force_framegen,
             persist_settings: cli.bench_seconds.is_none() && !cli.test_mode,
             test_fps: cli.test_fps,
@@ -806,6 +822,7 @@ impl ApplicationHandler<AppEvent> for App {
                             framegen_forced: self.force_framegen,
                             recorder_status: &recorder_status,
                             recorder_available,
+                            update_status: self.updater.snapshot(),
                         },
                     );
                     if prepared_ui.output.retry_framegen {
@@ -831,9 +848,10 @@ impl ApplicationHandler<AppEvent> for App {
                             .start(&base, Duration::from_secs(10), info, Instant::now());
                     }
                     let toggle_fullscreen = prepared_ui.output.toggle_fullscreen;
-                    let exit_requested = prepared_ui.output.exit_requested;
+                    let mut exit_requested = prepared_ui.output.exit_requested;
                     let apply_settings = prepared_ui.output.apply_settings.clone();
                     let reinitialize_devices = prepared_ui.output.reinitialize_devices.clone();
+                    let update_action = prepared_ui.output.update_action.clone();
                     if let Some(live) = &prepared_ui.output.live_settings {
                         self.audio.set_volume(live.volume);
                         self.audio.set_muted(live.audio_muted);
@@ -862,6 +880,11 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     if let Some(settings) = reinitialize_devices {
                         self.reinitialize_devices(settings);
+                    }
+                    if let Some(action) = update_action {
+                        if self.handle_update_action(action) {
+                            exit_requested = true;
+                        }
                     }
                     if exit_requested {
                         if let Some(capture) = &mut self.capture {
@@ -929,6 +952,13 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             AppEvent::FrameGenEvent => self.service_framegen(),
+            AppEvent::UpdateEvent => {
+                if self.updater.poll() {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
         }
     }
 
@@ -1105,6 +1135,51 @@ impl ApplicationHandler<AppEvent> for App {
 }
 
 impl App {
+    /// Handles an action emitted by the settings footer or inline update banner.
+    ///
+    /// Returns `true` when the staged updater was launched and the application
+    /// should exit cleanly so file replacement can proceed.
+    fn handle_update_action(&mut self, action: updater::UpdateAction) -> bool {
+        let should_exit = match action {
+            updater::UpdateAction::Check => {
+                self.updater.check_for_updates();
+                false
+            }
+            updater::UpdateAction::Download => {
+                self.updater.start_download();
+                false
+            }
+            updater::UpdateAction::Cancel => {
+                self.updater.cancel_download();
+                false
+            }
+            updater::UpdateAction::RestartToApply => match self.updater.launch_staged_updater() {
+                Ok(()) => {
+                    info!("launched staged updater; exiting to apply update");
+                    true
+                }
+                Err(err) => {
+                    error!("failed launching staged updater: {err}");
+                    false
+                }
+            },
+            updater::UpdateAction::OpenReleasePage(url) => {
+                if let Err(err) = updater::open_release_page(&url) {
+                    warn!("failed opening release page: {err}");
+                }
+                false
+            }
+            updater::UpdateAction::Dismiss => {
+                self.updater.dismiss();
+                false
+            }
+        };
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        should_exit
+    }
+
     fn remember_changed_audio_choices(&self, settings: &mut Settings) {
         if settings.audio_input != self.settings.audio_input {
             settings.audio_input_name = None;

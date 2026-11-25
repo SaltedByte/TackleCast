@@ -9,6 +9,7 @@ use crate::settings::{
     RifeModel,
 };
 use crate::theme::Palette;
+use crate::updater::{UpdateAction, UpdateStatus};
 use egui::{Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Stroke};
 use egui_components as sc;
 use egui_extras::{Size, StripBuilder};
@@ -96,6 +97,7 @@ pub struct UiFrame<'a> {
     pub framegen_forced: bool,
     pub recorder_status: &'a str,
     pub recorder_available: bool,
+    pub update_status: &'a UpdateStatus,
 }
 
 pub struct PreparedUi {
@@ -117,6 +119,8 @@ pub struct UiOutput {
     pub retry_framegen: bool,
     /// Start recording a diagnostic clip (raw captured frames).
     pub record_clip: bool,
+    /// User-triggered action from the update footer button or status banner.
+    pub update_action: Option<UpdateAction>,
     pub repaint_after: Duration,
 }
 
@@ -874,22 +878,23 @@ fn draw_menu(
                             ),
                         );
                         ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add(
-                                    sc::Button::outline(if frame.devices_busy {
-                                        "Reinitializing…"
-                                    } else {
-                                        "Reinitialize devices"
-                                    })
-                                    .small()
-                                    .disabled(frame.devices_busy),
-                                )
-                                .clicked()
-                            {
-                                output.reinitialize_devices = Some(draft.clone());
-                            }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if menu_width < 520.0 {
+                            ui.horizontal_wrapped(|ui| {
+                                if ui
+                                    .add(
+                                        sc::Button::outline(if frame.devices_busy {
+                                            "Reinitializing…"
+                                        } else {
+                                            "Reinitialize devices"
+                                        })
+                                        .small()
+                                        .disabled(frame.devices_busy),
+                                    )
+                                    .clicked()
+                                {
+                                    output.reinitialize_devices = Some(draft.clone());
+                                }
+                                draw_update_button(ui, frame.update_status, output);
                                 if ui
                                     .add(
                                         sc::Button::primary("Apply & close")
@@ -901,7 +906,37 @@ fn draw_menu(
                                     output.apply_settings = Some(draft.clone());
                                 }
                             });
-                        });
+                        } else {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(
+                                        sc::Button::outline(if frame.devices_busy {
+                                            "Reinitializing…"
+                                        } else {
+                                            "Reinitialize devices"
+                                        })
+                                        .small()
+                                        .disabled(frame.devices_busy),
+                                    )
+                                    .clicked()
+                                {
+                                    output.reinitialize_devices = Some(draft.clone());
+                                }
+                                draw_update_button(ui, frame.update_status, output);
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui
+                                        .add(
+                                            sc::Button::primary("Apply & close")
+                                                .small()
+                                                .disabled(frame.devices_busy),
+                                        )
+                                        .clicked()
+                                    {
+                                        output.apply_settings = Some(draft.clone());
+                                    }
+                                });
+                            });
+                        }
                     });
                 });
         });
@@ -920,6 +955,129 @@ fn draw_menu(
                 output.apply_settings = Some(draft.clone());
             }
         });
+}
+
+/// Renders the mutating update button in the settings footer.
+fn draw_update_button(ui: &mut egui::Ui, status: &UpdateStatus, output: &mut UiOutput) {
+    match status {
+        UpdateStatus::Idle => {
+            if ui
+                .add(sc::Button::outline("Check for updates").small())
+                .clicked()
+            {
+                output.update_action = Some(UpdateAction::Check);
+            }
+        }
+        UpdateStatus::Checking => {
+            ui.add(sc::Button::outline("Checking…").small().disabled(true));
+        }
+        UpdateStatus::UpToDate { current } => {
+            if ui
+                .add(sc::Button::outline(format!("Up to date (v{current}) · Dismiss")).small())
+                .on_hover_text("Click to dismiss")
+                .clicked()
+            {
+                output.update_action = Some(UpdateAction::Dismiss);
+            }
+        }
+        UpdateStatus::Available {
+            version,
+            html_url,
+            can_self_update,
+            fallback_reason,
+        } => {
+            if *can_self_update {
+                if ui
+                    .add(sc::Button::primary(format!("Update to v{version}")).small())
+                    .on_hover_text(format!("Download and stage v{version}"))
+                    .clicked()
+                {
+                    output.update_action = Some(UpdateAction::Download);
+                }
+            } else {
+                let tooltip = fallback_reason
+                    .as_deref()
+                    .unwrap_or("Open GitHub release page");
+                if ui
+                    .add(sc::Button::primary(format!("Get v{version}")).small())
+                    .on_hover_text(tooltip)
+                    .clicked()
+                {
+                    output.update_action = Some(UpdateAction::OpenReleasePage(html_url.clone()));
+                }
+            }
+            if ui.add(sc::Button::outline("Dismiss").small()).clicked() {
+                output.update_action = Some(UpdateAction::Dismiss);
+            }
+        }
+        UpdateStatus::Downloading {
+            version,
+            downloaded,
+            total,
+        } => {
+            let label = match total {
+                Some(total) if *total > 0 => {
+                    let pct = ((*downloaded as f64 / *total as f64) * 100.0)
+                        .clamp(0.0, 100.0)
+                        .round() as u32;
+                    format!("Downloading v{version} ({pct}%) · Cancel")
+                }
+                _ => format!(
+                    "Downloading v{version} ({}) · Cancel",
+                    format_mb(*downloaded)
+                ),
+            };
+            if ui
+                .add(sc::Button::outline(label).small())
+                .on_hover_text("Click to cancel download")
+                .clicked()
+            {
+                output.update_action = Some(UpdateAction::Cancel);
+            }
+        }
+        UpdateStatus::Verifying { version } => {
+            ui.add(
+                sc::Button::outline(format!("Verifying v{version}…"))
+                    .small()
+                    .disabled(true),
+            );
+        }
+        UpdateStatus::Extracting { version } => {
+            ui.add(
+                sc::Button::outline(format!("Staging v{version}…"))
+                    .small()
+                    .disabled(true),
+            );
+        }
+        UpdateStatus::ReadyToRestart { version } => {
+            if ui
+                .add(sc::Button::primary(format!("Restart to update (v{version})")).small())
+                .clicked()
+            {
+                output.update_action = Some(UpdateAction::RestartToApply);
+            }
+            if ui.add(sc::Button::outline("Dismiss").small()).clicked() {
+                output.update_action = Some(UpdateAction::Dismiss);
+            }
+        }
+        UpdateStatus::Failed { message } => {
+            if ui
+                .add(sc::Button::outline("Update failed · Retry").small())
+                .on_hover_text(message)
+                .clicked()
+            {
+                output.update_action = Some(UpdateAction::Check);
+            }
+            if ui.add(sc::Button::outline("Dismiss").small()).clicked() {
+                output.update_action = Some(UpdateAction::Dismiss);
+            }
+        }
+    }
+}
+
+/// Formats a byte count in megabytes for download progress display.
+fn format_mb(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
 }
 
 fn edition_header(ui: &mut egui::Ui, theme: Theme) -> f32 {
@@ -1876,6 +2034,7 @@ mod tests {
                                 framegen_forced: false,
                                 recorder_status: "",
                                 recorder_available: false,
+                                update_status: &UpdateStatus::Idle,
                             },
                             &mut UiOutput::default(),
                         );
@@ -2049,6 +2208,7 @@ mod tests {
                             framegen_forced: false,
                             recorder_status: "",
                             recorder_available: false,
+                            update_status: &UpdateStatus::Idle,
                         },
                     );
                     if let Some(live) = &output.output.live_settings {
@@ -2543,6 +2703,7 @@ mod tests {
                 framegen_forced: false,
                 recorder_status: "",
                 recorder_available: false,
+                update_status: &UpdateStatus::Idle,
             };
             let mut text = String::new();
             for _ in 0..3 {
@@ -2643,6 +2804,7 @@ mod tests {
             framegen_forced: false,
             recorder_status: "",
             recorder_available: false,
+            update_status: &UpdateStatus::Idle,
         };
         let mut tab = MenuTab::Display;
         ctx.data_mut(|data| data.insert_temp(egui::Id::new("test_overlay_focus"), true));
@@ -2728,6 +2890,7 @@ mod tests {
             framegen_forced: false,
             recorder_status: "",
             recorder_available: false,
+            update_status: &UpdateStatus::Idle,
         };
         let mut tab = MenuTab::Display;
         let mut texts = String::new();
@@ -2937,6 +3100,7 @@ mod tests {
                             framegen_forced: false,
                             recorder_status: "",
                             recorder_available: false,
+                            update_status: &UpdateStatus::Idle,
                         },
                         &mut UiOutput::default(),
                     );
@@ -3038,6 +3202,7 @@ mod tests {
                     framegen_forced: false,
                     recorder_status: "",
                     recorder_available: false,
+                    update_status: &UpdateStatus::Idle,
                 };
                 let mut previous_size = None;
                 let mut label_left = None;
@@ -3333,5 +3498,125 @@ mod tests {
             overlay.status_message.as_deref(),
             Some("Reconnecting capture…")
         );
+    }
+
+    #[test]
+    fn update_footer_button_mutates_across_all_states() {
+        let states: Vec<(UpdateStatus, &str)> = vec![
+            (UpdateStatus::Idle, "Check for updates"),
+            (UpdateStatus::Checking, "Checking…"),
+            (
+                UpdateStatus::UpToDate {
+                    current: "3.0.0".into(),
+                },
+                "Up to date (v3.0.0) · Dismiss",
+            ),
+            (
+                UpdateStatus::Available {
+                    version: "3.1.0".into(),
+                    html_url: "https://github.com/SaltedByte/TackleCast/releases/tag/v3.1.0".into(),
+                    can_self_update: true,
+                    fallback_reason: None,
+                },
+                "Update to v3.1.0",
+            ),
+            (
+                UpdateStatus::Available {
+                    version: "3.1.0".into(),
+                    html_url: "https://github.com/SaltedByte/TackleCast/releases/tag/v3.1.0".into(),
+                    can_self_update: false,
+                    fallback_reason: Some("Portable release required".into()),
+                },
+                "Get v3.1.0",
+            ),
+            (
+                UpdateStatus::Downloading {
+                    version: "3.1.0".into(),
+                    downloaded: 10 * 1024 * 1024,
+                    total: Some(50 * 1024 * 1024),
+                },
+                "Downloading v3.1.0 (20%) · Cancel",
+            ),
+            (
+                UpdateStatus::Verifying {
+                    version: "3.1.0".into(),
+                },
+                "Verifying v3.1.0…",
+            ),
+            (
+                UpdateStatus::Extracting {
+                    version: "3.1.0".into(),
+                },
+                "Staging v3.1.0…",
+            ),
+            (
+                UpdateStatus::ReadyToRestart {
+                    version: "3.1.0".into(),
+                },
+                "Restart to update (v3.1.0)",
+            ),
+            (
+                UpdateStatus::Failed {
+                    message: "Offline".into(),
+                },
+                "Update failed · Retry",
+            ),
+        ];
+
+        for (status, expected) in states {
+            let ctx = egui::Context::default();
+            let mut settings = Settings::default();
+            let overlay = sample();
+            let frame = UiFrame {
+                overlay: &overlay,
+                settings: &Settings::default(),
+                video_devices: &[],
+                audio_inputs: &[],
+                audio_outputs: &[],
+                is_fullscreen: false,
+                audio_status: "",
+                devices_busy: false,
+                framegen: &FgDiagnostics::default(),
+                framegen_forced: false,
+                recorder_status: "",
+                recorder_available: false,
+                update_status: &status,
+            };
+            let mut text = String::new();
+            for _ in 0..2 {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1280.0, 720.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |root| {
+                        configure_style(root.ctx(), settings.theme);
+                        draw_menu(
+                            root.ctx(),
+                            &mut settings,
+                            &mut MenuTab::Display,
+                            &frame,
+                            &mut UiOutput::default(),
+                        );
+                    },
+                );
+                text = output
+                    .shapes
+                    .into_iter()
+                    .filter_map(|s| match s.shape {
+                        egui::Shape::Text(t) => Some(t.galley.job.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            assert!(
+                text.contains(expected),
+                "expected '{expected}' in rendered settings menu for {status:?}, got:\n{text}"
+            );
+        }
     }
 }
