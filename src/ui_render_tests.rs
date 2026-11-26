@@ -89,6 +89,7 @@ fn settings_pages_render_with_readable_controls() {
                 framegen_forced: false,
                 recorder_status: "",
                 recorder_available: false,
+                update_status: Some(&crate::updater::UpdateStatus::Idle),
             };
             let mut tab = page.menu_tab().unwrap_or(MenuTab::Display);
             if page == PreviewPage::Overlay {
