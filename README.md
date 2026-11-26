@@ -52,6 +52,8 @@ Keep the extracted files together: the app uses the libraries and, where include
 
 Settings are grouped into **Video**, **Picture**, **Audio**, **Frame Gen**, and **Display**. Picture adjustments preview live; closing the menu saves your choices and applies device changes.
 
+**Check for updates** contacts GitHub only when clicked. Launch TackleCast with `--no-updates` to hide the control.
+
 ## Frame generation
 
 Some console games run at 30 FPS. TackleCast's optional frame generation creates an extra frame between captured frames to make motion look smoother at 60 FPS. It starts **off**; you can enable it in the **Frame Gen** tab on Windows.

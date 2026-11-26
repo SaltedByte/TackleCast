@@ -1,47 +1,36 @@
 //! Manual GitHub Releases self-updater for TackleCast.
 //!
 //! Queries GitHub's stable `/releases/latest` endpoint only when explicitly
-//! requested by the user, verifies the matching platform archive against its
-//! published `.sha256` checksum, stages extraction into a temporary directory
-//! next to the executable, and hands off file replacement to the staged binary
-//! via `--apply-update` with backup and rollback.
+//! requested by the user. In-place installation requires a release signed
+//! by the build's pinned key and a recoverable filesystem transaction.
 
-use std::collections::HashSet;
-use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use flate2::read::GzDecoder;
+use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tar::Archive;
-use tracing::{info, warn};
-use zip::ZipArchive;
+use tempfile::TempDir;
+
+mod archive;
+mod install;
 
 /// Default upstream GitHub repository queried for official TackleCast releases.
 pub const DEFAULT_UPDATE_REPO: &str = "SaltedByte/TackleCast";
 
-/// Staging directory name created inside the portable install folder.
-const STAGING_DIR_NAME: &str = ".update-staging";
-
-/// Backup directory name used during `--apply-update` for rollback on failure.
-const BACKUP_DIR_NAME: &str = ".update-backup";
-
-/// Internal CLI flag used to invoke the staged binary as an update helper.
-const APPLY_UPDATE_FLAG: &str = "--apply-update";
-
 /// Network timeout applied to GitHub API and checksum requests.
 const API_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Maximum wait time for the parent TackleCast process to exit before applying.
-const PARENT_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_ASSET_REDIRECTS: u32 = 5;
 
 /// Returns the `owner/repo` slug queried for updates.
 ///
@@ -158,18 +147,13 @@ enum InstallMode {
 /// Requires `build-info.json` next to the executable (to avoid overwriting
 /// `cargo` dev builds) and verifies write permission with a temporary probe.
 fn detect_install_mode(exe_dir: &Path) -> InstallMode {
-    if !exe_dir.join("build-info.json").is_file() {
+    if install::read_version(exe_dir).ok() != SemVer::parse(current_version()) {
         return InstallMode::ExternalOnly(
             "Portable release required for in-app update (dev/source build detected).".into(),
         );
     }
-    let probe = exe_dir.join(format!(".tacklecast-write-probe-{}", std::process::id()));
-    match File::create(&probe) {
-        Ok(file) => {
-            drop(file);
-            let _ = fs::remove_file(&probe);
-            InstallMode::PortableWritable(exe_dir.to_path_buf())
-        }
+    match tempfile::tempfile_in(exe_dir) {
+        Ok(_) => InstallMode::PortableWritable(exe_dir.to_path_buf()),
         Err(_) => InstallMode::ExternalOnly(
             "Install folder is read-only; download the release manually.".into(),
         ),
@@ -248,11 +232,11 @@ pub enum UpdateAction {
 }
 
 /// Metadata retained for a discovered update that can be downloaded.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PendingRelease {
     version: String,
     html_url: String,
-    download_plan: Option<DownloadPlan>,
+    download_plan: Option<Box<DownloadPlan>>,
     fallback_reason: Option<String>,
 }
 
@@ -262,17 +246,19 @@ struct DownloadPlan {
     archive_name: String,
     archive_url: String,
     checksum_url: String,
+    signature_url: String,
+    public_key: [u8; 32],
+    repo: String,
+    tag: String,
     expected_size: Option<u64>,
     kind: ArchiveKind,
     install_dir: PathBuf,
 }
 
 /// Staged update ready to be applied on restart.
-#[derive(Debug, Clone)]
 struct StagedUpdate {
     version: String,
-    staging_dir: PathBuf,
-    install_dir: PathBuf,
+    work: TempDir,
 }
 
 /// Internal messages sent from background worker threads to [`UpdateController`].
@@ -451,12 +437,13 @@ impl UpdateController {
         if self.status.is_busy() {
             return;
         }
-        let Some(release) = self.pending.clone() else {
+        let Some(release) = &self.pending else {
             return;
         };
-        let Some(plan) = release.download_plan else {
+        let Some(plan) = release.download_plan.clone() else {
             return;
         };
+        let version = release.version.clone();
 
         self.cancel_flag = Arc::new(AtomicBool::new(false));
         let cancel = Arc::clone(&self.cancel_flag);
@@ -464,13 +451,13 @@ impl UpdateController {
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
         self.status = UpdateStatus::Downloading {
-            version: release.version.clone(),
+            version: version.clone(),
             downloaded: 0,
             total: plan.expected_size,
         };
 
         std::thread::spawn(move || {
-            download_and_stage(release.version, plan, cancel, &tx, &waker);
+            download_and_stage(version, *plan, cancel, &tx, &waker);
         });
     }
 
@@ -482,16 +469,19 @@ impl UpdateController {
     /// Dismisses the status banner when no background task is actively running.
     pub fn dismiss(&mut self) {
         if !self.status.is_busy() {
+            self.pending = None;
+            self.staged = None;
             self.status = UpdateStatus::Idle;
         }
     }
 
     /// Spawns the staged binary in `--apply-update` mode so the caller can exit.
     pub fn launch_staged_updater(&mut self) -> Result<(), String> {
-        let Some(staged) = self.staged.clone() else {
+        let Some(staged) = self.staged.take() else {
             return Err("No staged update is ready to apply.".into());
         };
-        if let Err(err) = spawn_staged_helper(&staged) {
+        if let Err(err) = install::spawn_helper(staged.work) {
+            let err = format!("Could not launch the staged update: {err}");
             self.status = UpdateStatus::Failed {
                 message: err.clone(),
             };
@@ -529,21 +519,19 @@ const MAX_API_RESPONSE_BYTES: u64 = 1024 * 1024;
 /// Maximum response body size accepted for a `.sha256` checksum asset (64 KiB).
 const MAX_CHECKSUM_BYTES: u64 = 64 * 1024;
 
-/// Builds a configured `ureq::Agent` with TackleCast's HTTPS-only and timeout settings.
-fn http_agent(timeout: Option<Duration>) -> ureq::Agent {
-    let mut builder = ureq::Agent::config_builder().https_only(true);
-    if let Some(t) = timeout {
-        builder = builder.timeout_global(Some(t));
-    } else {
-        builder = builder
-            .timeout_connect(Some(API_TIMEOUT))
-            .timeout_recv_body(Some(Duration::from_secs(60)));
-    }
-    builder.build().into()
+fn http_agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .https_only(true)
+        .max_redirects(0)
+        .timeout_connect(Some(API_TIMEOUT))
+        .timeout_per_read(Some(API_TIMEOUT))
+        .timeout_recv_response(Some(API_TIMEOUT))
+        .timeout_global(Some(timeout))
+        .build()
+        .into()
 }
 
-/// Reads at most `max_bytes` from `reader` and decodes it as UTF-8.
-fn read_bounded_utf8<R: Read>(reader: R, max_bytes: u64, label: &str) -> Result<String, String> {
+fn read_bounded<R: Read>(reader: R, max_bytes: u64, label: &str) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
     reader
         .take(max_bytes + 1)
@@ -552,39 +540,105 @@ fn read_bounded_utf8<R: Read>(reader: R, max_bytes: u64, label: &str) -> Result<
     if buf.len() as u64 > max_bytes {
         return Err(format!("{label} exceeded maximum allowed size."));
     }
-    String::from_utf8(buf).map_err(|e| format!("Invalid UTF-8 in {label}: {e}"))
+    Ok(buf)
 }
 
-/// Validates that `url` is a safe HTTPS URL on `github.com` or `*.githubusercontent.com`.
-fn validate_https_download_url(url: &str) -> Result<(), String> {
-    if url.is_empty()
-        || url
-            .bytes()
-            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
-    {
-        return Err("Refusing download URL with control or whitespace characters.".into());
-    }
-    let Some(rest) = url.strip_prefix("https://") else {
-        return Err(format!("Refusing non-HTTPS download URL: {url}"));
+fn read_bounded_utf8(reader: impl Read, max_bytes: u64, label: &str) -> Result<String, String> {
+    String::from_utf8(read_bounded(reader, max_bytes, label)?)
+        .map_err(|err| format!("Invalid UTF-8 in {label}: {err}"))
+}
+
+fn validate_repo(repo: &str) -> Result<(), String> {
+    let valid_part = |part: &str| {
+        !matches!(part, "" | "." | "..")
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() || authority.contains('@') || authority.contains(':') {
-        return Err(format!(
-            "Refusing download URL with unexpected authority: {url}"
-        ));
+    if repo
+        .split_once('/')
+        .is_some_and(|(owner, name)| valid_part(owner) && valid_part(name))
+    {
+        Ok(())
+    } else {
+        Err("Invalid update repository. Expected owner/repo.".into())
     }
-    let host = authority.to_ascii_lowercase();
-    let trusted = host == "github.com"
-        || (host.ends_with(".githubusercontent.com")
-            && host.len() > ".githubusercontent.com".len());
-    if !trusted {
-        return Err(format!("Refusing download URL from untrusted host: {host}"));
+}
+
+fn validate_https_download_url(url: &str) -> Result<ureq::http::Uri, String> {
+    let uri: ureq::http::Uri = url.parse().map_err(|_| "Invalid update asset URL.")?;
+    let authority = uri
+        .authority()
+        .map(|authority| authority.as_str().to_ascii_lowercase());
+    if uri.scheme_str() != Some("https")
+        || !matches!(
+            authority.as_deref(),
+            Some(
+                "github.com"
+                    | "release-assets.githubusercontent.com"
+                    | "objects.githubusercontent.com"
+            )
+        )
+        || url.contains(['#', '\\'])
+    {
+        return Err("Update asset URL must use HTTPS on GitHub's release hosts.".into());
+    }
+    Ok(uri)
+}
+
+fn validate_release_asset(asset: &GitHubAsset, repo: &str, tag: &str) -> Result<(), String> {
+    let uri = validate_https_download_url(&asset.browser_download_url)?;
+    let path = uri.path();
+    let prefix = format!("/{repo}/releases/download/");
+    let suffix = format!("{tag}/{}", asset.name);
+    if !uri
+        .host()
+        .is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
+        || uri.query().is_some()
+        || !path
+            .get(..prefix.len())
+            .is_some_and(|part| part.eq_ignore_ascii_case(&prefix))
+        || path.get(prefix.len()..) != Some(suffix.as_str())
+    {
+        return Err("Update asset URL does not match the selected repository and release.".into());
     }
     Ok(())
 }
 
+fn open_asset(
+    agent: &ureq::Agent,
+    url: &str,
+    user_agent: &str,
+) -> Result<ureq::http::Response<ureq::Body>, String> {
+    let mut uri = validate_https_download_url(url)?;
+    for _ in 0..=MAX_ASSET_REDIRECTS {
+        let response = agent
+            .get(&uri)
+            .header("User-Agent", user_agent)
+            .call()
+            .map_err(format_http_error)?;
+        if response.status() == ureq::http::StatusCode::OK {
+            return Ok(response);
+        }
+        if !response.status().is_redirection() {
+            return Err(format!(
+                "Unexpected update download status: {}",
+                response.status()
+            ));
+        }
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|header| header.to_str().ok())
+            .ok_or_else(|| "Update download redirect is missing a valid URL.".to_string())?;
+        uri = validate_https_download_url(location)?;
+    }
+    Err("Too many redirects while downloading an update.".into())
+}
+
 /// Validates that `url` is a safe GitHub Releases web page URL for `expected_repo`.
 fn validate_github_release_url(url: &str, expected_repo: &str) -> Result<(), String> {
+    validate_repo(expected_repo)?;
     if url.is_empty()
         || url.bytes().any(|b| {
             b.is_ascii_control()
@@ -622,18 +676,25 @@ fn validate_github_release_url(url: &str, expected_repo: &str) -> Result<(), Str
 
 /// Queries GitHub's `/releases/latest` endpoint and evaluates whether an update is available.
 fn fetch_latest_release(repo: &str, current_str: &str) -> Result<CheckOutcome, String> {
+    validate_repo(repo)?;
     let current = SemVer::parse(current_str)
         .ok_or_else(|| format!("Invalid local version '{current_str}'."))?;
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let user_agent = format!("TackleCast/{current_str}");
 
-    let agent = http_agent(Some(API_TIMEOUT));
+    let agent = http_agent(API_TIMEOUT);
     let mut response = agent
         .get(&url)
         .header("User-Agent", &user_agent)
         .header("Accept", "application/vnd.github+json")
         .call()
         .map_err(format_http_error)?;
+    if response.status() != ureq::http::StatusCode::OK {
+        return Err(format!(
+            "Unexpected GitHub release response: {}",
+            response.status()
+        ));
+    }
 
     let body = read_bounded_utf8(
         response.body_mut().as_reader(),
@@ -645,7 +706,16 @@ fn fetch_latest_release(repo: &str, current_str: &str) -> Result<CheckOutcome, S
         .map(|dir| detect_install_mode(&dir))
         .unwrap_or_else(InstallMode::ExternalOnly);
 
-    evaluate_release_json(&body, repo, current, current_platform_asset(), install_mode)
+    let public_key =
+        option_env!("TACKLECAST_UPDATE_PUBLIC_KEY").and_then(|key| decode_hex(key.trim()));
+    evaluate_release_json(
+        &body,
+        repo,
+        current,
+        current_platform_asset(),
+        install_mode,
+        public_key,
+    )
 }
 
 /// Parses a GitHub latest-release JSON payload and determines the check outcome.
@@ -655,6 +725,7 @@ fn evaluate_release_json(
     current: SemVer,
     platform_spec: Option<PlatformAssetSpec>,
     install_mode: InstallMode,
+    public_key: Option<[u8; 32]>,
 ) -> Result<CheckOutcome, String> {
     let release: GitHubRelease =
         serde_json::from_str(json).map_err(|e| format!("Invalid GitHub release payload: {e}"))?;
@@ -680,44 +751,56 @@ fn evaluate_release_json(
 
     validate_github_release_url(&release.html_url, repo)?;
 
-    let (download_plan, fallback_reason) = match (platform_spec, install_mode) {
-        (None, _) => (
+    let (download_plan, fallback_reason) = match (platform_spec, install_mode, public_key) {
+        (None, _, _) => (
             None,
             Some("No official self-update archive for this platform.".into()),
         ),
-        (_, InstallMode::ExternalOnly(reason)) => (None, Some(reason)),
-        (Some(spec), InstallMode::PortableWritable(install_dir)) => {
+        (_, InstallMode::ExternalOnly(reason), _) => (None, Some(reason)),
+        (_, _, None) => (
+            None,
+            Some("No update signing key is configured for this build.".into()),
+        ),
+        (Some(spec), InstallMode::PortableWritable(install_dir), Some(public_key)) => {
             let archive = release.assets.iter().find(|a| a.name == spec.archive_name);
             let checksum = release.assets.iter().find(|a| a.name == spec.checksum_name);
-            match (archive, checksum) {
-                (Some(arch), Some(sum)) => {
-                    validate_https_download_url(&arch.browser_download_url)?;
-                    validate_https_download_url(&sum.browser_download_url)?;
+            let signature_name = format!("{}.sig", spec.checksum_name);
+            let signature = release.assets.iter().find(|a| a.name == signature_name);
+            match (archive, checksum, signature) {
+                (Some(arch), Some(sum), Some(sig)) if arch.size <= MAX_ARCHIVE_BYTES => {
+                    for asset in [arch, sum, sig] {
+                        validate_release_asset(asset, repo, &release.tag_name)?;
+                    }
                     (
-                        Some(DownloadPlan {
+                        Some(Box::new(DownloadPlan {
                             archive_name: arch.name.clone(),
                             archive_url: arch.browser_download_url.clone(),
                             checksum_url: sum.browser_download_url.clone(),
+                            signature_url: sig.browser_download_url.clone(),
+                            repo: repo.to_ascii_lowercase(),
+                            tag: release.tag_name.clone(),
+                            public_key,
                             expected_size: (arch.size > 0).then_some(arch.size),
                             kind: spec.kind,
                             install_dir,
-                        }),
+                        })),
                         None,
                     )
                 }
-                (None, _) => (
+                (None, _, _) => (
                     None,
                     Some(format!(
                         "Release is missing {} for this platform.",
                         spec.archive_name
                     )),
                 ),
-                (Some(_), None) => (
+                (_, None, _) | (_, _, None) => (
                     None,
-                    Some(format!(
-                        "Release is missing {} checksum; refusing automatic install.",
-                        spec.checksum_name
-                    )),
+                    Some("Release has no signed checksum for this platform.".into()),
+                ),
+                _ => (
+                    None,
+                    Some("The release archive is too large for in-app installation.".into()),
                 ),
             }
         }
@@ -770,7 +853,31 @@ fn parse_sha256_file(contents: &str, expected_filename: &str) -> Option<String> 
     None
 }
 
-/// Downloads the archive and checksum, verifies SHA-256, and extracts into staging.
+fn decode_hex<const N: usize>(hex: &str) -> Option<[u8; N]> {
+    if hex.len() != N * 2 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = [0; N];
+    for (byte, pair) in bytes.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(bytes)
+}
+
+fn signed_checksum_message(repo: &str, tag: &str, archive: &str, hash: &str) -> String {
+    format!("tacklecast-update-v1\n{repo}\n{tag}\n{archive}\n{hash}\n")
+}
+
+fn verify_signed_checksum(
+    public_key: &[u8; 32],
+    message: &str,
+    signature: &[u8],
+) -> Result<(), String> {
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(message.as_bytes(), signature)
+        .map_err(|_| "Update signature did not match the trusted release key.".into())
+}
+
 fn download_and_stage(
     version: String,
     plan: DownloadPlan,
@@ -782,186 +889,145 @@ fn download_and_stage(
         let _ = tx.send(msg);
         (waker)();
     };
+    send(match stage_release(version, &plan, &cancel, &send) {
+        Ok(Some(staged)) => WorkerMessage::Staged(staged),
+        Ok(None) => WorkerMessage::Cancelled,
+        Err(_) if cancel.load(Ordering::Relaxed) => WorkerMessage::Cancelled,
+        Err(err) => WorkerMessage::Failed(err),
+    });
+}
 
-    let staging_dir = plan.install_dir.join(STAGING_DIR_NAME);
-    if staging_dir.exists() {
-        let _ = fs::remove_dir_all(&staging_dir);
-    }
-    if let Err(e) = fs::create_dir_all(&staging_dir) {
-        send(WorkerMessage::Failed(format!(
-            "Cannot create update staging directory: {e}"
-        )));
-        return;
-    }
-
-    let archive_path = staging_dir.join(&plan.archive_name);
+fn stage_release(
+    version: String,
+    plan: &DownloadPlan,
+    cancel: &AtomicBool,
+    send: &impl Fn(WorkerMessage),
+) -> Result<Option<StagedUpdate>, String> {
     let user_agent = format!("TackleCast/{}", current_version());
-
-    // Fetch expected SHA-256 checksum first so missing/invalid checksums fail fast.
-    let expected_hash = match fetch_checksum(&plan.checksum_url, &plan.archive_name, &user_agent) {
-        Ok(hash) => hash,
-        Err(err) => {
-            let _ = fs::remove_dir_all(&staging_dir);
-            send(WorkerMessage::Failed(err));
-            return;
-        }
-    };
-
+    let expected_hash = fetch_signed_checksum(plan, &user_agent)?;
     if cancel.load(Ordering::Relaxed) {
-        let _ = fs::remove_dir_all(&staging_dir);
-        send(WorkerMessage::Cancelled);
-        return;
+        return Ok(None);
     }
 
-    if let Err(err) = validate_https_download_url(&plan.archive_url) {
-        let _ = fs::remove_dir_all(&staging_dir);
-        send(WorkerMessage::Failed(err));
-        return;
-    }
-
-    // Stream archive download while computing SHA-256 and reporting progress.
-    let agent = http_agent(None);
-    let mut response = match agent
-        .get(&plan.archive_url)
-        .header("User-Agent", &user_agent)
-        .call()
-    {
-        Ok(resp) => resp,
-        Err(err) => {
-            let _ = fs::remove_dir_all(&staging_dir);
-            send(WorkerMessage::Failed(format_http_error(err)));
-            return;
-        }
-    };
-
-    let total = response
+    let work = install::create_staging(&plan.install_dir)
+        .map_err(|err| format!("Cannot create update staging directory: {err}"))?;
+    let archive_path = work.path().join(&plan.archive_name);
+    let agent = http_agent(Duration::from_secs(15 * 60));
+    let mut response = open_asset(&agent, &plan.archive_url, &user_agent)?;
+    let content_length = response
         .headers()
         .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .or(plan.expected_size);
+        .map(|header| {
+            header
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| "Invalid update archive Content-Length.".to_string())
+        })
+        .transpose()?;
+    let total = archive_total(plan.expected_size, content_length)?;
+    let limit = total.unwrap_or(MAX_ARCHIVE_BYTES);
 
-    let mut file = match File::create(&archive_path) {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = fs::remove_dir_all(&staging_dir);
-            send(WorkerMessage::Failed(format!(
-                "Cannot create temporary archive file: {e}"
-            )));
-            return;
-        }
-    };
-
+    let mut file = File::create_new(&archive_path)
+        .map_err(|err| format!("Cannot create temporary archive: {err}"))?;
     let mut reader = response.body_mut().as_reader();
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
-    let mut downloaded: u64 = 0;
+    let mut downloaded = 0;
     let mut last_report = Instant::now();
-
     loop {
         if cancel.load(Ordering::Relaxed) {
-            drop(file);
-            let _ = fs::remove_dir_all(&staging_dir);
-            send(WorkerMessage::Cancelled);
-            return;
+            return Ok(None);
         }
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                if let Err(e) = file.write_all(&buf[..n]) {
-                    drop(file);
-                    let _ = fs::remove_dir_all(&staging_dir);
-                    send(WorkerMessage::Failed(format!("Download write failed: {e}")));
-                    return;
-                }
-                hasher.update(&buf[..n]);
-                downloaded += n as u64;
-                if last_report.elapsed() >= Duration::from_millis(80) {
-                    send(WorkerMessage::DownloadProgress {
-                        version: version.clone(),
-                        downloaded,
-                        total,
-                    });
-                    last_report = Instant::now();
-                }
-            }
-            Err(e) => {
-                drop(file);
-                let _ = fs::remove_dir_all(&staging_dir);
-                send(WorkerMessage::Failed(format!("Download interrupted: {e}")));
-                return;
-            }
+        let size = reader
+            .read(&mut buf)
+            .map_err(|err| format!("Download interrupted: {err}"))?;
+        if size == 0 {
+            break;
         }
-    }
-
-    if let Err(e) = file.flush() {
-        drop(file);
-        let _ = fs::remove_dir_all(&staging_dir);
-        send(WorkerMessage::Failed(format!(
-            "Failed flushing downloaded archive: {e}"
-        )));
-        return;
+        downloaded += size as u64;
+        if downloaded > limit {
+            return Err("Update download exceeded its allowed size.".into());
+        }
+        file.write_all(&buf[..size])
+            .map_err(|err| format!("Download write failed: {err}"))?;
+        hasher.update(&buf[..size]);
+        if last_report.elapsed() >= Duration::from_millis(80) {
+            send(WorkerMessage::DownloadProgress {
+                version: version.clone(),
+                downloaded,
+                total,
+            });
+            last_report = Instant::now();
+        }
     }
     drop(file);
+    if total.is_some_and(|total| total != downloaded) {
+        return Err("Update archive did not match the expected size.".into());
+    }
 
     send(WorkerMessage::Verifying {
         version: version.clone(),
     });
-    let actual_hash = format_hex(&hasher.finalize());
-    if actual_hash != expected_hash {
-        let _ = fs::remove_dir_all(&staging_dir);
-        send(WorkerMessage::Failed(
-            "SHA-256 checksum mismatch; downloaded archive was discarded.".into(),
-        ));
-        return;
+    if format_hex(&hasher.finalize()) != expected_hash {
+        return Err("SHA-256 checksum mismatch. The downloaded archive was discarded.".into());
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(None);
     }
 
     send(WorkerMessage::Extracting {
         version: version.clone(),
     });
-    let extract_result = match plan.kind {
-        ArchiveKind::Zip => extract_zip_safely(&archive_path, &staging_dir),
-        ArchiveKind::TarGz => extract_tar_gz_safely(&archive_path, &staging_dir),
-    };
-    let _ = fs::remove_file(&archive_path);
-
-    if let Err(err) = extract_result {
-        let _ = fs::remove_dir_all(&staging_dir);
-        send(WorkerMessage::Failed(err));
-        return;
+    let payload = work.path().join("payload");
+    archive::extract(plan.kind, &archive_path, &payload)
+        .map_err(|err| format!("Cannot extract the update: {err}"))?;
+    fs::remove_file(archive_path)
+        .map_err(|err| format!("Cannot remove the unpacked archive: {err}"))?;
+    if !fs::symlink_metadata(install::binary_path(&payload))
+        .is_ok_and(|meta| install::is_regular_file(&meta))
+        || install::read_version(&payload).ok() != SemVer::parse(&version)
+    {
+        return Err(
+            "Update archive is missing the executable or has mismatched build metadata.".into(),
+        );
     }
-
-    if !staged_binary_path(&staging_dir).is_file() {
-        let _ = fs::remove_dir_all(&staging_dir);
-        send(WorkerMessage::Failed(
-            "Extracted release archive is missing the TackleCast executable.".into(),
-        ));
-        return;
-    }
-
-    send(WorkerMessage::Staged(StagedUpdate {
-        version,
-        staging_dir,
-        install_dir: plan.install_dir,
-    }));
+    Ok((!cancel.load(Ordering::Relaxed)).then_some(StagedUpdate { version, work }))
 }
 
-/// Downloads and parses the `.sha256` checksum asset for `archive_name`.
-fn fetch_checksum(url: &str, archive_name: &str, user_agent: &str) -> Result<String, String> {
-    validate_https_download_url(url)?;
-    let agent = http_agent(Some(API_TIMEOUT));
-    let mut response = agent
-        .get(url)
-        .header("User-Agent", user_agent)
-        .call()
-        .map_err(format_http_error)?;
+fn archive_total(expected: Option<u64>, received: Option<u64>) -> Result<Option<u64>, String> {
+    if expected
+        .zip(received)
+        .is_some_and(|(expected, received)| expected != received)
+    {
+        return Err("Update archive size disagrees with the release metadata.".into());
+    }
+    let total = expected.or(received);
+    if total.is_some_and(|total| total == 0 || total > MAX_ARCHIVE_BYTES) {
+        return Err("Update archive exceeds the supported size limits.".into());
+    }
+    Ok(total)
+}
+
+fn fetch_signed_checksum(plan: &DownloadPlan, user_agent: &str) -> Result<String, String> {
+    let agent = http_agent(API_TIMEOUT);
+    let mut response = open_asset(&agent, &plan.checksum_url, user_agent)?;
     let text = read_bounded_utf8(
         response.body_mut().as_reader(),
         MAX_CHECKSUM_BYTES,
         "checksum file",
     )?;
-    parse_sha256_file(&text, archive_name)
-        .ok_or_else(|| format!("Checksum file did not contain a valid SHA-256 for {archive_name}."))
+    let hash = parse_sha256_file(&text, &plan.archive_name).ok_or_else(|| {
+        format!(
+            "Checksum file has no valid SHA-256 for {}.",
+            plan.archive_name
+        )
+    })?;
+    let mut response = open_asset(&agent, &plan.signature_url, user_agent)?;
+    let signature = read_bounded(response.body_mut().as_reader(), 64, "update signature")?;
+    let message = signed_checksum_message(&plan.repo, &plan.tag, &plan.archive_name, &hash);
+    verify_signed_checksum(&plan.public_key, &message, &signature)?;
+    Ok(hash)
 }
 
 /// Encodes a byte slice as lowercase hexadecimal.
@@ -974,673 +1040,15 @@ fn format_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Validates a relative archive entry path and rejects path traversal components.
-fn sanitize_relative_path(raw: &Path) -> Result<PathBuf, String> {
-    let mut clean = PathBuf::new();
-    for component in raw.components() {
-        match component {
-            Component::Normal(part) => clean.push(part),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(format!(
-                    "Archive entry contains an unsafe path: {}",
-                    raw.display()
-                ));
-            }
-        }
-    }
-    Ok(clean)
+/// Locks portable installs and recovers a pending transaction before loading settings.
+pub fn prepare_startup() -> Result<Option<File>, String> {
+    install::startup(&current_exe_dir()?).map_err(|err| err.to_string())
 }
 
-/// Strips a single shared top-level wrapper folder (e.g. `TackleCast-Linux-x86_64/`)
-/// when every entry in the archive starts with the same first path component.
-fn common_top_level_dir(paths: &[PathBuf]) -> Option<OsString> {
-    let mut first_dir: Option<OsString> = None;
-    let mut has_nested = false;
-
-    for path in paths {
-        let mut comps = path.components();
-        let Some(Component::Normal(first)) = comps.next() else {
-            return None;
-        };
-        if comps.next().is_some() {
-            has_nested = true;
-        }
-        match &first_dir {
-            None => first_dir = Some(first.to_os_string()),
-            Some(existing) if existing == first => {}
-            Some(_) => return None,
-        }
-    }
-
-    if has_nested {
-        first_dir
-    } else {
-        None
-    }
-}
-
-/// Extracts a `.zip` archive into `dest` while rejecting path-traversal entries.
-fn extract_zip_safely(archive_path: &Path, dest: &Path) -> Result<(), String> {
-    let file = File::open(archive_path).map_err(|e| format!("Cannot open zip archive: {e}"))?;
-    let mut archive = ZipArchive::new(file).map_err(|e| format!("Invalid zip archive: {e}"))?;
-
-    let mut sanitized_paths = Vec::with_capacity(archive.len());
-    for idx in 0..archive.len() {
-        let entry = archive
-            .by_index(idx)
-            .map_err(|e| format!("Cannot inspect zip entry {idx}: {e}"))?;
-        let rel = sanitize_relative_path(Path::new(entry.name()))?;
-        if !rel.as_os_str().is_empty() {
-            sanitized_paths.push(rel);
-        }
-    }
-    let strip_prefix = common_top_level_dir(&sanitized_paths);
-
-    for idx in 0..archive.len() {
-        let mut entry = archive
-            .by_index(idx)
-            .map_err(|e| format!("Cannot read zip entry {idx}: {e}"))?;
-        let mut rel = sanitize_relative_path(Path::new(entry.name()))?;
-        if let Some(prefix) = &strip_prefix {
-            if let Ok(stripped) = rel.strip_prefix(prefix) {
-                rel = stripped.to_path_buf();
-            }
-        }
-        if rel.as_os_str().is_empty() {
-            continue;
-        }
-        let out_path = dest.join(&rel);
-        if entry.is_dir() {
-            fs::create_dir_all(&out_path)
-                .map_err(|e| format!("Failed creating directory {}: {e}", out_path.display()))?;
-        } else {
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("Failed creating directory {}: {e}", parent.display()))?;
-            }
-            let mut out = File::create(&out_path)
-                .map_err(|e| format!("Failed creating {}: {e}", out_path.display()))?;
-            io::copy(&mut entry, &mut out)
-                .map_err(|e| format!("Failed extracting {}: {e}", out_path.display()))?;
-            #[cfg(unix)]
-            if let Some(mode) = entry.unix_mode() {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&out_path, fs::Permissions::from_mode(mode & 0o777));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Extracts a `.tar.gz` archive into `dest`, preserving Unix permissions and safe relative symlinks.
-fn extract_tar_gz_safely(archive_path: &Path, dest: &Path) -> Result<(), String> {
-    // Pass 1: validate every entry path and detect a shared top-level wrapper folder.
-    let mut sanitized_paths = Vec::new();
-    {
-        let file =
-            File::open(archive_path).map_err(|e| format!("Cannot open tar.gz archive: {e}"))?;
-        let mut archive = Archive::new(GzDecoder::new(file));
-        let entries = archive
-            .entries()
-            .map_err(|e| format!("Invalid tar.gz archive: {e}"))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("Corrupt tar.gz entry: {e}"))?;
-            let path = entry
-                .path()
-                .map_err(|e| format!("Invalid tar.gz entry path: {e}"))?;
-            let rel = sanitize_relative_path(&path)?;
-            if !rel.as_os_str().is_empty() {
-                sanitized_paths.push(rel);
-            }
-        }
-    }
-    let strip_prefix = common_top_level_dir(&sanitized_paths);
-
-    // Pass 2: extract entries safely into `dest`.
-    let file = File::open(archive_path).map_err(|e| format!("Cannot open tar.gz archive: {e}"))?;
-    let mut archive = Archive::new(GzDecoder::new(file));
-    let entries = archive
-        .entries()
-        .map_err(|e| format!("Invalid tar.gz archive: {e}"))?;
-
-    for entry in entries {
-        let mut entry = entry.map_err(|e| format!("Corrupt tar.gz entry: {e}"))?;
-        let raw_path = entry
-            .path()
-            .map_err(|e| format!("Invalid tar.gz entry path: {e}"))?
-            .into_owned();
-        let mut rel = sanitize_relative_path(&raw_path)?;
-        if let Some(prefix) = &strip_prefix {
-            if let Ok(stripped) = rel.strip_prefix(prefix) {
-                rel = stripped.to_path_buf();
-            }
-        }
-        if rel.as_os_str().is_empty() {
-            continue;
-        }
-        let out_path = dest.join(&rel);
-        let entry_type = entry.header().entry_type();
-
-        if entry_type.is_dir() {
-            fs::create_dir_all(&out_path)
-                .map_err(|e| format!("Failed creating directory {}: {e}", out_path.display()))?;
-        } else if entry_type.is_file() {
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("Failed creating directory {}: {e}", parent.display()))?;
-            }
-            let mut out = File::create(&out_path)
-                .map_err(|e| format!("Failed creating {}: {e}", out_path.display()))?;
-            io::copy(&mut entry, &mut out)
-                .map_err(|e| format!("Failed extracting {}: {e}", out_path.display()))?;
-            #[cfg(unix)]
-            if let Ok(mode) = entry.header().mode() {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&out_path, fs::Permissions::from_mode(mode & 0o777));
-            }
-        } else if entry_type.is_symlink() {
-            let link_target = entry
-                .link_name()
-                .map_err(|e| format!("Invalid symlink entry: {e}"))?
-                .ok_or_else(|| format!("Symlink {} is missing target.", rel.display()))?
-                .into_owned();
-            validate_relative_symlink(&rel, &link_target)?;
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("Failed creating directory {}: {e}", parent.display()))?;
-            }
-            #[cfg(unix)]
-            {
-                if out_path.symlink_metadata().is_ok() {
-                    let _ = fs::remove_file(&out_path);
-                }
-                std::os::unix::fs::symlink(&link_target, &out_path).map_err(|e| {
-                    format!(
-                        "Failed creating symlink {} -> {}: {e}",
-                        out_path.display(),
-                        link_target.display()
-                    )
-                })?;
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = (&out_path, &link_target);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Ensures a symlink inside an archive is relative and never resolves outside the staging root.
-fn validate_relative_symlink(entry_rel: &Path, link_target: &Path) -> Result<(), String> {
-    if link_target.is_absolute() {
-        return Err(format!(
-            "Archive symlink {} points to an absolute path: {}",
-            entry_rel.display(),
-            link_target.display()
-        ));
-    }
-    let mut depth: i32 = 0;
-    if let Some(parent) = entry_rel.parent() {
-        for comp in parent.components() {
-            if matches!(comp, Component::Normal(_)) {
-                depth += 1;
-            }
-        }
-    }
-    for comp in link_target.components() {
-        match comp {
-            Component::CurDir => {}
-            Component::Normal(_) => depth += 1,
-            Component::ParentDir => {
-                depth -= 1;
-                if depth < 0 {
-                    return Err(format!(
-                        "Archive symlink {} escapes staging directory: {}",
-                        entry_rel.display(),
-                        link_target.display()
-                    ));
-                }
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(format!(
-                    "Archive symlink {} uses an unsafe target: {}",
-                    entry_rel.display(),
-                    link_target.display()
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Returns the expected TackleCast executable path inside `dir` for the current OS.
-fn staged_binary_path(dir: &Path) -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        dir.join("TackleCast.exe")
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        dir.join("tacklecast")
-    }
-}
-
-/// Spawns the newly staged executable in `--apply-update` mode.
-fn spawn_staged_helper(staged: &StagedUpdate) -> Result<(), String> {
-    let helper_bin = staged_binary_path(&staged.staging_dir);
-    let mut cmd = Command::new(&helper_bin);
-    cmd.arg(APPLY_UPDATE_FLAG)
-        .arg("--pid")
-        .arg(std::process::id().to_string())
-        .arg("--source")
-        .arg(&staged.staging_dir)
-        .arg("--target")
-        .arg(&staged.install_dir)
-        .current_dir(&staged.staging_dir);
-
-    #[cfg(target_os = "linux")]
-    {
-        let lib_dir = staged.staging_dir.join("lib");
-        if lib_dir.is_dir() {
-            let value = match std::env::var_os("LD_LIBRARY_PATH") {
-                Some(existing) if !existing.is_empty() => {
-                    let mut combined = OsString::from(lib_dir.as_os_str());
-                    combined.push(":");
-                    combined.push(existing);
-                    combined
-                }
-                _ => OsString::from(lib_dir.as_os_str()),
-            };
-            cmd.env("LD_LIBRARY_PATH", value);
-        }
-    }
-
-    cmd.spawn().map(|_| ()).map_err(|e| {
-        format!(
-            "Failed launching staged updater {}: {e}",
-            helper_bin.display()
-        )
-    })
-}
-
-/// Parsed arguments for the internal `--apply-update` helper mode.
-#[derive(Debug, PartialEq, Eq)]
-struct ApplyUpdateArgs {
-    pid: u32,
-    source: PathBuf,
-    target: PathBuf,
-}
-
-/// Parses `--apply-update --pid <pid> --source <dir> --target <dir>` from raw OS args.
-fn parse_apply_update_args(args: &[OsString]) -> Option<Result<ApplyUpdateArgs, String>> {
-    if !args.iter().any(|arg| arg == APPLY_UPDATE_FLAG) {
-        return None;
-    }
-    let mut pid: Option<u32> = None;
-    let mut source: Option<PathBuf> = None;
-    let mut target: Option<PathBuf> = None;
-
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        if arg == "--pid" {
-            i += 1;
-            let val = args.get(i).and_then(|s| s.to_str());
-            pid = val.and_then(|s| s.parse::<u32>().ok());
-        } else if arg == "--source" {
-            i += 1;
-            source = args.get(i).map(PathBuf::from);
-        } else if arg == "--target" {
-            i += 1;
-            target = args.get(i).map(PathBuf::from);
-        }
-        i += 1;
-    }
-
-    Some(match (pid, source, target) {
-        (Some(pid), Some(source), Some(target)) => Ok(ApplyUpdateArgs {
-            pid,
-            source,
-            target,
-        }),
-        _ => {
-            Err("Invalid --apply-update arguments; expected --pid, --source, and --target.".into())
-        }
-    })
-}
-
-/// Intercepts `--apply-update` early in `main()` before GUI/capture startup.
-///
-/// Returns `Some(exit_code)` when running in helper mode, or `None` for normal startup.
+/// Handles the internal staged helper modes before normal application startup.
 pub fn maybe_run_apply_update_from_args() -> Option<i32> {
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let parsed = parse_apply_update_args(&args)?;
-    let exit_code = match parsed {
-        Ok(cfg) => match run_apply_update(&cfg) {
-            Ok(()) => 0,
-            Err(err) => {
-                log_apply_error(&cfg.target, &err);
-                1
-            }
-        },
-        Err(err) => {
-            eprintln!("tacklecast updater error: {err}");
-            1
-        }
-    };
-    Some(exit_code)
-}
-
-/// Executes the staged helper flow: wait for parent exit, overlay-copy with rollback, and relaunch.
-fn run_apply_update(cfg: &ApplyUpdateArgs) -> Result<(), String> {
-    wait_for_pid_exit(cfg.pid, PARENT_EXIT_TIMEOUT);
-    let backup_dir = cfg.target.join(BACKUP_DIR_NAME);
-    apply_staged_overlay(&cfg.source, &cfg.target, &backup_dir)?;
-    relaunch_target(&cfg.target)
-}
-
-/// Appends an updater failure message to `<target>/logs/updater.log`.
-fn log_apply_error(target_dir: &Path, message: &str) {
-    let logs_dir = target_dir.join("logs");
-    let _ = fs::create_dir_all(&logs_dir);
-    if let Ok(mut file) = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(logs_dir.join("updater.log"))
-    {
-        let _ = writeln!(file, "Update apply failed: {message}");
-    }
-}
-
-/// Waits until `pid` exits or `timeout` elapses.
-fn wait_for_pid_exit(pid: u32, timeout: Duration) {
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::Foundation::CloseHandle;
-        use windows::Win32::System::Threading::{
-            OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
-        };
-        // SAFETY: `OpenProcess` returns a valid handle or an error; we wait and close it.
-        unsafe {
-            if let Ok(handle) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
-                let ms = timeout.as_millis().min(u32::MAX as u128) as u32;
-                let _ = WaitForSingleObject(handle, ms);
-                let _ = CloseHandle(handle);
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let proc_dir = PathBuf::from(format!("/proc/{pid}"));
-        let deadline = Instant::now() + timeout;
-        while proc_dir.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    {
-        let _ = (pid, timeout);
-        std::thread::sleep(Duration::from_millis(300));
-    }
-}
-
-/// Overlay-copies all files and symlinks from `source` into `target` with backup and rollback.
-///
-/// Only paths present in `source` are touched in `target`; existing user files
-/// such as `tacklecast_settings.json`, `logs/`, and `NvOFFRUC.dll` are never deleted.
-fn apply_staged_overlay(source: &Path, target: &Path, backup: &Path) -> Result<(), String> {
-    if backup.exists() {
-        let _ = fs::remove_dir_all(backup);
-    }
-    fs::create_dir_all(backup)
-        .map_err(|e| format!("Cannot create backup directory {}: {e}", backup.display()))?;
-
-    let entries = collect_relative_entries(source)?;
-    let mut backed_up: Vec<PathBuf> = Vec::new();
-    let mut newly_created: Vec<PathBuf> = Vec::new();
-
-    for rel in entries {
-        let src_path = source.join(&rel);
-        let dst_path = target.join(&rel);
-        let bak_path = backup.join(&rel);
-
-        let step = (|| -> Result<(), String> {
-            if let Some(parent) = dst_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("Failed creating {}: {e}", parent.display()))?;
-            }
-
-            if let Ok(dst_meta) = dst_path.symlink_metadata() {
-                if dst_meta.file_type().is_dir() {
-                    return Err(format!(
-                        "Refusing to replace existing directory {} with staged file.",
-                        dst_path.display()
-                    ));
-                }
-                if let Some(bak_parent) = bak_path.parent() {
-                    fs::create_dir_all(bak_parent)
-                        .map_err(|e| format!("Failed creating {}: {e}", bak_parent.display()))?;
-                }
-                move_with_retries(&dst_path, &bak_path)?;
-                backed_up.push(rel.clone());
-            } else {
-                newly_created.push(rel.clone());
-            }
-
-            copy_entry(&src_path, &dst_path)
-        })();
-
-        if let Err(err) = step {
-            rollback_overlay(target, backup, &backed_up, &newly_created);
-            return Err(err);
-        }
-    }
-
-    Ok(())
-}
-
-/// Recursively collects all file and symlink paths under `root` as relative paths.
-fn collect_relative_entries(root: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut out = Vec::new();
-    collect_relative_entries_inner(root, root, &mut out)?;
-    out.sort();
-    Ok(out)
-}
-
-/// Recursive helper for [`collect_relative_entries`].
-fn collect_relative_entries_inner(
-    root: &Path,
-    current: &Path,
-    out: &mut Vec<PathBuf>,
-) -> Result<(), String> {
-    let dir = fs::read_dir(current)
-        .map_err(|e| format!("Cannot read staging directory {}: {e}", current.display()))?;
-    for entry in dir {
-        let entry = entry.map_err(|e| format!("Failed iterating {}: {e}", current.display()))?;
-        let name = entry.file_name();
-        if name == STAGING_DIR_NAME || name == BACKUP_DIR_NAME {
-            continue;
-        }
-        let path = entry.path();
-        let meta = fs::symlink_metadata(&path)
-            .map_err(|e| format!("Failed inspecting {}: {e}", path.display()))?;
-        if meta.file_type().is_dir() {
-            collect_relative_entries_inner(root, &path, out)?;
-        } else {
-            let rel = path
-                .strip_prefix(root)
-                .map_err(|e| format!("Internal path error: {e}"))?
-                .to_path_buf();
-            out.push(rel);
-        }
-    }
-    Ok(())
-}
-
-/// Moves `from` to `to`, retrying briefly to tolerate Windows antivirus/handle release delays.
-fn move_with_retries(from: &Path, to: &Path) -> Result<(), String> {
-    let mut last_err = None;
-    for attempt in 0..20 {
-        match fs::rename(from, to) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                last_err = Some(e);
-                if attempt < 19 {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-            }
-        }
-    }
-    Err(format!(
-        "Failed backing up {} to {}: {}",
-        from.display(),
-        to.display(),
-        last_err
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "unknown error".into())
-    ))
-}
-
-/// Copies a regular file (preserving Unix permissions) or recreates a symlink.
-fn copy_entry(src: &Path, dst: &Path) -> Result<(), String> {
-    #[cfg_attr(not(unix), allow(unused_variables))]
-    let meta = fs::symlink_metadata(src)
-        .map_err(|e| format!("Failed reading metadata for {}: {e}", src.display()))?;
-
-    #[cfg(unix)]
-    if meta.file_type().is_symlink() {
-        let target = fs::read_link(src)
-            .map_err(|e| format!("Failed reading symlink {}: {e}", src.display()))?;
-        if dst.symlink_metadata().is_ok() {
-            let _ = fs::remove_file(dst);
-        }
-        return std::os::unix::fs::symlink(&target, dst).map_err(|e| {
-            format!(
-                "Failed creating symlink {} -> {}: {e}",
-                dst.display(),
-                target.display()
-            )
-        });
-    }
-
-    fs::copy(src, dst)
-        .map_err(|e| format!("Failed copying {} to {}: {e}", src.display(), dst.display()))?;
-
-    #[cfg(unix)]
-    {
-        let _ = fs::set_permissions(dst, meta.permissions());
-    }
-
-    Ok(())
-}
-
-/// Restores all backed-up files and removes newly created files after a failed overlay step.
-fn rollback_overlay(
-    target: &Path,
-    backup: &Path,
-    backed_up: &[PathBuf],
-    newly_created: &[PathBuf],
-) {
-    let backed_set: HashSet<&PathBuf> = backed_up.iter().collect();
-    for rel in newly_created.iter().rev() {
-        if !backed_set.contains(rel) {
-            let _ = fs::remove_file(target.join(rel));
-        }
-    }
-    for rel in backed_up.iter().rev() {
-        let dst = target.join(rel);
-        let bak = backup.join(rel);
-        if dst.symlink_metadata().is_ok() {
-            let _ = fs::remove_file(&dst);
-        }
-        let _ = fs::rename(&bak, &dst);
-    }
-}
-
-/// Relaunches TackleCast from `target_dir` after a successful overlay update.
-fn relaunch_target(target_dir: &Path) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        let exe = target_dir.join("TackleCast.exe");
-        Command::new(&exe)
-            .current_dir(target_dir)
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| {
-                format!(
-                    "Update applied, but relaunch failed ({}): {e}",
-                    exe.display()
-                )
-            })
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let run_sh = target_dir.join("run.sh");
-        if run_sh.is_file() {
-            Command::new(&run_sh)
-                .current_dir(target_dir)
-                .spawn()
-                .map(|_| ())
-                .map_err(|e| {
-                    format!(
-                        "Update applied, but relaunch failed ({}): {e}",
-                        run_sh.display()
-                    )
-                })
-        } else {
-            let bin = target_dir.join("tacklecast");
-            let mut cmd = Command::new(&bin);
-            cmd.current_dir(target_dir);
-            let lib_dir = target_dir.join("lib");
-            if lib_dir.is_dir() {
-                cmd.env("LD_LIBRARY_PATH", &lib_dir);
-            }
-            cmd.spawn().map(|_| ()).map_err(|e| {
-                format!(
-                    "Update applied, but relaunch failed ({}): {e}",
-                    bin.display()
-                )
-            })
-        }
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    {
-        let _ = target_dir;
-        Ok(())
-    }
-}
-
-/// Removes leftover `.update-staging` and `.update-backup` folders on normal startup.
-pub fn cleanup_stale_update_dirs() {
-    let Ok(exe_dir) = current_exe_dir() else {
-        return;
-    };
-    for name in [STAGING_DIR_NAME, BACKUP_DIR_NAME] {
-        let path = exe_dir.join(name);
-        if !path.exists() {
-            continue;
-        }
-        // Retry briefly in case the helper process is still exiting on Windows.
-        for attempt in 0..5 {
-            match fs::remove_dir_all(&path) {
-                Ok(()) => {
-                    info!("cleaned up temporary update directory: {}", path.display());
-                    break;
-                }
-                Err(err) if attempt == 4 => {
-                    warn!(
-                        "could not remove temporary update directory {}: {err}",
-                        path.display()
-                    );
-                }
-                Err(_) => std::thread::sleep(Duration::from_millis(150)),
-            }
-        }
-    }
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    install::run_helper(&args)
 }
 
 /// Opens a validated GitHub release URL in the user's default web browser.
@@ -1693,7 +1101,9 @@ pub fn open_release_page(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use flate2::write::GzEncoder;
+    #[cfg(unix)]
     use flate2::Compression;
     use std::sync::atomic::AtomicUsize;
 
@@ -1772,6 +1182,11 @@ mod tests {
                     "name": "TackleCast-Linux-x86_64.tar.gz.sha256",
                     "browser_download_url": "https://github.com/SaltedByte/TackleCast/releases/download/v3.1.0/TackleCast-Linux-x86_64.tar.gz.sha256",
                     "size": 99
+                },
+                {
+                    "name": "TackleCast-Linux-x86_64.tar.gz.sha256.sig",
+                    "browser_download_url": "https://github.com/SaltedByte/TackleCast/releases/download/v3.1.0/TackleCast-Linux-x86_64.tar.gz.sha256.sig",
+                    "size": 64
                 }
             ]
         }"#;
@@ -1788,6 +1203,7 @@ mod tests {
             current,
             Some(spec),
             InstallMode::PortableWritable(PathBuf::from("/tmp/install")),
+            Some([1; 32]),
         )
         .unwrap();
         match portable {
@@ -1805,6 +1221,7 @@ mod tests {
             current,
             Some(spec),
             InstallMode::ExternalOnly("dev build".into()),
+            Some([1; 32]),
         )
         .unwrap();
         match dev {
@@ -1814,6 +1231,32 @@ mod tests {
             }
             CheckOutcome::UpToDate { .. } => panic!("expected available update"),
         }
+
+        let untrusted = evaluate_release_json(
+            json,
+            DEFAULT_UPDATE_REPO,
+            current,
+            Some(spec),
+            InstallMode::PortableWritable(PathBuf::from("/tmp/install")),
+            None,
+        )
+        .unwrap();
+        let CheckOutcome::Available(untrusted) = untrusted else {
+            panic!("expected browser fallback");
+        };
+        assert!(untrusted.download_plan.is_none());
+        assert!(untrusted.fallback_reason.is_some());
+
+        let wrong_release = json.replace("/download/v3.1.0/", "/download/v2.9.0/");
+        assert!(evaluate_release_json(
+            &wrong_release,
+            DEFAULT_UPDATE_REPO,
+            current,
+            Some(spec),
+            InstallMode::PortableWritable(PathBuf::from("/tmp/install")),
+            Some([1; 32]),
+        )
+        .is_err());
     }
 
     #[test]
@@ -1858,8 +1301,46 @@ mod tests {
         .is_err());
         assert!(validate_https_download_url("https://github.com@evil.example/a.zip").is_err());
         assert!(validate_https_download_url("https://evil.example/a.zip").is_err());
+        assert!(
+            validate_https_download_url("https://raw.githubusercontent.com/project/a.zip").is_err()
+        );
+        assert!(validate_https_download_url(
+            "https://release-assets.githubusercontent.com/asset?token=value"
+        )
+        .is_ok());
+        assert_eq!(http_agent(API_TIMEOUT).config().max_redirects(), 0);
     }
 
+    #[test]
+    fn release_signature_binds_repository_version_platform_and_checksum() {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let key = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+        let public_key = key.public_key().as_ref().try_into().unwrap();
+        let hash = "ab".repeat(32);
+        let message =
+            signed_checksum_message("saltedbyte/tacklecast", "v3.1.0", "release.zip", &hash);
+        let signature = key.sign(message.as_bytes());
+        assert!(verify_signed_checksum(public_key, &message, signature.as_ref()).is_ok());
+        for altered in [
+            message.replace("saltedbyte", "another-owner"),
+            message.replace("3.1.0", "3.0.0"),
+            message.replace("release.zip", "release.tar.gz"),
+            message.replace(&hash, &"cd".repeat(32)),
+        ] {
+            assert!(verify_signed_checksum(public_key, &altered, signature.as_ref()).is_err());
+        }
+        assert!(verify_signed_checksum(&[1; 32], &message, signature.as_ref()).is_err());
+        assert!(verify_signed_checksum(public_key, &message, &[]).is_err());
+    }
+
+    #[test]
+    fn archive_sizes_must_fit_and_agree() {
+        assert_eq!(archive_total(Some(3), None).unwrap(), Some(3));
+        assert_eq!(archive_total(None, None).unwrap(), None);
+        assert!(archive_total(Some(3), Some(4)).is_err());
+        assert!(archive_total(None, Some(MAX_ARCHIVE_BYTES + 1)).is_err());
+    }
     #[test]
     fn bounded_utf8_reader_rejects_oversized_payloads() {
         let ok = read_bounded_utf8(&b"hello"[..], 5, "test").unwrap();
@@ -1875,6 +1356,7 @@ mod tests {
             let file = File::create(&zip_path).unwrap();
             let mut writer = zip::ZipWriter::new(file);
             let options = zip::write::SimpleFileOptions::default();
+            writer.add_directory("logs/", options).unwrap();
             writer.start_file("TackleCast.exe", options).unwrap();
             writer.write_all(b"exe-bytes").unwrap();
             writer.start_file("rife/model.onnx", options).unwrap();
@@ -1883,7 +1365,8 @@ mod tests {
         }
         let out = root.join("out");
         fs::create_dir_all(&out).unwrap();
-        extract_zip_safely(&zip_path, &out).unwrap();
+        archive::extract(ArchiveKind::Zip, &zip_path, &out).unwrap();
+        assert!(!out.join("logs").exists());
         assert_eq!(fs::read(out.join("TackleCast.exe")).unwrap(), b"exe-bytes");
         assert_eq!(
             fs::read(out.join("rife/model.onnx")).unwrap(),
@@ -1901,11 +1384,12 @@ mod tests {
         }
         let evil_out = root.join("evil-out");
         fs::create_dir_all(&evil_out).unwrap();
-        assert!(extract_zip_safely(&evil_zip, &evil_out).is_err());
+        assert!(archive::extract(ArchiveKind::Zip, &evil_zip, &evil_out).is_err());
 
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn tar_gz_extraction_strips_top_dir_preserves_symlinks_and_permissions() {
         let root = temp_test_dir("targz");
@@ -1936,7 +1420,7 @@ mod tests {
             builder
                 .append_data(
                     &mut lib_hdr,
-                    "TackleCast-Linux-x86_64/lib/libavcodec.so.62",
+                    "TackleCast-Linux-x86_64/lib/libavcodec.so.62.1",
                     &lib_data[..],
                 )
                 .unwrap();
@@ -1946,6 +1430,13 @@ mod tests {
             link_hdr.set_size(0);
             link_hdr.set_mode(0o777);
             link_hdr.set_cksum();
+            builder
+                .append_link(
+                    &mut link_hdr,
+                    "TackleCast-Linux-x86_64/lib/libavcodec.so.62",
+                    "libavcodec.so.62.1",
+                )
+                .unwrap();
             builder
                 .append_link(
                     &mut link_hdr,
@@ -1959,7 +1450,7 @@ mod tests {
 
         let out = root.join("out");
         fs::create_dir_all(&out).unwrap();
-        extract_tar_gz_safely(&tar_path, &out).unwrap();
+        archive::extract(ArchiveKind::TarGz, &tar_path, &out).unwrap();
 
         assert_eq!(
             fs::read(out.join("run.sh")).unwrap(),
@@ -1981,115 +1472,6 @@ mod tests {
             assert_eq!(link_target, Path::new("libavcodec.so.62"));
         }
 
-        assert!(
-            validate_relative_symlink(Path::new("lib/bad.so"), Path::new("../../etc/passwd"))
-                .is_err()
-        );
-
         let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn overlay_apply_preserves_user_files_and_replaces_release_files() {
-        let root = temp_test_dir("overlay");
-        let target = root.join("install");
-        let staging = target.join(STAGING_DIR_NAME);
-        let backup = target.join(BACKUP_DIR_NAME);
-        fs::create_dir_all(target.join("logs")).unwrap();
-        fs::create_dir_all(target.join("lib")).unwrap();
-        fs::create_dir_all(staging.join("lib")).unwrap();
-
-        // Existing install + user files.
-        fs::write(target.join("tacklecast"), b"old-bin").unwrap();
-        fs::write(target.join("build-info.json"), r#"{"version":"3.0.0"}"#).unwrap();
-        fs::write(target.join("tacklecast_settings.json"), r#"{"volume":0.8}"#).unwrap();
-        fs::write(target.join("logs/session.log"), b"user-log").unwrap();
-        fs::write(target.join("NvOFFRUC.dll"), b"user-dll").unwrap();
-
-        // Staged update files.
-        fs::write(staging.join("tacklecast"), b"new-bin").unwrap();
-        fs::write(staging.join("build-info.json"), r#"{"version":"3.1.0"}"#).unwrap();
-        fs::write(staging.join("lib/libavcodec.so.62"), b"new-so").unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("libavcodec.so.62", staging.join("lib/libavcodec.so")).unwrap();
-
-        apply_staged_overlay(&staging, &target, &backup).unwrap();
-
-        assert_eq!(fs::read(target.join("tacklecast")).unwrap(), b"new-bin");
-        assert_eq!(
-            fs::read_to_string(target.join("build-info.json")).unwrap(),
-            r#"{"version":"3.1.0"}"#
-        );
-        assert_eq!(
-            fs::read_to_string(target.join("tacklecast_settings.json")).unwrap(),
-            r#"{"volume":0.8}"#
-        );
-        assert_eq!(
-            fs::read(target.join("logs/session.log")).unwrap(),
-            b"user-log"
-        );
-        assert_eq!(fs::read(target.join("NvOFFRUC.dll")).unwrap(), b"user-dll");
-        #[cfg(unix)]
-        assert_eq!(
-            fs::read_link(target.join("lib/libavcodec.so")).unwrap(),
-            Path::new("libavcodec.so.62")
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn overlay_rollback_restores_originals_when_copy_fails() {
-        let root = temp_test_dir("rollback");
-        let target = root.join("install");
-        let staging = target.join(STAGING_DIR_NAME);
-        let backup = target.join(BACKUP_DIR_NAME);
-        fs::create_dir_all(&target).unwrap();
-        fs::create_dir_all(&staging).unwrap();
-
-        fs::write(target.join("a_first.bin"), b"original-a").unwrap();
-        fs::write(staging.join("a_first.bin"), b"updated-a").unwrap();
-        fs::write(staging.join("b_new.bin"), b"brand-new").unwrap();
-        // Force a copy error on `z_conflict` by creating a directory at the target file path.
-        fs::create_dir_all(target.join("z_conflict")).unwrap();
-        fs::write(target.join("z_conflict/keep.txt"), b"dir-marker").unwrap();
-        fs::write(staging.join("z_conflict"), b"file-over-dir").unwrap();
-
-        let result = apply_staged_overlay(&staging, &target, &backup);
-        assert!(
-            result.is_err(),
-            "overlay over non-empty directory must fail"
-        );
-        assert_eq!(
-            fs::read(target.join("a_first.bin")).unwrap(),
-            b"original-a",
-            "backed-up file must be restored on rollback"
-        );
-        assert!(
-            !target.join("b_new.bin").exists(),
-            "newly created file must be removed on rollback"
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn apply_update_args_preserve_case_sensitive_paths() {
-        let raw = vec![
-            OsString::from("--apply-update"),
-            OsString::from("--pid"),
-            OsString::from("4242"),
-            OsString::from("--source"),
-            OsString::from("/Home/User/TackleCast/.update-staging"),
-            OsString::from("--target"),
-            OsString::from("/Home/User/TackleCast"),
-        ];
-        let parsed = parse_apply_update_args(&raw).unwrap().unwrap();
-        assert_eq!(parsed.pid, 4242);
-        assert_eq!(
-            parsed.source,
-            PathBuf::from("/Home/User/TackleCast/.update-staging")
-        );
-        assert_eq!(parsed.target, PathBuf::from("/Home/User/TackleCast"));
     }
 }

@@ -97,7 +97,7 @@ pub struct UiFrame<'a> {
     pub framegen_forced: bool,
     pub recorder_status: &'a str,
     pub recorder_available: bool,
-    pub update_status: &'a UpdateStatus,
+    pub update_status: Option<&'a UpdateStatus>,
 }
 
 pub struct PreparedUi {
@@ -958,7 +958,10 @@ fn draw_menu(
 }
 
 /// Renders the mutating update button in the settings footer.
-fn draw_update_button(ui: &mut egui::Ui, status: &UpdateStatus, output: &mut UiOutput) {
+fn draw_update_button(ui: &mut egui::Ui, status: Option<&UpdateStatus>, output: &mut UiOutput) {
+    let Some(status) = status else {
+        return;
+    };
     match status {
         UpdateStatus::Idle => {
             if ui
@@ -2034,7 +2037,7 @@ mod tests {
                                 framegen_forced: false,
                                 recorder_status: "",
                                 recorder_available: false,
-                                update_status: &UpdateStatus::Idle,
+                                update_status: Some(&UpdateStatus::Idle),
                             },
                             &mut UiOutput::default(),
                         );
@@ -2208,7 +2211,7 @@ mod tests {
                             framegen_forced: false,
                             recorder_status: "",
                             recorder_available: false,
-                            update_status: &UpdateStatus::Idle,
+                            update_status: Some(&UpdateStatus::Idle),
                         },
                     );
                     if let Some(live) = &output.output.live_settings {
@@ -2703,7 +2706,7 @@ mod tests {
                 framegen_forced: false,
                 recorder_status: "",
                 recorder_available: false,
-                update_status: &UpdateStatus::Idle,
+                update_status: Some(&UpdateStatus::Idle),
             };
             let mut text = String::new();
             for _ in 0..3 {
@@ -2804,7 +2807,7 @@ mod tests {
             framegen_forced: false,
             recorder_status: "",
             recorder_available: false,
-            update_status: &UpdateStatus::Idle,
+            update_status: Some(&UpdateStatus::Idle),
         };
         let mut tab = MenuTab::Display;
         ctx.data_mut(|data| data.insert_temp(egui::Id::new("test_overlay_focus"), true));
@@ -2890,7 +2893,7 @@ mod tests {
             framegen_forced: false,
             recorder_status: "",
             recorder_available: false,
-            update_status: &UpdateStatus::Idle,
+            update_status: Some(&UpdateStatus::Idle),
         };
         let mut tab = MenuTab::Display;
         let mut texts = String::new();
@@ -3100,7 +3103,7 @@ mod tests {
                             framegen_forced: false,
                             recorder_status: "",
                             recorder_available: false,
-                            update_status: &UpdateStatus::Idle,
+                            update_status: Some(&UpdateStatus::Idle),
                         },
                         &mut UiOutput::default(),
                     );
@@ -3202,7 +3205,7 @@ mod tests {
                     framegen_forced: false,
                     recorder_status: "",
                     recorder_available: false,
-                    update_status: &UpdateStatus::Idle,
+                    update_status: Some(&UpdateStatus::Idle),
                 };
                 let mut previous_size = None;
                 let mut label_left = None;
@@ -3563,6 +3566,10 @@ mod tests {
             ),
         ];
 
+        let states = states
+            .into_iter()
+            .map(|(status, expected)| (Some(status), Some(expected)))
+            .chain([(None, None)]);
         for (status, expected) in states {
             let ctx = egui::Context::default();
             let mut settings = Settings::default();
@@ -3580,7 +3587,7 @@ mod tests {
                 framegen_forced: false,
                 recorder_status: "",
                 recorder_available: false,
-                update_status: &status,
+                update_status: status.as_ref(),
             };
             let mut text = String::new();
             for _ in 0..2 {
@@ -3613,10 +3620,14 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join("\n");
             }
-            assert!(
-                text.contains(expected),
-                "expected '{expected}' in rendered settings menu for {status:?}, got:\n{text}"
-            );
+            if let Some(expected) = expected {
+                assert!(
+                    text.contains(expected),
+                    "expected '{expected}' in rendered settings menu for {status:?}, got:\n{text}"
+                );
+            } else {
+                assert!(!text.contains("Check for updates"));
+            }
         }
     }
 }

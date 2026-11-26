@@ -23,10 +23,12 @@ flate2 = "1"
 image = "0.25"
 instant = "0.1"
 pollster = "0.4"
+ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tar = "0.4"
+tempfile = "3"
 time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
 tracing = "0.1"
 tracing-appender = "0.2"

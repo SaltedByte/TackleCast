@@ -313,34 +313,50 @@ CI, including package validation, without creating a tag or GitHub Release.
 
 ## Manual GitHub Releases updater
 
-The settings footer includes a manual **Check for updates** control that
-mutates in place across states (`Check for updates` → `Checking…` →
-`Update to vX.Y.Z` / `Up to date (vX.Y.Z) · Dismiss` / download progress /
-`Restart to update`). No network requests occur on startup or in the background.
+Open Settings and select **Check for updates** to query the latest stable GitHub
+Release. Select **Update to vX.Y.Z** to download and stage an eligible update,
+then **Restart to update** to install it. Startup and idle sessions make no
+updater network requests. Pass `--no-updates` on launch to hide the control.
+Recovery from a previously interrupted installation still runs when needed.
 
-- Checks query `https://api.github.com/repos/<repo>/releases/latest` over
-  HTTPS-only (`ureq` with `https_only(true)`), skip drafts and prereleases, and
-  compare strict `MAJOR.MINOR.PATCH` tags against `Cargo.toml`. API and
-  `.sha256` responses are size-bounded.
-- The target repository defaults to `SaltedByte/TackleCast`. Set
-  `TACKLECAST_UPDATE_REPO=owner/repo` at compile time to test end-to-end
-  against a fork release without modifying source files.
-- Automatic in-place updates require a writable portable package
-  (`build-info.json` next to the executable plus a write probe) and matching
-  platform archive + `.sha256` assets hosted on `github.com` or
-  `*.githubusercontent.com`. Source/dev builds and read-only directories fall
-  back to opening the validated GitHub release page (`ShellExecuteW` on Windows,
-  `xdg-open` on Linux).
-- Before extraction, the archive is verified against the release `.sha256` file
-  (verifying transport integrity matching `release.yml`, not offline
-  code-signing). Extraction rejects path traversal and escaping symlinks,
-  stages into `.update-staging/`, and launches the staged binary with
-  `--apply-update` after waiting for the current process to exit.
-- `--apply-update` overlay-copies release files with `.update-backup/` rollback
-  on copy failure, preserving `tacklecast_settings.json`, `logs/`, and
-  user-added files such as `NvOFFRUC.dll`. Obsolete files removed in a newer
-  release are not deleted automatically. Stale `.update-staging/` and
-  `.update-backup/` folders are removed on the next normal launch.
-- Unit tests cover semver parsing, `.sha256` parsing, URL/host/size validation,
-  safe `.zip` and `.tar.gz` extraction (including symlinks and Unix modes),
-  overlay apply/rollback, and all mutating footer button states.
+In-place installation requires a writable x86_64 Windows or Linux portable
+package, a pinned Ed25519 public key, and the matching release archive,
+`.sha256`, and `.sha256.sig` assets. Source builds, read-only installs, and
+releases without a signature offer the GitHub release page instead. Asset URLs
+must match the release repository and tag. All redirects must use HTTPS on
+GitHub's release hosts. Archives are limited to 2 GiB downloaded and 4 GiB
+extracted, with at most 10,000 entries.
+
+The installer stages into a unique directory under `.update-staging/`. Archive
+paths and install parents are validated before replacement. Linux archives can
+contain same-directory symlinks that resolve to files in the package. The
+installer protects `tacklecast_settings.json`, `logs/`, `recordings/`, and
+`NvOFFRUC.dll`. Files absent from the new archive are kept.
+
+Close other instances of TackleCast in the same install folder before selecting
+**Restart to update**. The helper waits for the old process to exit, locks the
+install, and saves the originals and a recovery journal before replacing any
+files. Startup restores the originals if a transaction was interrupted. If the
+main executable cannot start, run the staged executable with `--recover-update`
+from its `payload` folder. On Linux, run
+`LD_LIBRARY_PATH="$PWD/lib" ./tacklecast --recover-update` there. If recovery
+fails, the staging folder retains the journal and backup for another attempt.
+Completed transactions are cleaned up on startup.
+
+### Signing release updates
+
+Keep the Ed25519 private key offline. When building portable packages, set
+`TACKLECAST_UPDATE_PUBLIC_KEY` to the raw 32-byte public key as 64 hex
+characters. Release builds without that setting offer manual downloads.
+The built-in repository is `SaltedByte/TackleCast`. For a fork, also set
+`TACKLECAST_UPDATE_REPO=owner/repo` at compile time.
+
+The signing script verifies the SHA-256 of each archive and signs a message
+binding the checksum to its repository, tag, and filename. On the offline
+signing machine, place the two official archives and their `.sha256` files
+in `release-assets/`. Each checksum file uses the standard
+`<sha256>  <filename>` format. Run `python3 scripts/sign_update.py` with
+`TACKLECAST_UPDATE_PUBLIC_KEY`, `TACKLECAST_UPDATE_SIGNING_KEY` (the PEM private
+key), `TACKLECAST_SIGN_REPO`, and `TACKLECAST_SIGN_TAG` set. The script requires
+Python 3.11 or later and OpenSSL 3. Attach the archives, checksums, and generated
+`.sha256.sig` files to the draft GitHub release before publishing it.

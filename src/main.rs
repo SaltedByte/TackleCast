@@ -96,6 +96,7 @@ enum TestPatternMode {
 
 #[derive(Debug)]
 struct CliArgs {
+    no_updates: bool,
     test_mode: bool,
     test_pattern: TestPatternMode,
     preview_page: Option<ui::PreviewPage>,
@@ -192,6 +193,7 @@ impl CliArgs {
             }
         }
         Self {
+            no_updates: has_flag("--no-updates"),
             test_mode,
             test_pattern,
             preview_page,
@@ -230,6 +232,13 @@ fn main() {
     if let Err(error) = logger::init_logging() {
         eprintln!("failed to initialize logging: {error}");
     }
+    let _update_lock = match updater::prepare_startup() {
+        Ok(lock) => lock,
+        Err(error) => {
+            error!("Cannot start TackleCast during update recovery: {error}");
+            std::process::exit(1);
+        }
+    };
     if let Err(error) = ffmpeg_next::init() {
         eprintln!("failed to initialize ffmpeg: {error}");
     }
@@ -279,9 +288,6 @@ fn main() {
     let _ = unsafe { SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(APP_ID)) };
 
     let cli = CliArgs::parse();
-    if !cli.test_mode && !cli.preview_active() && cli.bench_seconds.is_none() {
-        updater::cleanup_stale_update_dirs();
-    }
     let mut settings = Settings::load();
     if let Some(theme) = cli.preview_theme {
         settings.theme = theme;
@@ -431,7 +437,7 @@ struct App {
     /// Diagnostic clip recorder (raw captured frames for `--fg-replay`).
     recorder: framegen::recorder::ClipRecorder,
     /// Manual GitHub Releases self-updater controller.
-    updater: updater::UpdateController,
+    updater: Option<updater::UpdateController>,
     /// Frame generation was forced on from the command line (not saved).
     force_framegen: bool,
     /// False for automated runs (bench) so the user's settings are untouched.
@@ -478,9 +484,11 @@ impl App {
         let factory = framegen::platform_backend_factory(Box::new(move || {
             let _ = waker_proxy.send_event(AppEvent::FrameGenEvent);
         }));
-        let update_proxy = event_proxy.clone();
-        let updater = updater::UpdateController::new(move || {
-            let _ = update_proxy.send_event(AppEvent::UpdateEvent);
+        let updater = (!cli.no_updates).then(|| {
+            let update_proxy = event_proxy.clone();
+            updater::UpdateController::new(move || {
+                let _ = update_proxy.send_event(AppEvent::UpdateEvent);
+            })
         });
         let bench = cli.bench_seconds.map(|seconds| Bench {
             started: Instant::now(),
@@ -822,7 +830,10 @@ impl ApplicationHandler<AppEvent> for App {
                             framegen_forced: self.force_framegen,
                             recorder_status: &recorder_status,
                             recorder_available,
-                            update_status: self.updater.snapshot(),
+                            update_status: self
+                                .updater
+                                .as_ref()
+                                .map(updater::UpdateController::snapshot),
                         },
                     );
                     if prepared_ui.output.retry_framegen {
@@ -953,7 +964,11 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::FrameGenEvent => self.service_framegen(),
             AppEvent::UpdateEvent => {
-                if self.updater.poll() {
+                if self
+                    .updater
+                    .as_mut()
+                    .is_some_and(updater::UpdateController::poll)
+                {
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
@@ -1140,20 +1155,23 @@ impl App {
     /// Returns `true` when the staged updater was launched and the application
     /// should exit cleanly so file replacement can proceed.
     fn handle_update_action(&mut self, action: updater::UpdateAction) -> bool {
+        let Some(updater) = self.updater.as_mut() else {
+            return false;
+        };
         let should_exit = match action {
             updater::UpdateAction::Check => {
-                self.updater.check_for_updates();
+                updater.check_for_updates();
                 false
             }
             updater::UpdateAction::Download => {
-                self.updater.start_download();
+                updater.start_download();
                 false
             }
             updater::UpdateAction::Cancel => {
-                self.updater.cancel_download();
+                updater.cancel_download();
                 false
             }
-            updater::UpdateAction::RestartToApply => match self.updater.launch_staged_updater() {
+            updater::UpdateAction::RestartToApply => match updater.launch_staged_updater() {
                 Ok(()) => {
                     info!("launched staged updater; exiting to apply update");
                     true
@@ -1170,7 +1188,7 @@ impl App {
                 false
             }
             updater::UpdateAction::Dismiss => {
-                self.updater.dismiss();
+                updater.dismiss();
                 false
             }
         };
@@ -1775,6 +1793,12 @@ mod cli_tests {
         let not_a_test_flag = CliArgs::parse_from(["--test-ui=none"]);
         assert!(!not_a_test_flag.test_mode);
         assert!(!not_a_test_flag.preview_active());
+    }
+
+    #[test]
+    fn updates_can_be_disabled_at_launch() {
+        assert!(CliArgs::parse_from(["--no-updates"]).no_updates);
+        assert!(!CliArgs::parse_from(["--test"]).no_updates);
     }
 
     #[test]
